@@ -1,0 +1,64 @@
+# ============================================================
+# Hayai — build artifacts
+# ============================================================
+/target/
+**/target/
+
+# ============================================================
+# Rust local configuration (machine-specific, not for public)
+# ============================================================
+.cargo/
+.cargo-cache/
+Cargo.lock.bak
+
+# ============================================================
+# Downloaded models and binaries (weights, GGUF, archives)
+# ============================================================
+/models/
+*.gguf
+*.safetensors
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# ============================================================
+# Logs, intermediate results and benchmark outputs
+# ============================================================
+bench_results/
+results_*.txt
+*.log
+*.err
+*.out
+
+# ============================================================
+# Implementation plans and internal design notes
+# ============================================================
+implementation_plan*.md
+Inferencia de Modelos con Streaming de Pesos.md
+
+# ============================================================
+# Hidden folders / IDE
+# ============================================================
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Secrets / local environment
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key

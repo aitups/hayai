@@ -1,0 +1,400 @@
+//! GGML IQ3_XXS / IQ3_S (block 256) — 3-bit IQ quants with lookup grids.
+//! Layout and dequant match llama.cpp `ggml-quants.c` / `ggml-common.h`.
+
+use crate::gguf::f16_to_f32;
+use crate::gguf_types::GgufError;
+use rayon::prelude::*;
+
+pub const QK_K: usize = 256;
+/// `sizeof(block_iq3_xxs)` = 2 + 96
+pub const IQ3_XXS_BLOCK_BYTES: usize = 98;
+/// `sizeof(block_iq3_s)` = 2 + 64 + 8 + 32 + 4
+pub const IQ3_S_BLOCK_BYTES: usize = 110;
+
+const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// llama.cpp `ksigns_iq2xs` — sign bitmasks for 8 values.
+pub static KSIGNS_IQ2XS: [u8; 128] = [
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+];
+
+/// llama.cpp `iq3xxs_grid` — 256 entries, each packed as 4×u8 grid points.
+pub static IQ3XXS_GRID: [u32; 256] = [
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+];
+
+/// llama.cpp `iq3s_grid` — 512 entries.
+pub static IQ3S_GRID: [u32; 512] = [
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+];
+
+#[inline]
+fn grid4(grid: u32) -> [u8; 4] {
+    grid.to_le_bytes()
+}
+
+#[inline]
+fn signed_mul(db: f32, g: u8, signs: u8, j: usize) -> f32 {
+    let s = if signs & KMASK_IQ2XS[j] != 0 {
+        -1.0f32
+    } else {
+        1.0f32
+    };
+    db * g as f32 * s
+}
+
+fn dequant_iq3_xxs_block(block: &[u8], y: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..66];
+    let scales_and_signs = &block[66..98];
+    let mut yo = 0usize;
+    let mut qoff = 0usize;
+    for ib32 in 0..8 {
+        let aux32 = u32::from_le_bytes([
+            scales_and_signs[4 * ib32],
+            scales_and_signs[4 * ib32 + 1],
+            scales_and_signs[4 * ib32 + 2],
+            scales_and_signs[4 * ib32 + 3],
+        ]);
+        let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+            let g1 = grid4(IQ3XXS_GRID[qs[qoff + 2 * l] as usize]);
+            let g2 = grid4(IQ3XXS_GRID[qs[qoff + 2 * l + 1] as usize]);
+            for j in 0..4 {
+                y[yo + j] = signed_mul(db, g1[j], signs, j);
+                y[yo + 4 + j] = signed_mul(db, g2[j], signs, j + 4);
+            }
+            yo += 8;
+        }
+        qoff += 8;
+    }
+}
+
+fn dequant_iq3_s_block(block: &[u8], y: &mut [f32]) {
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs_all = &block[2..66];
+    let qh_all = &block[66..74];
+    let signs_all = &block[74..106];
+    let scales = &block[106..110];
+    let mut yo = 0usize;
+    let mut qoff = 0usize;
+    let mut soff = 0usize;
+    let mut qh_off = 0usize;
+    for ib32 in (0..8).step_by(2) {
+        let db1 = d * (1.0 + 2.0 * (scales[ib32 / 2] & 0x0f) as f32);
+        let db2 = d * (1.0 + 2.0 * (scales[ib32 / 2] >> 4) as f32);
+        let qh0 = qh_all[qh_off];
+        for l in 0..4 {
+            let idx1 = qs_all[qoff + 2 * l] as usize | (((qh0 as usize) << (8 - 2 * l)) & 256);
+            let idx2 = qs_all[qoff + 2 * l + 1] as usize | (((qh0 as usize) << (7 - 2 * l)) & 256);
+            let g1 = grid4(IQ3S_GRID[idx1]);
+            let g2 = grid4(IQ3S_GRID[idx2]);
+            let signs = signs_all[soff + l];
+            for j in 0..4 {
+                y[yo + j] = signed_mul(db1, g1[j], signs, j);
+                y[yo + 4 + j] = signed_mul(db1, g2[j], signs, j + 4);
+            }
+            yo += 8;
+        }
+        qoff += 8;
+        soff += 4;
+        let qh1 = qh_all[qh_off + 1];
+        for l in 0..4 {
+            let idx1 = qs_all[qoff + 2 * l] as usize | (((qh1 as usize) << (8 - 2 * l)) & 256);
+            let idx2 = qs_all[qoff + 2 * l + 1] as usize | (((qh1 as usize) << (7 - 2 * l)) & 256);
+            let g1 = grid4(IQ3S_GRID[idx1]);
+            let g2 = grid4(IQ3S_GRID[idx2]);
+            let signs = signs_all[soff + l];
+            for j in 0..4 {
+                y[yo + j] = signed_mul(db2, g1[j], signs, j);
+                y[yo + 4 + j] = signed_mul(db2, g2[j], signs, j + 4);
+            }
+            yo += 8;
+        }
+        qh_off += 2;
+        qoff += 8;
+        soff += 4;
+    }
+}
+
+pub fn dequant_iq3_xxs(bytes: &[u8], n: usize) -> Result<Vec<f32>, GgufError> {
+    if n % QK_K != 0 {
+        return Err(GgufError::Truncated("iq3_xxs n not multiple of 256"));
+    }
+    let blocks = n / QK_K;
+    if bytes.len() < blocks * IQ3_XXS_BLOCK_BYTES {
+        return Err(GgufError::Truncated("iq3_xxs tensor"));
+    }
+    let mut out = vec![0.0f32; n];
+    for i in 0..blocks {
+        dequant_iq3_xxs_block(
+            &bytes[i * IQ3_XXS_BLOCK_BYTES..],
+            &mut out[i * QK_K..(i + 1) * QK_K],
+        );
+    }
+    Ok(out)
+}
+
+pub fn dequant_iq3_s(bytes: &[u8], n: usize) -> Result<Vec<f32>, GgufError> {
+    if n % QK_K != 0 {
+        return Err(GgufError::Truncated("iq3_s n not multiple of 256"));
+    }
+    let blocks = n / QK_K;
+    if bytes.len() < blocks * IQ3_S_BLOCK_BYTES {
+        return Err(GgufError::Truncated("iq3_s tensor"));
+    }
+    let mut out = vec![0.0f32; n];
+    for i in 0..blocks {
+        dequant_iq3_s_block(
+            &bytes[i * IQ3_S_BLOCK_BYTES..],
+            &mut out[i * QK_K..(i + 1) * QK_K],
+        );
+    }
+    Ok(out)
+}
+
+pub fn gemv_iq3_xxs(
+    nrows: usize,
+    ncols: usize,
+    data: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 {
+        return Err(GgufError::Msg(format!(
+            "IQ3_XXS ncols={ncols} not multiple of {QK_K}"
+        )));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * IQ3_XXS_BLOCK_BYTES;
+    if data.len() < nrows * row_bytes {
+        return Err(GgufError::Truncated("iq3_xxs gemv"));
+    }
+    assert_eq!(input.len(), ncols);
+    assert_eq!(output.len(), nrows);
+
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let row_base = row * row_bytes;
+        let mut sum = 0.0f32;
+        let mut tmp = [0.0f32; QK_K];
+        for b in 0..blocks_per_row {
+            dequant_iq3_xxs_block(
+                &data[row_base + b * IQ3_XXS_BLOCK_BYTES..],
+                &mut tmp,
+            );
+            let x_base = b * QK_K;
+            for j in 0..QK_K {
+                sum += tmp[j] * input[x_base + j];
+            }
+        }
+        *out = sum;
+    });
+    Ok(())
+}
+
+pub fn gemv_iq3_s(
+    nrows: usize,
+    ncols: usize,
+    data: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 {
+        return Err(GgufError::Msg(format!(
+            "IQ3_S ncols={ncols} not multiple of {QK_K}"
+        )));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * IQ3_S_BLOCK_BYTES;
+    if data.len() < nrows * row_bytes {
+        return Err(GgufError::Truncated("iq3_s gemv"));
+    }
+    assert_eq!(input.len(), ncols);
+    assert_eq!(output.len(), nrows);
+
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let row_base = row * row_bytes;
+        let mut sum = 0.0f32;
+        let mut tmp = [0.0f32; QK_K];
+        for b in 0..blocks_per_row {
+            dequant_iq3_s_block(&data[row_base + b * IQ3_S_BLOCK_BYTES..], &mut tmp);
+            let x_base = b * QK_K;
+            for j in 0..QK_K {
+                sum += tmp[j] * input[x_base + j];
+            }
+        }
+        *out = sum;
+    });
+    Ok(())
+}
+
+pub fn extract_iq3_xxs_row(
+    data: &[u8],
+    ncols: usize,
+    row: usize,
+    out: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 || out.len() != ncols {
+        return Err(GgufError::Truncated("iq3_xxs embed row"));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * IQ3_XXS_BLOCK_BYTES;
+    let start = row * row_bytes;
+    if data.len() < start + row_bytes {
+        return Err(GgufError::Truncated("iq3_xxs embed OOB"));
+    }
+    for b in 0..blocks_per_row {
+        dequant_iq3_xxs_block(
+            &data[start + b * IQ3_XXS_BLOCK_BYTES..],
+            &mut out[b * QK_K..(b + 1) * QK_K],
+        );
+    }
+    Ok(())
+}
+
+pub fn extract_iq3_s_row(
+    data: &[u8],
+    ncols: usize,
+    row: usize,
+    out: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 || out.len() != ncols {
+        return Err(GgufError::Truncated("iq3_s embed row"));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * IQ3_S_BLOCK_BYTES;
+    let start = row * row_bytes;
+    if data.len() < start + row_bytes {
+        return Err(GgufError::Truncated("iq3_s embed OOB"));
+    }
+    for b in 0..blocks_per_row {
+        dequant_iq3_s_block(
+            &data[start + b * IQ3_S_BLOCK_BYTES..],
+            &mut out[b * QK_K..(b + 1) * QK_K],
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iq3_xxs_block_roundtrip_len() {
+        let block = vec![0u8; IQ3_XXS_BLOCK_BYTES];
+        let mut y = [0.0f32; QK_K];
+        dequant_iq3_xxs_block(&block, &mut y);
+        assert_eq!(y.len(), 256);
+    }
+
+    #[test]
+    fn iq3_s_block_roundtrip_len() {
+        let block = vec![0u8; IQ3_S_BLOCK_BYTES];
+        let mut y = [0.0f32; QK_K];
+        dequant_iq3_s_block(&block, &mut y);
+        assert_eq!(y.len(), 256);
+    }
+}

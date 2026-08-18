@@ -1,0 +1,18 @@
+[package]
+name = "hayai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hayai-core.workspace = true
+hayai-opencl.workspace = true
+hayai-cpu.workspace = true
+hayai-io.workspace = true
+hayai-model.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+ureq = { workspace = true }

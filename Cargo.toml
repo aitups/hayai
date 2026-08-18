@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hayai-core",
+    "crates/hayai-io",
+    "crates/hayai-opencl",
+    "crates/hayai-kernels",
+    "crates/hayai-cpu",
+    "crates/hayai-model",
+    "crates/hayai-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Hayai Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+opencl3 = { version = "0.12", features = ["CL_VERSION_2_0", "CL_VERSION_2_1", "CL_VERSION_3_0"] }
+cl3 = { version = "0.13", default-features = false, features = ["dynamic"] }
+tokio = { version = "=1.38.0", features = ["full"] }
+bytemuck = { version = "1.16", features = ["derive"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
+clap = { version = "=4.5.1", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
+rayon = "1.10"
+memmap2 = "0.9"
+ureq = "2.9"
+
+# Workspace crates
+hayai-core = { path = "crates/hayai-core" }
+hayai-io = { path = "crates/hayai-io" }
+hayai-opencl = { path = "crates/hayai-opencl" }
+hayai-kernels = { path = "crates/hayai-kernels" }
+hayai-cpu = { path = "crates/hayai-cpu" }
+hayai-model = { path = "crates/hayai-model" }

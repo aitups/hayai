@@ -1,0 +1,13 @@
+[package]
+name = "hayai-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+hayai-io.workspace = true

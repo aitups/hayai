@@ -1,0 +1,14 @@
+[package]
+name = "hayai-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hayai-opencl.workspace = true
+hayai-cpu.workspace = true
+hayai-io.workspace = true
+hayai-model.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "hayai-opencl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencl3.workspace = true
+cl3.workspace = true
+hayai-kernels.workspace = true
+hayai-model.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+hayai-cpu.workspace = true
+hayai-model.workspace = true
