@@ -111,6 +111,8 @@ pub struct StreamingGenerator {
     pub(crate) z_l_init: Option<Vec<f32>>,
     /// Adaptive memory strategy for the resident/macro-chunk window.
     pub memory_strategy: MemoryStrategy,
+    /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
+    pub window_plan: Option<WindowPlan>,
     /// Resident layer cache: Some when k_chunk >= n_layers (zero-I/O decode mode).
     pub(crate) resident_layers: Option<Vec<(Vec<u8>, LayerPackLayout)>>,
     /// Stored ExecPlan used to drive the forward graph (Ola 2).
@@ -245,6 +247,7 @@ impl StreamingGenerator {
             deltanet_weights: None,
             deltanet_states: None,
             memory_strategy: MemoryStrategy::AutoFit,
+            window_plan: None,
             resident_layers: None,
         })
     }
@@ -708,6 +711,7 @@ impl StreamingGenerator {
 
         // ── Adaptive Memory Window ──────────────────────────────────────────────────
         let win = compute_window_plan(&orch.pool, layer_bytes, self.config.num_layers, self.memory_strategy);
+        self.window_plan = Some(win);
         info!(
             "AdaptiveWindow: k_chunk={} resident={} window={}  (strategy={:?})",
             win.k_chunk, win.resident,
@@ -723,16 +727,6 @@ impl StreamingGenerator {
             for i in 0..self.config.num_layers {
                 let pack = reader.load_layer_pack(i)?;
                 let layout = pack.layout();
-                let mut blob = vec![0u8; layout.total];
-                // Serialise pack into contiguous bytes for the cache.
-                macro_rules! copy_field {
-                    ($off:expr, $len:expr, $data:expr) => {
-                        if $len > 0 {
-                            blob[$off..$off + $len].copy_from_slice(&$data.data[$data.data.len() - $len..]);
-                        }
-                    };
-                }
-                let _ = copy_field; // suppress warning; we use raw nbytes approach instead
                 // Re-read into contiguous blob via load_layer_pack_into.
                 let mut scratch_blob = vec![0u8; layout.total];
                 self.catalog.load_layer_pack_into(i, &mut scratch_blob)?;

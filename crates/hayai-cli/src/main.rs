@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use hayai_core::{
     build_exec_plan, format_bytes, process_rss_bytes, run_decode_benchmark, run_overlap_probe,
-    EngineOrchestrator, ExecutionMode, Generator, StreamingGenerator, StreamingMemoryBudget,
+    EngineOrchestrator, ExecutionMode, Generator, MemoryStrategy, StreamingGenerator,
+    StreamingMemoryBudget,
 };
 use hayai_cpu::{cpu_lut_matmul_q4, fp32_matmul, max_abs_diff, unpack_q4_to_fp32};
 use hayai_io::{open_layer_reader, PingPongBuffer};
@@ -101,6 +102,9 @@ enum Commands {
         /// DEV ONLY: load weights via full-file mmap (violates PRD streaming design)
         #[arg(long, default_value_t = false)]
         dev_mmap: bool,
+        /// Memory window strategy: auto | minimal | cap_mb (e.g. 2048 or 2048mb)
+        #[arg(long, default_value = "auto")]
+        memory_strategy: String,
     },
 
     /// Benchmark packed-Q generate: tok/s + packed weight MiB
@@ -120,6 +124,9 @@ enum Commands {
         /// Disable ChatML wrap (send prompt as-is; better for fair llama.cpp compare)
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// Memory window strategy: auto | minimal | cap_mb (e.g. 2048 or 2048mb)
+        #[arg(long, default_value = "auto")]
+        memory_strategy: String,
     },
 
     /// Parse GGUF metadata → streaming ExecPlan (ops registry + HW strategy)
@@ -165,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
             seed,
             raw,
             dev_mmap,
+            memory_strategy,
         } => cmd_generate(
             model,
             prompt,
@@ -178,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
             seed,
             !raw,
             dev_mmap,
+            memory_strategy,
         )?,
         Commands::BenchGenerate {
             model,
@@ -187,7 +196,17 @@ async fn main() -> anyhow::Result<()> {
             sinks,
             window,
             raw,
-        } => cmd_bench_generate(model, prompt, max_tokens, device, sinks, window, !raw)?,
+            memory_strategy,
+        } => cmd_bench_generate(
+            model,
+            prompt,
+            max_tokens,
+            device,
+            sinks,
+            window,
+            !raw,
+            memory_strategy,
+        )?,
         Commands::Plan { model } => cmd_plan(model)?,
     }
 
@@ -674,6 +693,7 @@ fn cmd_generate(
     seed: u64,
     use_chat: bool,
     dev_mmap: bool,
+    memory_strategy: String,
 ) -> anyhow::Result<()> {
     let sampler = match sample_name.as_str() {
         "greedy" => SamplerConfig::Greedy,
@@ -698,6 +718,7 @@ fn cmd_generate(
             "deterministic stream (WeightIo → ping-pong scratch)"
         }
     );
+    println!("  Memory: {}", memory_strategy);
     println!("─────────────────────────────────────────────────────────────");
 
     let rss_before = process_rss_bytes();
@@ -734,6 +755,7 @@ fn cmd_generate(
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     drop(cat);
     let mut gen = StreamingGenerator::open(&model, tokenizer, sinks, window, sampler, seed)?;
+    gen.set_memory_strategy(MemoryStrategy::parse(&memory_strategy));
     println!(
         "  Ready {} in {:.2}s (WeightIo={})",
         gen.config.name,
@@ -784,6 +806,15 @@ fn cmd_generate(
         gen.used_dgpu,
         gen.used_apu
     );
+    if let Some(w) = gen.window_plan {
+        println!(
+            "  AdaptiveWindow: strategy={:?} k_chunk={} resident={} window={}",
+            gen.memory_strategy,
+            w.k_chunk,
+            w.resident,
+            format_bytes(w.window_bytes)
+        );
+    }
     if let Some(b) = gen.memory_budget {
         let rss = process_rss_bytes();
         println!(
@@ -842,6 +873,7 @@ fn cmd_bench_generate(
     sinks: usize,
     window: usize,
     use_chat: bool,
+    memory_strategy: String,
 ) -> anyhow::Result<()> {
     println!("─────────────────────────────────────────────────────────────");
     println!("  HAYAI Bench Generate (Phase 5 — PRD streaming path)");
@@ -860,6 +892,7 @@ fn cmd_bench_generate(
         SamplerConfig::Greedy,
         42,
     )?;
+    gen.set_memory_strategy(MemoryStrategy::parse(&memory_strategy));
     let load_s = t0.elapsed().as_secs_f64();
     let prompt_text = if use_chat {
         gen.tokenizer.apply_chat_template(&prompt)
@@ -947,6 +980,15 @@ fn cmd_bench_generate(
         "  Sample out:    {:?}",
         stats.text.chars().take(80).collect::<String>()
     );
+    if let Some(w) = gen.window_plan {
+        println!(
+            "  AdaptiveWindow: strategy={:?} k_chunk={} resident={} window={}",
+            gen.memory_strategy,
+            w.k_chunk,
+            w.resident,
+            format_bytes(w.window_bytes)
+        );
+    }
     if let Some(mem) = gen.owned_mem {
         println!(
             "  Hayai-owned:   peak {} (scratch={} kv={} acts={} staging={})",
