@@ -5,7 +5,7 @@ pub mod weight_io;
 #[cfg(target_os = "linux")]
 pub mod iouring_reader;
 
-pub use buffer_pool::PingPongBuffer;
+pub use buffer_pool::{AlignedBuffer, PingPongBuffer};
 pub use reader::{
     open_layer_reader, IoBackend, LayerPrefetcher, LayerReader, StreamStats,
 };

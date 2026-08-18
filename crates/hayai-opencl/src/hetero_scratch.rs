@@ -12,6 +12,7 @@ use crate::memory::{
     DeviceLayerBuffer, OwnedSvmBuffer, PinnedHostBuffer, TransferPath,
 };
 use crate::pool::OpenClDevicePool;
+use hayai_io::AlignedBuffer;
 use hayai_model::LayerPackLayout;
 use libc::{c_void, size_t};
 use opencl3::memory::Buffer;
@@ -35,7 +36,7 @@ enum HostBase {
         pinned: [PinnedHostBuffer; 2],
     },
     Host {
-        slots: [Vec<u8>; 2],
+        slots: [AlignedBuffer; 2],
     },
 }
 
@@ -85,7 +86,10 @@ impl StreamingScratch {
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [vec![0u8; slot_bytes], vec![0u8; slot_bytes]],
+                        slots: [
+                            AlignedBuffer::zeroed(slot_bytes),
+                            AlignedBuffer::zeroed(slot_bytes),
+                        ],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
@@ -216,7 +220,7 @@ impl StreamingScratch {
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [vec![0u8; total], vec![0u8; 1]],
+                        slots: [AlignedBuffer::zeroed(total), AlignedBuffer::zeroed(1)],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
@@ -345,7 +349,10 @@ impl StreamingScratch {
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [vec![0u8; layer_bytes], vec![0u8; layer_bytes]],
+                        slots: [
+                            AlignedBuffer::zeroed(layer_bytes),
+                            AlignedBuffer::zeroed(layer_bytes),
+                        ],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,

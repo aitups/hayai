@@ -9,6 +9,7 @@ opencl3.workspace = true
 cl3.workspace = true
 hayai-kernels.workspace = true
 hayai-model.workspace = true
+hayai-io.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc = "0.2"
