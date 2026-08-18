@@ -51,6 +51,12 @@ pub struct StreamingScratch {
     pub resident: bool,
     pub resident_stride: usize,
     pub resident_layers: usize,
+    /// Macro-chunk mode (1 < block_k < resident_layers): ping-pong slots hold
+    /// `block_k × resident_stride` and are loaded once per block per token.
+    pub block_k: usize,
+    /// Which block (1-based) is currently staged in each ping-pong slot
+    /// (macro-chunk only). `0` = slot empty / stale.
+    pub block_staged: [usize; 2],
 }
 
 /// How a pool device should bind weights for Base+Offset GEMV.
@@ -63,22 +69,31 @@ pub enum WeightBind<'a> {
 
 impl StreamingScratch {
     /// Allocate scratch for the whole OpenCL pool (expert Base+Offset pattern).
+    ///
+    /// `k_chunk` = layers per ping-pong slot (macro-chunk). `1` keeps the classic
+    /// per-layer ping-pong. Non-resident macro-chunk sizes each slot
+    /// `k_chunk × layer_bytes`.
     pub fn allocate_for_pool(
         pool: &OpenClDevicePool,
         layer_bytes: usize,
+        k_chunk: usize,
     ) -> Result<(TransferPath, Self), OpenClError> {
+        let k_chunk = k_chunk.max(1);
+        let slot_bytes = layer_bytes.saturating_mul(k_chunk);
         if pool.is_empty() {
             return Ok((
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [vec![0u8; layer_bytes], vec![0u8; layer_bytes]],
+                        slots: [vec![0u8; slot_bytes], vec![0u8; slot_bytes]],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
                     resident: false,
                     resident_stride: layer_bytes,
                     resident_layers: 0,
+                    block_k: k_chunk,
+                    block_staged: [0, 0],
                 },
             ));
         }
@@ -91,8 +106,8 @@ impl StreamingScratch {
 
         let (path, host) = if let Some(apu) = svm_owner {
             match (
-                OwnedSvmBuffer::new(apu, layer_bytes),
-                OwnedSvmBuffer::new(apu, layer_bytes),
+                OwnedSvmBuffer::new(apu, slot_bytes),
+                OwnedSvmBuffer::new(apu, slot_bytes),
             ) {
                 (Ok(a), Ok(b)) => {
                     info!(
@@ -114,8 +129,8 @@ impl StreamingScratch {
                         TransferPath::PinnedDma,
                         HostBase::Pinned {
                             pinned: [
-                                PinnedHostBuffer::new(prim, layer_bytes)?,
-                                PinnedHostBuffer::new(prim, layer_bytes)?,
+                                PinnedHostBuffer::new(prim, slot_bytes)?,
+                                PinnedHostBuffer::new(prim, slot_bytes)?,
                             ],
                         },
                     )
@@ -131,8 +146,8 @@ impl StreamingScratch {
                 TransferPath::PinnedDma,
                 HostBase::Pinned {
                     pinned: [
-                        PinnedHostBuffer::new(prim, layer_bytes)?,
-                        PinnedHostBuffer::new(prim, layer_bytes)?,
+                        PinnedHostBuffer::new(prim, slot_bytes)?,
+                        PinnedHostBuffer::new(prim, slot_bytes)?,
                     ],
                 },
             )
@@ -145,14 +160,14 @@ impl StreamingScratch {
             dgpu_mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
                 slots: [
-                    DeviceLayerBuffer::new(eng, layer_bytes)?,
-                    DeviceLayerBuffer::new(eng, layer_bytes)?,
+                    DeviceLayerBuffer::new(eng, slot_bytes)?,
+                    DeviceLayerBuffer::new(eng, slot_bytes)?,
                 ],
             });
             info!(
                 "HeteroScratch dGPU mirror: {} ({} KiB × 2, FFN-slice DMA)",
                 eng.device_info.device_name,
-                layer_bytes / 1024
+                slot_bytes / 1024
             );
         }
 
@@ -163,8 +178,8 @@ impl StreamingScratch {
                 dgpu_mirrors.push(DgpuMirror {
                     device_id: prim.device_info.device_id,
                     slots: [
-                        DeviceLayerBuffer::new(prim, layer_bytes)?,
-                        DeviceLayerBuffer::new(prim, layer_bytes)?,
+                        DeviceLayerBuffer::new(prim, slot_bytes)?,
+                        DeviceLayerBuffer::new(prim, slot_bytes)?,
                     ],
                 });
             }
@@ -179,6 +194,8 @@ impl StreamingScratch {
                 resident: false,
                 resident_stride: layer_bytes,
                 resident_layers: 0,
+                block_k: k_chunk,
+                block_staged: [0, 0],
             },
         ))
     }
@@ -206,6 +223,8 @@ impl StreamingScratch {
                     resident: true,
                     resident_stride: layer_bytes,
                     resident_layers: n_layers,
+                    block_k: 1,
+                    block_staged: [0, 0],
                 },
             ));
         }
@@ -248,6 +267,8 @@ impl StreamingScratch {
                             resident: true,
                             resident_stride: layer_bytes,
                             resident_layers: n_layers,
+                            block_k: 1,
+                            block_staged: [0, 0],
                         },
                     ));
                 }
@@ -288,6 +309,8 @@ impl StreamingScratch {
                 resident: true,
                 resident_stride: layer_bytes,
                 resident_layers: n_layers,
+                block_k: 1,
+                block_staged: [0, 0],
             },
         ))
     }
@@ -329,6 +352,8 @@ impl StreamingScratch {
                     resident: false,
                     resident_stride: layer_bytes,
                     resident_layers: 0,
+                    block_k: 1,
+                    block_staged: [0, 0],
                 },
             ));
         };
@@ -360,6 +385,8 @@ impl StreamingScratch {
                             resident: false,
                             resident_stride: layer_bytes,
                             resident_layers: 0,
+                            block_k: 1,
+                            block_staged: [0, 0],
                         },
                     ));
                 }
@@ -393,6 +420,8 @@ impl StreamingScratch {
                 resident: false,
                 resident_stride: layer_bytes,
                 resident_layers: 0,
+                block_k: 1,
+                block_staged: [0, 0],
             },
         ))
     }
@@ -408,6 +437,20 @@ impl StreamingScratch {
             let len = base.len();
             let lo = idx.saturating_mul(s).min(len);
             return &mut base[lo..(lo + s).min(len)];
+        }
+        if self.block_k > 1 {
+            // Macro-chunk: layer `idx` lives at `(idx % block_k) × stride` inside
+            // its block's ping-pong slot.
+            let slot = self.slot_for(idx);
+            let s = self.resident_stride;
+            let base = match &mut self.host {
+                HostBase::Svm { slots, .. } => slots[slot].as_mut_slice(),
+                HostBase::Pinned { pinned } => pinned[slot].as_mut_slice(),
+                HostBase::Host { slots } => &mut slots[slot][..],
+            };
+            let len = base.len();
+            let off = (idx % self.block_k).saturating_mul(s).min(len);
+            return &mut base[off..(off + s).min(len)];
         }
         let slot = idx % 2;
         match &mut self.host {
@@ -425,8 +468,21 @@ impl StreamingScratch {
                 HostBase::Pinned { pinned } => pinned[0].as_slice(),
                 HostBase::Host { slots } => &slots[0][..],
             };
-            let lo = idx.saturating_mul(s).min(base.len());
-            return &base[lo..(lo + s).min(base.len())];
+            let len = base.len();
+            let lo = idx.saturating_mul(s).min(len);
+            return &base[lo..(lo + s).min(len)];
+        }
+        if self.block_k > 1 {
+            let slot = self.slot_for(idx);
+            let s = self.resident_stride;
+            let base = match &self.host {
+                HostBase::Svm { slots, .. } => slots[slot].as_slice(),
+                HostBase::Pinned { pinned } => pinned[slot].as_slice(),
+                HostBase::Host { slots } => &slots[slot][..],
+            };
+            let len = base.len();
+            let off = (idx % self.block_k).saturating_mul(s).min(len);
+            return &base[off..(off + s).min(len)];
         }
         let slot = idx % 2;
         match &self.host {
@@ -436,10 +492,39 @@ impl StreamingScratch {
         }
     }
 
+    /// Ping-pong slot that owns `layer` (streaming: `layer % 2`; macro-chunk:
+    /// `(layer / block_k) % 2`; resident: always `0`).
+    pub fn slot_for(&self, layer: usize) -> usize {
+        if self.resident {
+            0
+        } else {
+            (layer / self.block_k.max(1)) % 2
+        }
+    }
+
+    /// Raw pointer to a whole macro-chunk block slot (for block prefetch threads).
+    pub fn host_slot_block_ptr_mut(&mut self, block_slot: usize) -> (*mut u8, usize) {
+        let slot = block_slot % 2;
+        let slice = match &mut self.host {
+            HostBase::Svm { slots, .. } => slots[slot].as_mut_slice(),
+            HostBase::Pinned { pinned } => pinned[slot].as_mut_slice(),
+            HostBase::Host { slots } => &mut slots[slot][..],
+        };
+        (slice.as_mut_ptr(), slice.len())
+    }
+
+    /// Mark a ping-pong slot as holding `block` (1-based index stored).
+    pub fn mark_block_staged(&mut self, block_slot: usize, block: usize) {
+        self.block_staged[block_slot % 2] = block + 1;
+    }
+
     /// Byte capacity of one ping-pong slot (does not require SVM host-map).
     pub fn slot_capacity(&self) -> usize {
         if self.resident {
             return self.resident_stride;
+        }
+        if self.block_k > 1 {
+            return self.resident_stride.saturating_mul(self.block_k);
         }
         match &self.host {
             HostBase::Svm { slots, .. } => slots[0].size_bytes,
@@ -472,7 +557,7 @@ impl StreamingScratch {
             }
             return Ok(());
         }
-        let slot = idx % 2;
+        let slot = self.slot_for(idx);
         if let HostBase::Svm { slots, owner_id } = &mut self.host {
             if let Some(apu) = pool
                 .engines
@@ -514,7 +599,7 @@ impl StreamingScratch {
             // Every layer was DMA'd into the dGPU mirrors once at preload (`fill_layer`).
             return Ok(());
         }
-        let slot = idx % 2;
+        let slot = self.slot_for(idx);
         let n = layout.total.min(self.slot_len(slot));
         let ffn_base = layout.gate_off.min(n);
         self.dma_ffn_slices_mapped(pool, slot, layout, ffn_base, n)
@@ -538,7 +623,7 @@ impl StreamingScratch {
             }
             return Ok(());
         }
-        let slot = idx % 2;
+        let slot = self.slot_for(idx);
         if let HostBase::Svm { slots, owner_id } = &mut self.host {
             if let Some(apu) = pool
                 .engines
@@ -689,7 +774,7 @@ impl StreamingScratch {
                 eng.device_info.device_name
             )));
         }
-        let slot = slot % 2;
+        let slot = if self.resident { 0 } else { self.slot_for(slot) };
         if let HostBase::Svm { slots, owner_id } = &self.host {
             if eng.device_info.device_id == *owner_id {
                 return Ok(WeightBind::Svm {
@@ -714,11 +799,16 @@ impl StreamingScratch {
 
     /// Byte offset of a tensor inside a layer pack given the layer index.
     ///
-    /// Resident: `layer × stride + tensor_off`. Streaming: `tensor_off` (the layer
-    /// pack already sits at the base of its ping-pong slot).
+    /// Resident: `layer × stride + tensor_off`. Macro-chunk: the layer sits at
+    /// `(layer % block_k) × stride` inside its block slot. Streaming: `tensor_off`
+    /// (the layer pack already sits at the base of its ping-pong slot).
     pub fn weight_offset(&self, layer: usize, tensor_off: usize) -> usize {
         if self.resident {
             layer.saturating_mul(self.resident_stride).saturating_add(tensor_off)
+        } else if self.block_k > 1 {
+            (layer % self.block_k)
+                .saturating_mul(self.resident_stride)
+                .saturating_add(tensor_off)
         } else {
             tensor_off
         }

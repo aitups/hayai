@@ -67,8 +67,9 @@ impl StreamingGenerator {
             }
 
             let mut prefetch = None;
-            // Resident mode: all layers already in device memory — no prefetch.
-            if !scratch.resident && layer_idx + 1 < n_layers {
+            // Resident / macro-chunk: layers are (or will be) already in memory —
+            // the block is staged once by `stage_pack`. No per-layer prefetch.
+            if !scratch.resident && scratch.block_k <= 1 && layer_idx + 1 < n_layers {
                 let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
                 let next_slot = (layer_idx + 1) % 2;
@@ -86,7 +87,7 @@ impl StreamingGenerator {
             let slot = layer_idx % 2;
 
             // DMA FFN once per layer (overlaps first Attn); unmap before first FFN enqueue.
-            if scratch.resident {
+            if scratch.resident || scratch.block_k > 1 {
                 scratch.ensure_host_readable(&orch.pool, layer_idx)?;
                 (current, layout) = self
                     .catalog
@@ -107,7 +108,7 @@ impl StreamingGenerator {
 
                 if do_attn {
                     if !dma_committed {
-                        if scratch.resident {
+                        if scratch.resident || scratch.block_k > 1 {
                             scratch.ensure_host_readable(&orch.pool, layer_idx)?;
                             (current, layout) = self
                                 .catalog
@@ -250,7 +251,13 @@ impl StreamingGenerator {
             }
 
             // Cross-layer overlap: Attn(i+1,0) ∥ FFN(i, T−1).
-            if layer_idx + 1 < n_layers && t_count >= 2 {
+            // Disabled for macro-chunk: `bind_prefetched_slot` indexes ping-pong
+            // slots by `% 2`, which is wrong inside a block slot.
+            if !scratch.resident
+                && scratch.block_k <= 1
+                && layer_idx + 1 < n_layers
+                && t_count >= 2
+            {
                 if let (Some(p), Some((pack, lay))) = (pending.take(), next_staged.take()) {
                     let finishing = std::mem::replace(&mut current, pack);
                     let fin_layout = layout;

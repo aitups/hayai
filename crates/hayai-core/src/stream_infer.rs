@@ -320,6 +320,8 @@ impl StreamingGenerator {
     ///
     /// Resident mode: no disk read — layers already live in device memory; this
     /// only maps the SVM base (coarse) and rebuilds views over this layer's slice.
+    /// Macro-chunk: loads the whole `block_k` block once per slot, then returns
+    /// views over this layer's slice for every layer of the block.
     pub(crate) fn stage_pack(
         &mut self,
         orch: &EngineOrchestrator,
@@ -331,6 +333,34 @@ impl StreamingGenerator {
             let t_map = Instant::now();
             scratch.prepare_host_write(&orch.pool, layer)?;
             self.map_secs += t_map.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            let base = scratch.host_slot(layer);
+            let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
+            self.io_secs += t0.elapsed().as_secs_f64();
+            self.io_bytes += layout.total as u64;
+            return Ok((pack, layout));
+        }
+        if scratch.block_k > 1 {
+            let k = scratch.block_k;
+            let block = layer / k;
+            let bslot = scratch.slot_for(layer);
+            if scratch.block_staged[bslot] != block + 1 {
+                // Load the whole block into this slot once.
+                let t_map = Instant::now();
+                scratch.prepare_host_write(&orch.pool, layer)?;
+                self.map_secs += t_map.elapsed().as_secs_f64();
+                let mut cat = self.catalog.fork_reader()?;
+                let bs = block * k;
+                let be = (bs + k).min(self.config.num_layers);
+                for l in bs..be {
+                    let t0 = Instant::now();
+                    let dst = scratch.host_slot_mut(l);
+                    let (_, layout) = cat.load_layer_pack_into(l, dst)?;
+                    self.io_secs += t0.elapsed().as_secs_f64();
+                    self.io_bytes += layout.total as u64;
+                }
+                scratch.mark_block_staged(bslot, block);
+            }
             let t0 = Instant::now();
             let base = scratch.host_slot(layer);
             let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
@@ -480,6 +510,13 @@ impl StreamingGenerator {
         let mut embed_buf = vec![0.0f32; h];
         self.embed_row("token_embd.weight", token, h, &mut embed_buf)?;
         self.act_pp[0].copy_from_slice(&embed_buf);
+
+        // Macro-chunk decode: blocks of `block_k` layers per I/O batch.
+        if let Some(sc) = scratch.as_mut() {
+            if sc.block_k > 1 && !sc.resident {
+                return self.forward_macro_chunk(orch, token, sc);
+            }
+        }
 
         let pos = self.position;
         let n_layers = self.config.num_layers;
@@ -714,6 +751,225 @@ impl StreamingGenerator {
         Ok(logits)
     }
 
+    /// Macro-chunk decode: process blocks of `block_k` layers, loading each block
+    /// once per token (one prefetch thread per block instead of per layer).
+    fn forward_macro_chunk(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        let h = self.config.hidden_size;
+        let eps = self.config.rms_norm_eps;
+        let n_layers = self.config.num_layers;
+        let k = scratch.block_k.max(1);
+        let n_blocks = n_layers.div_ceil(k);
+        let pos = self.position;
+
+        for block in 0..n_blocks {
+            let bs = block * k;
+            let be = (bs + k).min(n_layers);
+
+            // Ensure this block is staged in its ping-pong slot.
+            self.stage_block(orch, scratch, bs, be)?;
+
+            // Prefetch the next block in parallel (I/O overlaps compute).
+            let mut prefetch: Option<JoinHandle<Result<(), GgufError>>> = None;
+            if block + 1 < n_blocks {
+                let next_bs = (block + 1) * k;
+                let next_be = (next_bs + k).min(n_layers);
+                let next_slot = (block + 1) % 2;
+                let t_map = Instant::now();
+                scratch.prepare_host_write(&orch.pool, next_bs)?;
+                self.map_secs += t_map.elapsed().as_secs_f64();
+                let (ptr, _len) = scratch.host_slot_block_ptr_mut(next_slot);
+                let slot_ptr = PrefetchSlotPtr::new(ptr, scratch.slot_capacity());
+                let stride = scratch.resident_stride;
+                let kk = k;
+                let mut cat = self.catalog.fork_reader()?;
+                prefetch = Some(thread::spawn(move || {
+                    let dst = unsafe { slot_ptr.as_mut_slice() };
+                    for l in next_bs..next_be {
+                        let off = (l - next_bs) * stride;
+                        let end = (off + stride).min(dst.len());
+                        cat.load_layer_pack_into(l, &mut dst[off..end])?;
+                    }
+                    Ok(())
+                }));
+            }
+
+            // Process every layer of the block.
+            for layer in bs..be {
+                self.act_swap_prepare();
+
+                let t_map = Instant::now();
+                scratch.ensure_host_readable(&orch.pool, layer)?;
+                self.map_secs += t_map.elapsed().as_secs_f64();
+                let base = scratch.host_slot(layer);
+                let (current, layout) =
+                    self.catalog.layer_pack_views_from_base(layer, base)?;
+
+                // ── CPU Attention ────────────────────────────────────────────────
+                let t_attn = Instant::now();
+                let mut xn = self.act().to_vec();
+                rms_norm(&mut xn, &self.layer_norms[layer].attn_norm, eps);
+
+                let q_dim = self.attn_cfg.hidden_size();
+                let kv_dim = self.attn_cfg.kv_dim();
+                let mut q = vec![0.0f32; q_dim];
+                let mut kk = vec![0.0f32; kv_dim];
+                let mut v = vec![0.0f32; kv_dim];
+                current.wq.gemv(&xn, &mut q)?;
+                current.wk.gemv(&xn, &mut kk)?;
+                current.wv.gemv(&xn, &mut v)?;
+
+                let mut attn_out = vec![0.0f32; q_dim];
+                attention_decode_step(
+                    &self.attn_cfg,
+                    &mut self.kv[layer],
+                    &mut q,
+                    &mut kk,
+                    &v,
+                    pos,
+                    &mut attn_out,
+                );
+                if let Some(ref gate_w) = current.attn_gate {
+                    let mut gate = vec![0.0f32; q_dim];
+                    gate_w.gemv(&xn, &mut gate)?;
+                    for i in 0..q_dim {
+                        attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+                    }
+                }
+                let mut attn_proj = vec![0.0f32; h];
+                current.wo.gemv(&attn_out, &mut attn_proj)?;
+                {
+                    let x = self.act_mut();
+                    for i in 0..h {
+                        x[i] += attn_proj[i];
+                    }
+                }
+                self.attn_secs += t_attn.elapsed().as_secs_f64();
+
+
+                // ── FFN ──────────────────────────────────────────────────────────
+                let mut xn = self.act().to_vec();
+                rms_norm(&mut xn, &self.layer_norms[layer].ffn_norm, eps);
+
+                self.ws_gate.fill(0.0);
+                self.ws_up.fill(0.0);
+                self.ws_down.fill(0.0);
+                self.finish_ffn_unmap(orch, scratch, layer)?;
+
+                let t_ffn = Instant::now();
+                let inflight = ffn_begin_gate_up_scratch(
+                    orch,
+                    &current.gate,
+                    &current.up,
+                    &xn,
+                    &mut self.ws_gate,
+                    &mut self.ws_up,
+                    &mut self.used_dgpu,
+                    &mut self.used_apu,
+                    Some(scratch),
+                    layer,
+                    Some(&layout),
+                )?;
+                ffn_finish_scratch(
+                    orch,
+                    inflight,
+                    &current.down,
+                    &mut self.ws_gate,
+                    &mut self.ws_up,
+                    &mut self.ws_down,
+                    &mut self.used_dgpu,
+                    Some(scratch),
+                    layer,
+                    Some(&layout),
+                )?;
+                self.ffn_secs += t_ffn.elapsed().as_secs_f64();
+
+                {
+                    let sel = self.act_sel;
+                    for i in 0..h {
+                        self.act_pp[sel][i] += self.ws_down[i];
+                    }
+                }
+            }
+
+            if let Some(handle) = prefetch.take() {
+                match handle.join() {
+                    Ok(Ok(())) => {
+                        scratch.mark_block_staged((block + 1) % 2, block + 1);
+                        self.prefetch_hits += 1;
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => {
+                        return Err(StreamInferError::Msg("block prefetch panicked".into()))
+                    }
+                }
+            }
+        }
+
+
+        // Final projection (resident cache or on-demand).
+        let mut xn = self.act().to_vec();
+        rms_norm(&mut xn, &self.output_norm, eps);
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        if self.has_output_weight {
+            if let Some(ow) = &self.resident_output {
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let ow = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += ow.nbytes() as u64;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
+        } else {
+            if let Some(emb) = &self.resident_embed {
+                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += emb.nbytes() as u64;
+                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            }
+        }
+
+        self.position += 1;
+        Ok(logits)
+    }
+
+    /// Load block `[bs, be)` into its ping-pong slot if not already staged.
+    fn stage_block(
+        &mut self,
+        orch: &EngineOrchestrator,
+        scratch: &mut hayai_opencl::StreamingScratch,
+        bs: usize,
+        be: usize,
+    ) -> Result<(), StreamInferError> {
+        let block = bs / scratch.block_k.max(1);
+        let bslot = scratch.slot_for(bs);
+        if scratch.block_staged[bslot] == block + 1 {
+            return Ok(());
+        }
+        let t_map = Instant::now();
+        scratch.prepare_host_write(&orch.pool, bs)?;
+        self.map_secs += t_map.elapsed().as_secs_f64();
+        let mut cat = self.catalog.fork_reader()?;
+        for l in bs..be {
+            let t0 = Instant::now();
+            let dst = scratch.host_slot_mut(l);
+            let (_, layout) = cat.load_layer_pack_into(l, dst)?;
+            self.io_secs += t0.elapsed().as_secs_f64();
+            self.io_bytes += layout.total as u64;
+        }
+        scratch.mark_block_staged(bslot, block);
+        Ok(())
+    }
+
     pub fn generate(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -782,7 +1038,7 @@ impl StreamingGenerator {
                 self.config.num_layers,
             )?
         } else {
-            hayai_opencl::StreamingScratch::allocate_for_pool(&orch.pool, layer_bytes)?
+            hayai_opencl::StreamingScratch::allocate_for_pool(&orch.pool, layer_bytes, win.k_chunk)?
         };
         self.transfer_path = Some(xfer);
         let budget = crate::metrics::StreamingMemoryBudget::estimate(
