@@ -113,8 +113,12 @@ pub struct StreamingGenerator {
     pub memory_strategy: MemoryStrategy,
     /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
     pub window_plan: Option<WindowPlan>,
-    /// Resident layer cache: Some when k_chunk >= n_layers (zero-I/O decode mode).
-    pub(crate) resident_layers: Option<Vec<(Vec<u8>, LayerPackLayout)>>,
+    /// Resident mode: cached final projection matrix (`output.weight`) for zero-I/O
+    /// decode. `None` in streaming mode.
+    pub(crate) resident_output: Option<QuantMatrix>,
+    /// Resident mode: cached embedding matrix (`token_embd.weight`) for zero-I/O
+    /// decode. `None` in streaming mode.
+    pub(crate) resident_embed: Option<QuantMatrix>,
     /// Stored ExecPlan used to drive the forward graph (Ola 2).
     pub exec_plan: Option<crate::exec_plan::ExecPlan>,
     /// Qwen3.5 DeltaNet weights (None entries for full-attn layers).
@@ -248,7 +252,8 @@ impl StreamingGenerator {
             deltanet_states: None,
             memory_strategy: MemoryStrategy::AutoFit,
             window_plan: None,
-            resident_layers: None,
+            resident_output: None,
+            resident_embed: None,
         })
     }
 
@@ -288,7 +293,33 @@ impl StreamingGenerator {
         Ok(pack)
     }
 
+    /// Embedding row read. Resident mode serves it from the cached embedding matrix
+    /// (zero disk I/O per token); streaming mode reads the row on demand.
+    pub(crate) fn embed_row(
+        &mut self,
+        embd_name: &str,
+        token: u32,
+        h: usize,
+        dst: &mut [f32],
+    ) -> Result<(), StreamInferError> {
+        if embd_name == "token_embd.weight" {
+            if let Some(emb) = &self.resident_embed {
+                emb.embed_row(token, dst)?;
+                self.io_bytes += (h * 2) as u64;
+                return Ok(());
+            }
+        }
+        let t0 = Instant::now();
+        self.catalog.read_embed_row(embd_name, token, h, dst)?;
+        self.io_secs += t0.elapsed().as_secs_f64();
+        self.io_bytes += (h * 2) as u64;
+        Ok(())
+    }
+
     /// Disk → host/SVM slot as views (host-mapped). DMA overlaps Attn; unmap before FFN.
+    ///
+    /// Resident mode: no disk read — layers already live in device memory; this
+    /// only maps the SVM base (coarse) and rebuilds views over this layer's slice.
     pub(crate) fn stage_pack(
         &mut self,
         orch: &EngineOrchestrator,
@@ -296,6 +327,17 @@ impl StreamingGenerator {
         slot: usize,
         layer: usize,
     ) -> Result<(LayerWeightPack, LayerPackLayout), StreamInferError> {
+        if scratch.resident {
+            let t_map = Instant::now();
+            scratch.prepare_host_write(&orch.pool, layer)?;
+            self.map_secs += t_map.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            let base = scratch.host_slot(layer);
+            let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
+            self.io_secs += t0.elapsed().as_secs_f64();
+            self.io_bytes += layout.total as u64;
+            return Ok((pack, layout));
+        }
         let t_map = Instant::now();
         scratch.prepare_host_write(&orch.pool, slot)?;
         self.map_secs += t_map.elapsed().as_secs_f64();
@@ -319,6 +361,10 @@ impl StreamingGenerator {
         slot: usize,
         layout: &LayerPackLayout,
     ) -> Result<(), StreamInferError> {
+        if scratch.resident {
+            // Layers were DMA'd into the dGPU mirrors once at preload.
+            return Ok(());
+        }
         let t0 = Instant::now();
         scratch.dma_ffn_keep_mapped(&orch.pool, slot, layout)?;
         self.dma_secs += t0.elapsed().as_secs_f64();
@@ -332,6 +378,13 @@ impl StreamingGenerator {
         scratch: &mut hayai_opencl::StreamingScratch,
         slot: usize,
     ) -> Result<(), StreamInferError> {
+        if scratch.resident {
+            // Unmap the whole resident base so device kernels can read the SVM.
+            let t0 = Instant::now();
+            scratch.unmap_host_for_device(&orch.pool, slot)?;
+            self.map_secs += t0.elapsed().as_secs_f64();
+            return Ok(());
+        }
         let t0 = Instant::now();
         scratch.unmap_host_for_device(&orch.pool, slot)?;
         self.map_secs += t0.elapsed().as_secs_f64();
@@ -360,6 +413,12 @@ impl StreamingGenerator {
         layout: &LayerPackLayout,
         pack: &LayerWeightPack,
     ) -> Result<LayerWeightPack, StreamInferError> {
+        if scratch.resident {
+            // Resident: the pack already points into the correct resident layer
+            // slice (built by `stage_pack`). Rebind nothing — `host_slot(idx)` here
+            // would index a ping-pong slot (`% 2`) which is wrong for residents.
+            return Ok(pack.clone());
+        }
         let t_map = Instant::now();
         scratch.ensure_host_readable(&orch.pool, slot)?;
         self.map_secs += t_map.elapsed().as_secs_f64();
@@ -418,13 +477,9 @@ impl StreamingGenerator {
         let h = self.config.hidden_size;
         self.act_sel = 0;
         self.act_pp[0].fill(0.0);
-        {
-            let t0 = Instant::now();
-            self.catalog
-                .read_embed_row("token_embd.weight", token, h, &mut self.act_pp[0])?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += (h * 2) as u64;
-        }
+        let mut embed_buf = vec![0.0f32; h];
+        self.embed_row("token_embd.weight", token, h, &mut embed_buf)?;
+        self.act_pp[0].copy_from_slice(&embed_buf);
 
         let pos = self.position;
         let n_layers = self.config.num_layers;
@@ -449,15 +504,31 @@ impl StreamingGenerator {
             let slot = layer_idx % 2;
             // Attn needs host-mapped views; start FFN DMA before Attn (overlap).
             if let Some(sc) = scratch.as_mut() {
-                let t_map = Instant::now();
-                sc.ensure_host_readable(&orch.pool, slot)?;
-                self.map_secs += t_map.elapsed().as_secs_f64();
-                current = current.rebind_views(sc.host_slot(slot), &layout);
-                self.begin_ffn_dma(orch, sc, slot, &layout)?;
+                if sc.resident {
+                    // Resident: rebind views over this layer's slice of the resident
+                    // base — no disk read, no DMA (all layers preloaded once).
+                    let t_map = Instant::now();
+                    sc.ensure_host_readable(&orch.pool, slot)?;
+                    self.map_secs += t_map.elapsed().as_secs_f64();
+                    let base = sc.host_slot(layer_idx);
+                    (current, layout) =
+                        self.catalog.layer_pack_views_from_base(layer_idx, base)?;
+                    self.io_bytes += layout.total as u64;
+                } else {
+                    let t_map = Instant::now();
+                    sc.ensure_host_readable(&orch.pool, slot)?;
+                    self.map_secs += t_map.elapsed().as_secs_f64();
+                    current = current.rebind_views(sc.host_slot(slot), &layout);
+                    self.begin_ffn_dma(orch, sc, slot, &layout)?;
+                }
             }
 
             // Prefetch N+1 **directly** into the other ping-pong slot (no heap staging).
-            if layer_idx + 1 < n_layers && prefetch.is_none() {
+            // Resident mode skips prefetch: every layer is already in device memory.
+            if !scratch.as_ref().map(|s| s.resident).unwrap_or(false)
+                && layer_idx + 1 < n_layers
+                && prefetch.is_none()
+            {
                 let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
                 if let Some(sc) = scratch.as_mut() {
@@ -544,7 +615,7 @@ impl StreamingGenerator {
                 &mut self.used_dgpu,
                 &mut self.used_apu,
                 scratch.as_deref(),
-                slot,
+                layer_idx,
                 Some(&layout),
             )?;
             self.ffn_secs += t_ffn_enq.elapsed().as_secs_f64();
@@ -576,7 +647,7 @@ impl StreamingGenerator {
                 &mut self.ws_down,
                 &mut self.used_dgpu,
                 scratch.as_deref(),
-                slot,
+                layer_idx,
                 Some(&layout),
             )?;
             self.ffn_secs += t_ffn_fin.elapsed().as_secs_f64();
@@ -617,17 +688,26 @@ impl StreamingGenerator {
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         if self.has_output_weight {
-            let t0 = Instant::now();
-            let ow = self.catalog.load_quant_matrix("output.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += ow.nbytes() as u64;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            if let Some(ow) = &self.resident_output {
+                // Resident: cached final projection (zero disk I/O).
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let ow = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += ow.nbytes() as u64;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
         } else {
-            let t0 = Instant::now();
-            let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += emb.nbytes() as u64;
-            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            if let Some(emb) = &self.resident_embed {
+                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += emb.nbytes() as u64;
+                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            }
         }
 
         self.position += 1;
@@ -676,15 +756,39 @@ impl StreamingGenerator {
             }
         }
 
+        // ── Adaptive Memory Window ──────────────────────────────────────────────────
         // Expert Base+Offset: SVM host on APU + dGPU DMA mirrors + parametric offsets.
         let layer_bytes = self.catalog.max_layer_pack_nbytes()?.max(1);
         self.layer_scratch_cap = layer_bytes;
-        let (xfer, mut scratch) =
-            hayai_opencl::StreamingScratch::allocate_for_pool(&orch.pool, layer_bytes)?;
+        let win = compute_window_plan(
+            &orch.pool,
+            layer_bytes,
+            self.config.num_layers,
+            self.memory_strategy,
+        );
+        self.window_plan = Some(win);
+        let resident = win.resident && win.k_chunk >= self.config.num_layers;
+        info!(
+            "AdaptiveWindow: k_chunk={} resident={} window={}  (strategy={:?})",
+            win.k_chunk, win.resident,
+            crate::metrics::format_bytes(win.window_bytes),
+            self.memory_strategy,
+        );
+
+        let (xfer, mut scratch) = if resident {
+            hayai_opencl::StreamingScratch::allocate_resident_for_pool(
+                &orch.pool,
+                layer_bytes,
+                self.config.num_layers,
+            )?
+        } else {
+            hayai_opencl::StreamingScratch::allocate_for_pool(&orch.pool, layer_bytes)?
+        };
         self.transfer_path = Some(xfer);
         let budget = crate::metrics::StreamingMemoryBudget::estimate(
             &self.config,
             layer_bytes,
+            win.k_chunk,
             self.kv_sinks,
             self.kv_window,
         );
@@ -695,45 +799,59 @@ impl StreamingGenerator {
             + self.ws_down.len())
             * 4;
         let mut owned = crate::metrics::HayaiOwnedMemory::default();
-        owned.note_scratch(layer_bytes as u64 * 2);
+        if resident {
+            owned.note_scratch(layer_bytes as u64 * self.config.num_layers as u64);
+        } else {
+            owned.note_scratch(layer_bytes as u64 * 2);
+        }
         owned.note_kv(budget.kv_bytes);
         owned.note_activations(act_bytes as u64);
         owned.note_metadata(self.catalog.header_bytes as u64);
         self.owned_mem = Some(owned);
         info!(
-            "HeteroScratch {:?} — {} KiB × 2 host | {} dGPU mirror(s) | budget ~{} | hayai_owned ~{}",
+            "HeteroScratch {:?} {} — {} KiB × {} host | {} dGPU mirror(s) | budget ~{} | hayai_owned ~{}",
             xfer,
+            if resident { "resident" } else { "ping-pong" },
             layer_bytes / 1024,
+            if resident { self.config.num_layers } else { 2 },
             scratch.dgpu_mirrors.len(),
             crate::metrics::format_bytes(budget.total_budget_bytes),
             crate::metrics::format_bytes(self.owned_mem.as_ref().map(|m| m.total()).unwrap_or(0))
         );
 
-        // ── Adaptive Memory Window ──────────────────────────────────────────────────
-        let win = compute_window_plan(&orch.pool, layer_bytes, self.config.num_layers, self.memory_strategy);
-        self.window_plan = Some(win);
-        info!(
-            "AdaptiveWindow: k_chunk={} resident={} window={}  (strategy={:?})",
-            win.k_chunk, win.resident,
-            crate::metrics::format_bytes(win.window_bytes),
-            self.memory_strategy,
-        );
-
-        // In resident mode, load every layer pack into host RAM once, then decode I/O-free.
-        if win.resident && self.resident_layers.is_none() {
-            info!("Resident mode: pre-loading all {} layers into host RAM", self.config.num_layers);
-            let mut cache: Vec<(Vec<u8>, LayerPackLayout)> = Vec::with_capacity(self.config.num_layers);
-            let mut reader = self.catalog.fork_reader()?;
+        // Resident mode: preload every layer pack once (disk → device memory) and
+        // cache the final projection + embedding matrices for zero-I/O decode.
+        if resident {
+            info!(
+                "Resident mode: pre-loading all {} layers into device memory",
+                self.config.num_layers
+            );
+            let mut cat = self.catalog.fork_reader()?;
             for i in 0..self.config.num_layers {
-                let pack = reader.load_layer_pack(i)?;
-                let layout = pack.layout();
-                // Re-read into contiguous blob via load_layer_pack_into.
-                let mut scratch_blob = vec![0u8; layout.total];
-                self.catalog.load_layer_pack_into(i, &mut scratch_blob)?;
-                cache.push((scratch_blob, layout));
+                let t0 = Instant::now();
+                let layout_total = {
+                    let dst = scratch.host_slot_mut(i);
+                    let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                    layout.total
+                };
+                scratch.dma_layer_to_mirrors(&orch.pool, i, layout_total)?;
+                self.io_secs += t0.elapsed().as_secs_f64();
             }
-            self.resident_layers = Some(cache);
-            info!("Resident load complete: {} layers cached", self.config.num_layers);
+            info!("Resident preload complete: {} layers in device memory", self.config.num_layers);
+            if self.has_output_weight {
+                self.resident_output = Some(self.catalog.load_quant_matrix("output.weight")?);
+            }
+            self.resident_embed = Some(self.catalog.load_quant_matrix("token_embd.weight")?);
+            self.io_bytes += self
+                .resident_output
+                .as_ref()
+                .map(|m| m.nbytes() as u64)
+                .unwrap_or(0)
+                + self
+                    .resident_embed
+                    .as_ref()
+                    .map(|m| m.nbytes() as u64)
+                    .unwrap_or(0);
         }
 
         let wall0 = Instant::now();
@@ -847,8 +965,8 @@ fn begin_gemv_from_scratch(
     m: &QuantMatrix,
     xn: &[f32],
     scratch: &hayai_opencl::StreamingScratch,
-    slot: usize,
-    weight_off: usize,
+    layer: usize,
+    tensor_off: usize,
 ) -> Result<PendingGemv, StreamInferError> {
     let (kernel, label) = match m.ggml_type {
         GgmlType::Q4_0 => (&eng.gemv_q4_0, "q4_0"),
@@ -877,14 +995,15 @@ fn begin_gemv_from_scratch(
         }
     };
     use hayai_opencl::WeightBind;
-    match scratch.weight_bind(eng, slot)? {
+    let woff = scratch.weight_offset(layer, tensor_off);
+    match scratch.weight_bind(eng, layer)? {
         WeightBind::Svm { ptr } => Ok(eng.ggml_gemv_async_from_svm(
             kernel,
             label,
             m.nrows,
             m.ncols,
             ptr,
-            weight_off,
+            woff,
             xn,
         )?),
         WeightBind::Device { buf } => Ok(eng.ggml_gemv_async_from_device(
@@ -893,7 +1012,7 @@ fn begin_gemv_from_scratch(
             m.nrows,
             m.ncols,
             buf,
-            weight_off,
+            woff,
             xn,
         )?),
     }
@@ -920,7 +1039,7 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     used_dgpu: &mut bool,
     used_apu: &mut bool,
     scratch: Option<&hayai_opencl::StreamingScratch>,
-    slot: usize,
+    layer: usize,
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<GateUpInflight, StreamInferError> {
     if orch.pool.is_empty() {
@@ -937,12 +1056,12 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     }
 
     let g = if let (Some(sc), Some(lay)) = (scratch, layout) {
-        begin_gemv_from_scratch(gate_eng, gate, xn, sc, slot, lay.gate_off)?
+        begin_gemv_from_scratch(gate_eng, gate, xn, sc, layer, lay.gate_off)?
     } else {
         begin_gemv(gate_eng, gate, xn)?
     };
     let u = if let (Some(sc), Some(lay)) = (scratch, layout) {
-        begin_gemv_from_scratch(up_eng, up, xn, sc, slot, lay.up_off)?
+        begin_gemv_from_scratch(up_eng, up, xn, sc, layer, lay.up_off)?
     } else {
         begin_gemv(up_eng, up, xn)?
     };
@@ -959,7 +1078,7 @@ pub(crate) fn ffn_finish_scratch(
     down_out: &mut [f32],
     used_dgpu: &mut bool,
     scratch: Option<&hayai_opencl::StreamingScratch>,
-    slot: usize,
+    layer: usize,
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<(), StreamInferError> {
     match inflight {
@@ -982,7 +1101,7 @@ pub(crate) fn ffn_finish_scratch(
         let eng = orch.pool.for_role(2);
         *used_dgpu = true;
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
-            begin_gemv_from_scratch(eng, down, gate_out, sc, slot, lay.down_off)?
+            begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
         } else {
             begin_gemv(eng, down, gate_out)?
         };
@@ -1004,7 +1123,7 @@ pub(crate) fn ffn_finish_gelu_scratch(
     down_out: &mut [f32],
     used_dgpu: &mut bool,
     scratch: Option<&hayai_opencl::StreamingScratch>,
-    slot: usize,
+    layer: usize,
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<(), StreamInferError> {
     match inflight {
@@ -1029,7 +1148,7 @@ pub(crate) fn ffn_finish_gelu_scratch(
         let eng = orch.pool.for_role(2);
         *used_dgpu = true;
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
-            begin_gemv_from_scratch(eng, down, gate_out, sc, slot, lay.down_off)?
+            begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
         } else {
             begin_gemv(eng, down, gate_out)?
         };

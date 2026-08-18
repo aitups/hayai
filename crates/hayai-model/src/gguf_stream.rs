@@ -327,6 +327,93 @@ impl GgufCatalog {
         Ok((pack, layout))
     }
 
+    /// Build layer-pack views into `base` **without any disk read** (resident mode).
+    ///
+    /// The pack's tensors must already live in `base[..layout.total]` (resident
+    /// device memory). Unlike [`Self::load_layer_pack_into`] this never touches the
+    /// weight payload — it only re-derives offsets/dims/types from the in-RAM index.
+    pub fn layer_pack_views_from_base(
+        &self,
+        layer: usize,
+        base: &[u8],
+    ) -> Result<(LayerWeightPack, LayerPackLayout), GgufError> {
+        let names = [
+            format!("blk.{layer}.attn_q.weight"),
+            format!("blk.{layer}.attn_k.weight"),
+            format!("blk.{layer}.attn_v.weight"),
+            format!("blk.{layer}.attn_output.weight"),
+            format!("blk.{layer}.ffn_gate.weight"),
+            format!("blk.{layer}.ffn_up.weight"),
+            format!("blk.{layer}.ffn_down.weight"),
+        ];
+        let mut offs = [0usize; 7];
+        let mut lens = [0usize; 7];
+        let mut dims = [(0usize, 0usize); 7];
+        let mut types = [crate::gguf_types::GgmlType::F32; 7];
+        let mut off = 0usize;
+        for (i, name) in names.iter().enumerate() {
+            let info = self.tensor(name)?.clone();
+            let nbytes = tensor_nbytes(&info)?;
+            if off + nbytes > base.len() {
+                return Err(GgufError::Msg(format!(
+                    "layer {layer} pack {nbytes}B at {off} exceeds resident base {}",
+                    base.len()
+                )));
+            }
+            offs[i] = off;
+            lens[i] = nbytes;
+            dims[i] = (info.ncols(), info.nrows());
+            types[i] = info.ggml_type;
+            off += nbytes;
+        }
+        let gate_name = format!("blk.{layer}.attn_gate.weight");
+        let (attn_gate_off, attn_gate_len, attn_gate_dim, attn_gate_ty) =
+            if let Ok(info) = self.tensor(&gate_name).cloned() {
+                let nbytes = tensor_nbytes(&info)?;
+                if off + nbytes > base.len() {
+                    return Err(GgufError::Msg(format!(
+                        "layer {layer} attn_gate exceeds resident base {}",
+                        base.len()
+                    )));
+                }
+                let ag_off = off;
+                off += nbytes;
+                (ag_off, nbytes, (info.ncols(), info.nrows()), info.ggml_type)
+            } else {
+                (0, 0, (0, 0), crate::gguf_types::GgmlType::F32)
+            };
+        let layout = LayerPackLayout {
+            wq_off: offs[0],
+            wk_off: offs[1],
+            wv_off: offs[2],
+            wo_off: offs[3],
+            gate_off: offs[4],
+            up_off: offs[5],
+            down_off: offs[6],
+            attn_gate_off,
+            wq_len: lens[0],
+            wk_len: lens[1],
+            wv_len: lens[2],
+            wo_len: lens[3],
+            gate_len: lens[4],
+            up_len: lens[5],
+            down_len: lens[6],
+            attn_gate_len,
+            total: off,
+        };
+        let mut pack = LayerWeightPack::views_from_base(base, &layout, &names, &dims, &types);
+        if attn_gate_len > 0 {
+            pack.attn_gate = Some(QuantMatrix::view(
+                gate_name,
+                attn_gate_dim.0,
+                attn_gate_dim.1,
+                attn_gate_ty,
+                &base[attn_gate_off..attn_gate_off + attn_gate_len],
+            ));
+        }
+        Ok((pack, layout))
+    }
+
     /// Byte size of one layer pack (for StreamingScratch allocation).
     pub fn layer_pack_nbytes(&self, layer: usize) -> Result<usize, GgufError> {
         let names = [
@@ -395,6 +482,7 @@ impl GgufCatalog {
 }
 
 /// One decoder layer's packed weights (resident only while that layer is active / prefetched).
+#[derive(Clone)]
 pub struct LayerWeightPack {
     pub wq: QuantMatrix,
     pub wk: QuantMatrix,

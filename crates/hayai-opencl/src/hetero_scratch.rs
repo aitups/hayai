@@ -45,6 +45,12 @@ pub struct StreamingScratch {
     /// Discrete-GPU VRAM copies of each ping-pong slot (full pack layout; FFN slices DMA'd).
     pub dgpu_mirrors: Vec<DgpuMirror>,
     pub path: TransferPath,
+    /// Resident mode: one base allocation of `resident_layers × resident_stride`
+    /// holding every layer pack; layers are addressed by index (never `% 2`) and
+    /// never re-read from disk nor re-DMA'd per token.
+    pub resident: bool,
+    pub resident_stride: usize,
+    pub resident_layers: usize,
 }
 
 /// How a pool device should bind weights for Base+Offset GEMV.
@@ -70,6 +76,9 @@ impl StreamingScratch {
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
+                    resident: false,
+                    resident_stride: layer_bytes,
+                    resident_layers: 0,
                 },
             ));
         }
@@ -167,8 +176,140 @@ impl StreamingScratch {
                 host,
                 dgpu_mirrors,
                 path,
+                resident: false,
+                resident_stride: layer_bytes,
+                resident_layers: 0,
             },
         ))
+    }
+
+    /// Allocate a **resident** scratch: every layer pack lives in accelerator
+    /// memory (`resident_layers × resident_stride`) for the whole session.
+    ///
+    /// Layers are addressed by index (no ping-pong), I/O and DMA happen once at
+    /// preload ([`Self::fill_layer`]) and are eliminated from the decode loop.
+    pub fn allocate_resident_for_pool(
+        pool: &OpenClDevicePool,
+        layer_bytes: usize,
+        n_layers: usize,
+    ) -> Result<(TransferPath, Self), OpenClError> {
+        let total = layer_bytes.saturating_mul(n_layers.max(1));
+        if pool.is_empty() {
+            return Ok((
+                TransferPath::HostRam,
+                Self {
+                    host: HostBase::Host {
+                        slots: [vec![0u8; total], vec![0u8; 1]],
+                    },
+                    dgpu_mirrors: Vec::new(),
+                    path: TransferPath::HostRam,
+                    resident: true,
+                    resident_stride: layer_bytes,
+                    resident_layers: n_layers,
+                },
+            ));
+        }
+
+        let svm_owner = pool
+            .apu_svm()
+            .or_else(|| pool.engines.iter().find(|e| e.device_info.supports_svm));
+        if let Some(apu) = svm_owner {
+            match OwnedSvmBuffer::new(apu, total) {
+                Ok(buf) => {
+                    info!(
+                        "ResidentScratch: SVM on {} ({} layers × {} KiB)",
+                        apu.device_info.device_name,
+                        n_layers,
+                        layer_bytes / 1024
+                    );
+                    let mut mirrors = Self::resident_mirrors(pool, total)?;
+                    // Pinned-host fallback not needed here (SVM covers primary FFN).
+                    if mirrors.is_empty() {
+                        let prim = pool.primary();
+                        if prim.device_info.device_kind == DeviceKind::DiscreteGpu {
+                            mirrors.push(DgpuMirror {
+                                device_id: prim.device_info.device_id,
+                                slots: [
+                                    DeviceLayerBuffer::new(prim, total)?,
+                                    DeviceLayerBuffer::new(prim, 1)?,
+                                ],
+                            });
+                        }
+                    }
+                    return Ok((
+                        TransferPath::SvmZeroCopy,
+                        Self {
+                            host: HostBase::Svm {
+                                slots: [buf, OwnedSvmBuffer::new(apu, 1)?],
+                                owner_id: apu.device_info.device_id,
+                            },
+                            dgpu_mirrors: mirrors,
+                            path: TransferPath::SvmZeroCopy,
+                            resident: true,
+                            resident_stride: layer_bytes,
+                            resident_layers: n_layers,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    warn!("ResidentScratch SVM alloc failed ({e}); pinned fallback");
+                }
+            }
+        }
+
+        let prim = pool.primary();
+        let mut mirrors = Self::resident_mirrors(pool, total)?;
+        if mirrors.is_empty() {
+            mirrors.push(DgpuMirror {
+                device_id: prim.device_info.device_id,
+                slots: [
+                    DeviceLayerBuffer::new(prim, total)?,
+                    DeviceLayerBuffer::new(prim, 1)?,
+                ],
+            });
+        }
+        info!(
+            "ResidentScratch: pinned host on {} ({} layers × {} KiB)",
+            prim.device_info.device_name,
+            n_layers,
+            layer_bytes / 1024
+        );
+        Ok((
+            TransferPath::PinnedDma,
+            Self {
+                host: HostBase::Pinned {
+                    pinned: [
+                        PinnedHostBuffer::new(prim, total)?,
+                        PinnedHostBuffer::new(prim, 1)?,
+                    ],
+                },
+                dgpu_mirrors: mirrors,
+                path: TransferPath::PinnedDma,
+                resident: true,
+                resident_stride: layer_bytes,
+                resident_layers: n_layers,
+            },
+        ))
+    }
+
+    /// One big VRAM mirror per discrete GPU for the resident base.
+    fn resident_mirrors(
+        pool: &OpenClDevicePool,
+        total: usize,
+    ) -> Result<Vec<DgpuMirror>, OpenClError> {
+        let mut mirrors = Vec::new();
+        for eng in pool.engines.iter().filter(|e| {
+            e.device_info.device_kind == DeviceKind::DiscreteGpu
+        }) {
+            mirrors.push(DgpuMirror {
+                device_id: eng.device_info.device_id,
+                slots: [
+                    DeviceLayerBuffer::new(eng, total)?,
+                    DeviceLayerBuffer::new(eng, 1)?,
+                ],
+            });
+        }
+        Ok(mirrors)
     }
 
     /// Legacy single-engine allocate (bench-io).
@@ -185,6 +326,9 @@ impl StreamingScratch {
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
+                    resident: false,
+                    resident_stride: layer_bytes,
+                    resident_layers: 0,
                 },
             ));
         };
@@ -213,6 +357,9 @@ impl StreamingScratch {
                             },
                             dgpu_mirrors: mirrors,
                             path: TransferPath::SvmZeroCopy,
+                            resident: false,
+                            resident_stride: layer_bytes,
+                            resident_layers: 0,
                         },
                     ));
                 }
@@ -243,11 +390,25 @@ impl StreamingScratch {
                 },
                 dgpu_mirrors: mirrors,
                 path,
+                resident: false,
+                resident_stride: layer_bytes,
+                resident_layers: 0,
             },
         ))
     }
 
     pub fn host_slot_mut(&mut self, idx: usize) -> &mut [u8] {
+        if self.resident {
+            let s = self.resident_stride;
+            let base = match &mut self.host {
+                HostBase::Svm { slots, .. } => slots[0].as_mut_slice(),
+                HostBase::Pinned { pinned } => pinned[0].as_mut_slice(),
+                HostBase::Host { slots } => &mut slots[0][..],
+            };
+            let len = base.len();
+            let lo = idx.saturating_mul(s).min(len);
+            return &mut base[lo..(lo + s).min(len)];
+        }
         let slot = idx % 2;
         match &mut self.host {
             HostBase::Svm { slots, .. } => slots[slot].as_mut_slice(),
@@ -257,6 +418,16 @@ impl StreamingScratch {
     }
 
     pub fn host_slot(&self, idx: usize) -> &[u8] {
+        if self.resident {
+            let s = self.resident_stride;
+            let base = match &self.host {
+                HostBase::Svm { slots, .. } => slots[0].as_slice(),
+                HostBase::Pinned { pinned } => pinned[0].as_slice(),
+                HostBase::Host { slots } => &slots[0][..],
+            };
+            let lo = idx.saturating_mul(s).min(base.len());
+            return &base[lo..(lo + s).min(base.len())];
+        }
         let slot = idx % 2;
         match &self.host {
             HostBase::Svm { slots, .. } => slots[slot].as_slice(),
@@ -267,6 +438,9 @@ impl StreamingScratch {
 
     /// Byte capacity of one ping-pong slot (does not require SVM host-map).
     pub fn slot_capacity(&self) -> usize {
+        if self.resident {
+            return self.resident_stride;
+        }
         match &self.host {
             HostBase::Svm { slots, .. } => slots[0].size_bytes,
             HostBase::Pinned { pinned } => pinned[0].size_bytes,
@@ -285,6 +459,19 @@ impl StreamingScratch {
         pool: &OpenClDevicePool,
         idx: usize,
     ) -> Result<(), OpenClError> {
+        if self.resident {
+            // idx = layer index; map the whole resident base once.
+            if let HostBase::Svm { slots, owner_id } = &mut self.host {
+                if let Some(apu) = pool
+                    .engines
+                    .iter()
+                    .find(|e| e.device_info.device_id == *owner_id)
+                {
+                    slots[0].prepare_for_host(apu)?;
+                }
+            }
+            return Ok(());
+        }
         let slot = idx % 2;
         if let HostBase::Svm { slots, owner_id } = &mut self.host {
             if let Some(apu) = pool
@@ -323,6 +510,10 @@ impl StreamingScratch {
         idx: usize,
         layout: &LayerPackLayout,
     ) -> Result<(), OpenClError> {
+        if self.resident {
+            // Every layer was DMA'd into the dGPU mirrors once at preload (`fill_layer`).
+            return Ok(());
+        }
         let slot = idx % 2;
         let n = layout.total.min(self.slot_len(slot));
         let ffn_base = layout.gate_off.min(n);
@@ -335,6 +526,18 @@ impl StreamingScratch {
         pool: &OpenClDevicePool,
         idx: usize,
     ) -> Result<(), OpenClError> {
+        if self.resident {
+            if let HostBase::Svm { slots, owner_id } = &mut self.host {
+                if let Some(apu) = pool
+                    .engines
+                    .iter()
+                    .find(|e| e.device_info.device_id == *owner_id)
+                {
+                    slots[0].prepare_for_device(apu)?;
+                }
+            }
+            return Ok(());
+        }
         let slot = idx % 2;
         if let HostBase::Svm { slots, owner_id } = &mut self.host {
             if let Some(apu) = pool
@@ -463,6 +666,29 @@ impl StreamingScratch {
     /// Resolve Base+Offset bind for a pool device. Errors if the device has no
     /// SVM ownership and no VRAM mirror (HostUpload removed from product path).
     pub fn weight_bind(&self, eng: &OpenClEngine, slot: usize) -> Result<WeightBind<'_>, OpenClError> {
+        if self.resident {
+            // Resident: single base allocation; `slot` is the layer index.
+            if let HostBase::Svm { slots, owner_id } = &self.host {
+                if eng.device_info.device_id == *owner_id {
+                    return Ok(WeightBind::Svm {
+                        ptr: slots[0].as_ptr(),
+                    });
+                }
+            }
+            if let Some(m) = self
+                .dgpu_mirrors
+                .iter()
+                .find(|m| m.device_id == eng.device_info.device_id)
+            {
+                return Ok(WeightBind::Device {
+                    buf: &m.slots[0].cl_buffer,
+                });
+            }
+            return Err(OpenClError::ClError(format!(
+                "no resident WeightBind for '{}' (need SVM owner or dGPU mirror)",
+                eng.device_info.device_name
+            )));
+        }
         let slot = slot % 2;
         if let HostBase::Svm { slots, owner_id } = &self.host {
             if eng.device_info.device_id == *owner_id {
@@ -484,6 +710,76 @@ impl StreamingScratch {
             "no WeightBind for '{}' (need SVM owner or dGPU mirror; HostUpload disabled)",
             eng.device_info.device_name
         )))
+    }
+
+    /// Byte offset of a tensor inside a layer pack given the layer index.
+    ///
+    /// Resident: `layer × stride + tensor_off`. Streaming: `tensor_off` (the layer
+    /// pack already sits at the base of its ping-pong slot).
+    pub fn weight_offset(&self, layer: usize, tensor_off: usize) -> usize {
+        if self.resident {
+            layer.saturating_mul(self.resident_stride).saturating_add(tensor_off)
+        } else {
+            tensor_off
+        }
+    }
+
+    /// Write one layer pack into the resident base and DMA it into every dGPU
+    /// mirror once (one-time preload cost; zero I/O/DMA during decode).
+    pub fn fill_layer(
+        &mut self,
+        pool: &OpenClDevicePool,
+        layer: usize,
+        blob: &[u8],
+    ) -> Result<(), OpenClError> {
+        debug_assert!(self.resident, "fill_layer requires resident scratch");
+        self.prepare_host_write(pool, layer)?;
+        {
+            let dst = self.host_slot_mut(layer);
+            let n = blob.len().min(dst.len());
+            dst[..n].copy_from_slice(&blob[..n]);
+        }
+        self.dma_layer_to_mirrors(pool, layer, blob.len())
+    }
+
+    /// DMA `total` bytes of the already-written layer `layer` (host resident base)
+    /// into every dGPU mirror. One-time cost; the decode loop never re-DMAs.
+    pub fn dma_layer_to_mirrors(
+        &mut self,
+        pool: &OpenClDevicePool,
+        layer: usize,
+        total: usize,
+    ) -> Result<(), OpenClError> {
+        if self.dgpu_mirrors.is_empty() || total == 0 {
+            return Ok(());
+        }
+        let (host_ptr, _total) = self.host_base_ptr_len();
+        let stride = self.resident_stride;
+        let base_off = layer.saturating_mul(stride);
+        for mirror in self.dgpu_mirrors.iter_mut() {
+            let Some(eng) = pool
+                .engines
+                .iter()
+                .find(|e| e.device_info.device_id == mirror.device_id)
+            else {
+                continue;
+            };
+            // SAFETY: host_ptr points into the resident base owned by `self`, which
+            // outlives this call; the base stays host-visible while mapped above.
+            let src = unsafe { std::slice::from_raw_parts(host_ptr.add(base_off), total) };
+            dma_write_rect(eng, &mut mirror.slots[0].cl_buffer, base_off, src)?;
+        }
+        Ok(())
+    }
+
+    /// Raw pointer to the resident host base plus its total length.
+    fn host_base_ptr_len(&self) -> (*const u8, usize) {
+        let n = self.resident_layers.saturating_mul(self.resident_stride);
+        match &self.host {
+            HostBase::Svm { slots, .. } => (slots[0].as_ptr(), n),
+            HostBase::Pinned { pinned } => (pinned[0].host_ptr, n),
+            HostBase::Host { slots } => (slots[0].as_ptr(), n),
+        }
     }
 
     /// Legacy helper used by older call sites.

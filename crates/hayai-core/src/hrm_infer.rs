@@ -31,13 +31,7 @@ impl StreamingGenerator {
 
         // z_H = embed * scale
         let mut z_h = vec![0.0f32; h];
-        {
-            let t0 = Instant::now();
-            self.catalog
-                .read_embed_row("token_embd.weight", token, h, &mut z_h)?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += (h * 2) as u64;
-        }
+        self.embed_row("token_embd.weight", token, h, &mut z_h)?;
         let scale = hrm.embedding_scale;
         for v in &mut z_h {
             *v *= scale;
@@ -92,17 +86,25 @@ impl StreamingGenerator {
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         if self.has_output_weight {
-            let t0 = Instant::now();
-            let ow = self.catalog.load_quant_matrix("output.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += ow.nbytes() as u64;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            if let Some(ow) = &self.resident_output {
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let ow = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += ow.nbytes() as u64;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
         } else {
-            let t0 = Instant::now();
-            let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += emb.nbytes() as u64;
-            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            if let Some(emb) = &self.resident_embed {
+                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += emb.nbytes() as u64;
+                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            }
         }
         self.position += 1;
         Ok(logits)
@@ -183,7 +185,7 @@ impl StreamingGenerator {
             &mut self.used_dgpu,
             &mut self.used_apu,
             Some(scratch),
-            slot,
+            blk,
             Some(&layout),
         )?;
         ffn_finish_scratch(
@@ -195,7 +197,7 @@ impl StreamingGenerator {
             &mut self.ws_down,
             &mut self.used_dgpu,
             Some(scratch),
-            slot,
+            blk,
             Some(&layout),
         )?;
         self.ffn_secs += t_ffn.elapsed().as_secs_f64();

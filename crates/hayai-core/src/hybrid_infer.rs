@@ -38,13 +38,7 @@ pub(crate) fn forward_hybrid(
     let pos = gen.position;
 
     let mut x = vec![0.0f32; h];
-    {
-        let t0 = Instant::now();
-        gen.catalog
-            .read_embed_row("token_embd.weight", token, h, &mut x)?;
-        gen.io_secs += t0.elapsed().as_secs_f64();
-        gen.io_bytes += (h * 2) as u64;
-    }
+    gen.embed_row("token_embd.weight", token, h, &mut x)?;
     if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") && pos == 0 {
         let mut ms = 0.0f32;
         for &v in x.iter() {
@@ -109,17 +103,25 @@ pub(crate) fn forward_hybrid(
     let vocab = gen.config.vocab_size;
     let mut logits = vec![0.0f32; vocab];
     if gen.has_output_weight {
-        let t0 = Instant::now();
-        let ow = gen.catalog.load_quant_matrix("output.weight")?;
-        gen.io_secs += t0.elapsed().as_secs_f64();
-        gen.io_bytes += ow.nbytes() as u64;
-        orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+        if let Some(ow) = &gen.resident_output {
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+        } else {
+            let t0 = Instant::now();
+            let ow = gen.catalog.load_quant_matrix("output.weight")?;
+            gen.io_secs += t0.elapsed().as_secs_f64();
+            gen.io_bytes += ow.nbytes() as u64;
+            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+        }
     } else {
-        let t0 = Instant::now();
-        let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-        gen.io_secs += t0.elapsed().as_secs_f64();
-        gen.io_bytes += emb.nbytes() as u64;
-        orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+        if let Some(emb) = &gen.resident_embed {
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+        } else {
+            let t0 = Instant::now();
+            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+            gen.io_secs += t0.elapsed().as_secs_f64();
+            gen.io_bytes += emb.nbytes() as u64;
+            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+        }
     }
     gen.position += 1;
     if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
@@ -442,7 +444,7 @@ fn run_full_attn_block(
         &mut gen.used_dgpu,
         &mut gen.used_apu,
         Some(scratch),
-        slot,
+        layer,
         Some(&layout),
     )?;
     ffn_finish_scratch(
@@ -454,7 +456,7 @@ fn run_full_attn_block(
         &mut gen.ws_down,
         &mut gen.used_dgpu,
         Some(scratch),
-        slot,
+        layer,
         Some(&layout),
     )?;
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();

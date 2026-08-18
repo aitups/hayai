@@ -45,11 +45,7 @@ impl StreamingGenerator {
         let mut xs: Vec<Vec<f32>> = Vec::with_capacity(t_count);
         for &tok in tokens {
             let mut x = vec![0.0f32; h];
-            let t0 = Instant::now();
-            self.catalog
-                .read_embed_row("token_embd.weight", tok, h, &mut x)?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += (h * 2) as u64;
+            self.embed_row("token_embd.weight", tok, h, &mut x)?;
             xs.push(x);
         }
 
@@ -71,7 +67,8 @@ impl StreamingGenerator {
             }
 
             let mut prefetch = None;
-            if layer_idx + 1 < n_layers {
+            // Resident mode: all layers already in device memory — no prefetch.
+            if !scratch.resident && layer_idx + 1 < n_layers {
                 let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
                 let next_slot = (layer_idx + 1) % 2;
@@ -89,8 +86,15 @@ impl StreamingGenerator {
             let slot = layer_idx % 2;
 
             // DMA FFN once per layer (overlaps first Attn); unmap before first FFN enqueue.
-            scratch.ensure_host_readable(&orch.pool, slot)?;
-            current = current.rebind_views(scratch.host_slot(slot), &layout);
+            if scratch.resident {
+                scratch.ensure_host_readable(&orch.pool, layer_idx)?;
+                (current, layout) = self
+                    .catalog
+                    .layer_pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
+            } else {
+                scratch.ensure_host_readable(&orch.pool, slot)?;
+                current = current.rebind_views(scratch.host_slot(slot), &layout);
+            }
             self.begin_ffn_dma(orch, scratch, slot, &layout)?;
             let mut dma_committed = true;
 
@@ -103,8 +107,15 @@ impl StreamingGenerator {
 
                 if do_attn {
                     if !dma_committed {
-                        scratch.ensure_host_readable(&orch.pool, slot)?;
-                        current = current.rebind_views(scratch.host_slot(slot), &layout);
+                        if scratch.resident {
+                            scratch.ensure_host_readable(&orch.pool, layer_idx)?;
+                            (current, layout) = self
+                                .catalog
+                                .layer_pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
+                        } else {
+                            scratch.ensure_host_readable(&orch.pool, slot)?;
+                            current = current.rebind_views(scratch.host_slot(slot), &layout);
+                        }
                     }
 
                     let t_attn = Instant::now();
@@ -154,7 +165,7 @@ impl StreamingGenerator {
                         &mut down_out,
                         &mut self.used_dgpu,
                         Some(scratch),
-                        slot,
+                        layer_idx,
                         Some(&layout),
                     )?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
@@ -185,7 +196,7 @@ impl StreamingGenerator {
                     &mut self.used_dgpu,
                     &mut self.used_apu,
                     Some(scratch),
-                    slot,
+                    layer_idx,
                     Some(&layout),
                 )?;
                 self.ffn_secs += t_enq.elapsed().as_secs_f64();
@@ -299,7 +310,7 @@ impl StreamingGenerator {
                         &mut down_out,
                         &mut self.used_dgpu,
                         Some(scratch),
-                        layer_idx % 2,
+                        layer_idx,
                         Some(&fin_layout),
                     )?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
@@ -345,7 +356,7 @@ impl StreamingGenerator {
                     &mut down_out,
                     &mut self.used_dgpu,
                     Some(scratch),
-                    layer_idx % 2,
+                    layer_idx,
                     Some(&layout),
                 )?;
                 self.ffn_secs += t_ffn.elapsed().as_secs_f64();
@@ -362,17 +373,25 @@ impl StreamingGenerator {
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         if self.has_output_weight {
-            let t0 = Instant::now();
-            let ow = self.catalog.load_quant_matrix("output.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += ow.nbytes() as u64;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            if let Some(ow) = &self.resident_output {
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let ow = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += ow.nbytes() as u64;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
         } else {
-            let t0 = Instant::now();
-            let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += emb.nbytes() as u64;
-            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            if let Some(emb) = &self.resident_embed {
+                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += emb.nbytes() as u64;
+                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            }
         }
         Ok(logits)
     }

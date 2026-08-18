@@ -95,14 +95,18 @@ pub struct StreamingMemoryBudget {
 }
 
 impl StreamingMemoryBudget {
-    /// Estimate from model dims + one-layer pack size + KV sinks/window.
+    /// Estimate from model dims + layer-window size + KV sinks/window.
+    ///
+    /// `k_chunk` = number of resident layer slots (1 for strict ping-pong → 2×
+    /// layer window; `n_layers` for full-resident → whole model window).
     pub fn estimate(
         config: &ModelConfig,
         layer_pack_bytes: usize,
+        k_chunk: usize,
         num_sink_tokens: usize,
         window_size: usize,
     ) -> Self {
-        let layer_window_bytes = 2u64.saturating_mul(layer_pack_bytes as u64);
+        let layer_window_bytes = (k_chunk as u64 + 1).saturating_mul(layer_pack_bytes as u64);
 
         let head_dim = config
             .hidden_size

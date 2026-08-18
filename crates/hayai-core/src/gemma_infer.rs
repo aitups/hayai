@@ -171,13 +171,7 @@ pub(crate) fn forward_gemma(
     let meta = GemmaMeta::from_catalog(&gen.catalog, &gen.config)?;
 
     let mut x = vec![0.0f32; h];
-    {
-        let t0 = Instant::now();
-        gen.catalog
-            .read_embed_row("token_embd.weight", token, h, &mut x)?;
-        gen.io_secs += t0.elapsed().as_secs_f64();
-        gen.io_bytes += (h * 2) as u64;
-    }
+    gen.embed_row("token_embd.weight", token, h, &mut x)?;
     // Gemma: scale token embeddings by sqrt(n_embd).
     let emb_scale = (h as f32).sqrt();
     for v in x.iter_mut() {
@@ -319,7 +313,7 @@ pub(crate) fn forward_gemma(
             &mut gen.used_dgpu,
             &mut gen.used_apu,
             Some(scratch),
-            slot,
+            layer,
             Some(&layout),
         )?;
         ffn_finish_gelu_scratch(
@@ -331,7 +325,7 @@ pub(crate) fn forward_gemma(
             &mut gen.ws_down,
             &mut gen.used_dgpu,
             Some(scratch),
-            slot,
+            layer,
             Some(&layout),
         )?;
         gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
@@ -368,13 +362,21 @@ pub(crate) fn forward_gemma(
     let vocab = gen.config.vocab_size;
     let mut logits = vec![0.0f32; vocab];
     if gen.has_output_weight {
-        let ow = gen.catalog.load_quant_matrix("output.weight")?;
-        orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-        gen.io_bytes += ow.nbytes() as u64;
+        if let Some(ow) = &gen.resident_output {
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+        } else {
+            let ow = gen.catalog.load_quant_matrix("output.weight")?;
+            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            gen.io_bytes += ow.nbytes() as u64;
+        }
     } else {
-        let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-        orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-        gen.io_bytes += emb.nbytes() as u64;
+        if let Some(emb) = &gen.resident_embed {
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+        } else {
+            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            gen.io_bytes += emb.nbytes() as u64;
+        }
     }
     if meta.softcap > 0.0 {
         let inv = 1.0 / meta.softcap;
@@ -399,8 +401,7 @@ fn build_per_layer_inputs(
     let total = n_layers * d;
     let mut tok_ple = vec![0.0f32; total];
     // per_layer_token_embd: [vocab, n_layers * d]
-    gen.catalog
-        .read_embed_row("per_layer_token_embd.weight", token, total, &mut tok_ple)?;
+    gen.embed_row("per_layer_token_embd.weight", token, total, &mut tok_ple)?;
     let scale = (d as f32).sqrt();
     for v in tok_ple.iter_mut() {
         *v *= scale;

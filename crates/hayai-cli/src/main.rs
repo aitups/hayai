@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use hayai_core::{
-    build_exec_plan, format_bytes, process_rss_bytes, run_decode_benchmark, run_overlap_probe,
-    EngineOrchestrator, ExecutionMode, Generator, MemoryStrategy, StreamingGenerator,
-    StreamingMemoryBudget,
+    build_exec_plan, compute_window_plan, format_bytes, process_rss_bytes, run_decode_benchmark,
+    run_overlap_probe, EngineOrchestrator, ExecutionMode, Generator, MemoryStrategy,
+    StreamingGenerator, StreamingMemoryBudget,
 };
 use hayai_cpu::{cpu_lut_matmul_q4, fp32_matmul, max_abs_diff, unpack_q4_to_fp32};
 use hayai_io::{open_layer_reader, PingPongBuffer};
@@ -901,10 +901,24 @@ fn cmd_bench_generate(
     };
     println!("  ChatML:        {use_chat}");
     let rss0 = process_rss_bytes();
-    let budget = StreamingMemoryBudget::estimate(&gen.config, layer_bytes, sinks, window);
 
     let mode = parse_device_mode(&device);
     let mut orch = EngineOrchestrator::new(mode, gen.config.clone());
+    let win = compute_window_plan(
+        &orch.pool,
+        layer_bytes,
+        gen.config.num_layers,
+        gen.memory_strategy,
+    );
+    let budget =
+        StreamingMemoryBudget::estimate(&gen.config, layer_bytes, win.k_chunk, sinks, window);
+
+    println!(
+        "  AdaptiveWindow: k_chunk={} resident={} window={}",
+        win.k_chunk,
+        win.resident,
+        format_bytes(win.window_bytes)
+    );
     println!("  FFN device:    {}", orch.ffn_device_name());
     if let Some(cl) = orch.opencl_engine() {
         println!(
