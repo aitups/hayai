@@ -25,6 +25,7 @@ The engine is **architecture-agnostic**: it reads a GGUF's metadata and builds a
 | `hayai-cpu` | SIMD attention, Q4 LUT MatMul, KV cache |
 | `hayai-model` | GGUF parsing, quantized GEMV formats, tokenizer, sampler |
 | `hayai-cli` | Command-line interface |
+| `hayai-api` | OpenAI-compatible HTTP server (`hayai-server`) |
 
 ---
 
@@ -125,6 +126,55 @@ cargo run --release -p hayai-cli -- generate --help
 ```
 
 ---
+
+## Server (OpenAI-compatible API)
+
+`hayai-server` exposes the engine through an OpenAI-compatible HTTP API with
+token-by-token SSE streaming.
+
+```bash
+# Serve a single model
+hayai-server --model models/SmolLM2-135M-Instruct-Q4_K_M.gguf --port 8080 --device cpu
+
+# Auto-scan models/ + download a model from HuggingFace (default *Q4_K_M.gguf)
+hayai-server --models-dir models --hf bartowski/SmolLM2-135M-Instruct-GGUF --port 8080
+
+# Exact HF file + resident weights + custom chat template
+hayai-server --hf Qwen/Qwen2.5-7B-Instruct-GGUF --hf-file qwen2.5-7b-instruct-q4_k_m.gguf \
+  --memory-strategy auto --chat-template @my_template.jinja
+```
+
+### Endpoints
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /healthz` | Health check |
+| `GET /v1/models` | List registered models (auto-scan of `--models-dir` + `--model` + `--hf`) |
+| `POST /v1/completions` | Legacy completion (`prompt`, `max_tokens`, `temperature`, `top_p`, `seed`, `stop`, `stream`) |
+| `POST /v1/chat/completions` | Chat completion (`messages`, same options) — renders the model's chat template |
+
+Both generation endpoints support `"stream": true` → SSE events with
+`choices[].delta.content` per token and a final `data: [DONE]`.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"SmolLM2-135M-Instruct-Q4_K_M","messages":[{"role":"user","content":"Say hi"}],"max_tokens":32,"stream":true}'
+```
+
+### Chat templates
+
+The chat template is read from the model's GGUF metadata
+(`tokenizer.chat_template`, Jinja) and rendered with `minijinja`. If the GGUF
+has none, a ChatML fallback is assumed. `--chat-template <string|@file>` overrides
+it for every model.
+
+### Notes
+
+- Requests for the same model are serialized on the shared OpenCL orchestrator;
+  each request keeps its own KV context. Default `--memory-strategy minimal`
+  avoids per-request resident preloads on multi-request servers.
+- `n > 1`, `logprobs` and `/v1/embeddings` are not implemented yet.
 
 ## Supported models
 
