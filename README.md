@@ -111,6 +111,10 @@ cargo run --release -p hayai-cli -- generate \
 ### Common options
 
 - `--device auto|cpu|<substring>` — `auto` picks any OpenCL GPU and falls back to CPU; `cpu` forces CPU-only; any other string selects the first OpenCL device whose name contains it (falls back to CPU if not found).
+- `--memory-strategy auto|minimal|<cap_mb>` — memory window for the weight stream:
+  - `auto` (default): detect free VRAM/RAM and pick the largest safe layer chunk (`k_chunk`). If the whole model fits, it becomes **resident** (all layers preloaded into SVM/VRAM once → zero disk I/O and zero per-token DMA).
+  - `minimal`: strict 2-slot ping-pong (lowest footprint).
+  - `2048` / `2048mb`: cap the resident window (e.g. macro-chunking with `k_chunk` blocks).
 - `generate`: `--model`, `--prompt`, `--max-tokens`, `--device`, `--sinks`, `--window`, `--sample greedy|temperature|top_p`, `--temperature`, `--top_p`, `--seed`, `--raw`, `--dev_mmap` (dev-only mmap path that violates the streaming design).
 - `bench-generate`: same model/prompt/tokens/device/sinks/window options plus `--raw`.
 
@@ -143,6 +147,7 @@ cargo run --release -p hayai-cli -- generate --help
 | --- | --- |
 | `RUST_LOG` | `tracing` filter (default `info`), e.g. `RUST_LOG=debug` |
 | `HAYAI_FORCE_TOKIO_IO` | Force tokio-based I/O instead of `io_uring` on Linux |
+| `HAYAI_O_DIRECT` | Open the GGUF with `O_DIRECT` (Linux, bypass page cache; buffers are page-aligned) |
 | `HAYAI_MAX_LAYERS` | Cap the number of model layers processed (debug) |
 | `HAYAI_SKIP_DN_ATTN` / `HAYAI_SKIP_FA_ATTN` | Skip DeltaNet / full-attention residuals (ablation) |
 | `HAYAI_DUMP_TOP` / `HAYAI_DUMP_AT_POS` / `HAYAI_DUMP_LAYER_RMS` | Dump top-k logits / layer RMS norms (debug) |
