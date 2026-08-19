@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "io-uring",
+ "libc",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -356,6 +357,7 @@ version = "0.1.0"
 dependencies = [
  "cl3",
  "hayai-cpu",
+ "hayai-io",
  "hayai-kernels",
  "hayai-model",
  "libc",
