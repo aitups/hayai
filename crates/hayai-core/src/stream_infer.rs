@@ -1480,7 +1480,7 @@ fn build_attn_config(
     Ok(cfg)
 }
 
-fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
+pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
     let arch = cat.meta_str("general.architecture").unwrap_or("llama");
     let prefix = if arch == "llama" || arch == "qwen2" || arch.contains("smollm") {
         "llama"

@@ -8,6 +8,7 @@ members = [
     "crates/hayai-cpu",
     "crates/hayai-model",
     "crates/hayai-cli",
+    "crates/hayai-api",
 ]
 
 [workspace.package]
@@ -29,6 +30,12 @@ clap = { version = "=4.5.1", default-features = false, features = ["std", "help"
 rayon = "1.10"
 memmap2 = "0.9"
 ureq = "2.9"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+tokio-stream = "0.1"
+minijinja = "2"
 
 # Workspace crates
 hayai-core = { path = "crates/hayai-core" }
@@ -37,3 +44,4 @@ hayai-opencl = { path = "crates/hayai-opencl" }
 hayai-kernels = { path = "crates/hayai-kernels" }
 hayai-cpu = { path = "crates/hayai-cpu" }
 hayai-model = { path = "crates/hayai-model" }
+hayai-api = { path = "crates/hayai-api" }

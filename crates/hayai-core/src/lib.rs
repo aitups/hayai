@@ -23,4 +23,4 @@ pub use pipeline::{
     PipelineStats, SyntheticFfnWeights,
 };
 pub use session::GenerationSession;
-pub use stream_infer::{StreamInferError, StreamingGenerator};
+pub use stream_infer::{load_config, StreamInferError, StreamingGenerator};

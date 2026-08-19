@@ -40,6 +40,11 @@ pub struct EngineOrchestrator {
     pub model_config: ModelConfig,
 }
 
+// SAFETY: OpenCL handles are raw pointers; the orchestrator is always accessed
+// behind a `Mutex` (API server serializes requests per model), so the underlying
+// OpenCL objects are never used concurrently. `Sync` comes from `Arc<Mutex<_>>`.
+unsafe impl Send for EngineOrchestrator {}
+
 impl EngineOrchestrator {
     pub fn new(requested_mode: ExecutionMode, model_config: ModelConfig) -> Self {
         info!(

@@ -1,0 +1,27 @@
+[package]
+name = "hayai-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hayai-server"
+path = "src/main.rs"
+
+[dependencies]
+hayai-core.workspace = true
+hayai-model.workspace = true
+hayai-opencl.workspace = true
+hayai-io.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+minijinja.workspace = true
+ureq.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
