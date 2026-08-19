@@ -121,6 +121,8 @@ pub struct StreamingGenerator {
     pub(crate) resident_embed: Option<QuantMatrix>,
     /// Stored ExecPlan used to drive the forward graph (Ola 2).
     pub exec_plan: Option<crate::exec_plan::ExecPlan>,
+    /// Dedicated background I/O worker (Phase H1) for block prefetches.
+    pub(crate) io_worker: hayai_io::IoWorker,
     /// Qwen3.5 DeltaNet weights (None entries for full-attn layers).
     pub(crate) deltanet_weights: Option<Vec<Option<crate::deltanet::DeltaNetLayerWeights>>>,
     pub(crate) deltanet_states: Option<Vec<Option<crate::deltanet::DeltaNetState>>>,
@@ -248,6 +250,7 @@ impl StreamingGenerator {
             layer_scratch_cap: 0,
             z_l_init,
             exec_plan: None,
+            io_worker: hayai_io::IoWorker::new("hayai-io-worker"),
             deltanet_weights: None,
             deltanet_states: None,
             memory_strategy: MemoryStrategy::AutoFit,
@@ -772,8 +775,8 @@ impl StreamingGenerator {
             // Ensure this block is staged in its ping-pong slot.
             self.stage_block(orch, scratch, bs, be)?;
 
-            // Prefetch the next block in parallel (I/O overlaps compute).
-            let mut prefetch: Option<JoinHandle<Result<(), GgufError>>> = None;
+            // Prefetch the next block on the dedicated I/O worker (overlaps compute).
+            let mut prefetch: Option<std::sync::mpsc::Receiver<Result<(), GgufError>>> = None;
             if block + 1 < n_blocks {
                 let next_bs = (block + 1) * k;
                 let next_be = (next_bs + k).min(n_layers);
@@ -785,7 +788,7 @@ impl StreamingGenerator {
                 let slot_ptr = PrefetchSlotPtr::new(ptr, scratch.slot_capacity());
                 let stride = scratch.resident_stride;
                 let mut cat = self.catalog.fork_reader()?;
-                prefetch = Some(thread::spawn(move || {
+                prefetch = self.io_worker.run(move || -> Result<(), GgufError> {
                     let dst = unsafe { slot_ptr.as_mut_slice() };
                     for l in next_bs..next_be {
                         let off = (l - next_bs) * stride;
@@ -793,7 +796,7 @@ impl StreamingGenerator {
                         cat.load_layer_pack_into(l, &mut dst[off..end])?;
                     }
                     Ok(())
-                }));
+                });
             }
 
             // Process every layer of the block.
@@ -894,15 +897,15 @@ impl StreamingGenerator {
                 }
             }
 
-            if let Some(handle) = prefetch.take() {
-                match handle.join() {
+            if let Some(rx) = prefetch {
+                match rx.recv() {
                     Ok(Ok(())) => {
                         scratch.mark_block_staged((block + 1) % 2, block + 1);
                         self.prefetch_hits += 1;
                     }
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => {
-                        return Err(StreamInferError::Msg("block prefetch panicked".into()))
+                        return Err(StreamInferError::Msg("block prefetch worker dropped".into()))
                     }
                 }
             }

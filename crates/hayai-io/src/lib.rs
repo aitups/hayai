@@ -1,4 +1,5 @@
 pub mod buffer_pool;
+pub mod io_worker;
 pub mod reader;
 pub mod weight_io;
 
@@ -6,6 +7,7 @@ pub mod weight_io;
 pub mod iouring_reader;
 
 pub use buffer_pool::{AlignedBuffer, PingPongBuffer};
+pub use io_worker::IoWorker;
 pub use reader::{
     open_layer_reader, IoBackend, LayerPrefetcher, LayerReader, StreamStats,
 };
