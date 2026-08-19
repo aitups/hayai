@@ -6,6 +6,7 @@ use super::{IoBackend, LayerReader, StreamStats};
 use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::pin::Pin;
@@ -31,12 +32,33 @@ impl IoUringLayerPrefetcher {
         layer_size_bytes: usize,
         total_layers: usize,
     ) -> io::Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        // Phase F: optional O_DIRECT (bypass page cache); buffers are page-aligned
+        // and layer offsets are sequential/aligned, so direct reads are legal.
+        let want_direct = std::env::var_os("HAYAI_O_DIRECT").is_some();
+        let file = if want_direct {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
+            {
+                Ok(f) => {
+                    info!("io_uring LayerReader: O_DIRECT enabled");
+                    f
+                }
+                Err(e) => {
+                    tracing::warn!("O_DIRECT layer reader open failed ({e}); buffered");
+                    File::open(path)?
+                }
+            }
+        } else {
+            File::open(path)?
+        };
         // Small ring; one in-flight read per layer is enough for the ping-pong pipeline.
         let ring = IoUring::new(8).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         info!(
             "Opened io_uring streaming file {:?} — {} layers × {} KB",
-            path.as_ref(),
+            path,
             total_layers,
             layer_size_bytes / 1024
         );

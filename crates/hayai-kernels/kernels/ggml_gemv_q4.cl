@@ -72,12 +72,18 @@ __kernel void ggml_gemv_q4_0(
                 ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
                 float d = hayai_half_bits_to_float(hd);
                 int x_base = b * 32 - t0;
-                for (int j = 0; j < 16; j++) {
-                    uchar qs = wbase[base + 2 + j];
-                    float x0 = (float)((int)(qs & 0x0F) - 8);
-                    float x1 = (float)((int)(qs >> 4) - 8);
+                // Vectorized loads (vload8 tolerates the 18-byte unaligned GGML block).
+                uchar8 q0 = vload8(0, &wbase[base + 2]);
+                uchar8 q1 = vload8(0, &wbase[base + 10]);
+                for (int j = 0; j < 8; j++) {
+                    float x0 = (float)((int)(q0.s[j] & 0x0F) - 8);
+                    float x1 = (float)((int)(q0.s[j] >> 4) - 8);
+                    float x2 = (float)((int)(q1.s[j] & 0x0F) - 8);
+                    float x3 = (float)((int)(q1.s[j] >> 4) - 8);
                     sum += x0 * d * local_input[x_base + j];
                     sum += x1 * d * local_input[x_base + j + 16];
+                    sum += x2 * d * local_input[x_base + j + 8];
+                    sum += x3 * d * local_input[x_base + j + 24];
                 }
             }
         }
@@ -114,10 +120,19 @@ __kernel void ggml_gemv_q4_1(
                 float d = hayai_half_bits_to_float(hd);
                 float m = hayai_half_bits_to_float(hm);
                 int x_base = b * 32 - t0;
-                for (int j = 0; j < 16; j++) {
-                    uchar qs = wbase[base + 4 + j];
-                    sum += ((float)(qs & 0x0F) * d + m) * local_input[x_base + j];
-                    sum += ((float)(qs >> 4) * d + m) * local_input[x_base + j + 16];
+                // Vectorized loads (vload8 tolerates the 20-byte unaligned GGML block).
+                uchar8 q0 = vload8(0, &wbase[base + 4]);
+                uchar8 q1 = vload8(0, &wbase[base + 12]);
+                for (int j = 0; j < 8; j++) {
+                    float a0 = (float)(q0.s[j] & 0x0F) * d + m;
+                    float a1 = (float)(q0.s[j] >> 4) * d + m;
+                    float a2 = (float)(q1.s[j] & 0x0F) * d + m;
+                    float a3 = (float)(q1.s[j] >> 4) * d + m;
+                    sum += a0 * local_input[x_base + j];
+                    sum += a1 * local_input[x_base + j + 16];
+                    sum += a2 * local_input[x_base + j + 8];
+                    sum += a3 * local_input[x_base + j + 24];
+                }
                 }
             }
         }
@@ -148,9 +163,16 @@ __kernel void ggml_gemv_q8_0(
         ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
         float d = hayai_half_bits_to_float(hd);
         int x_base = b * 32;
-        for (int j = 0; j < 32; j++) {
-            float q = (float)((char)wbase[base + 2 + j]);
-            sum += q * d * input[x_base + j];
+        // Vectorized loads (vload8 tolerates the 34-byte unaligned GGML block).
+        uchar8 q0 = vload8(0, &wbase[base + 2]);
+        uchar8 q1 = vload8(0, &wbase[base + 10]);
+        uchar8 q2 = vload8(0, &wbase[base + 18]);
+        uchar8 q3 = vload8(0, &wbase[base + 26]);
+        for (int j = 0; j < 8; j++) {
+            sum += (float)((char)q0.s[j]) * d * input[x_base + j];
+            sum += (float)((char)q1.s[j]) * d * input[x_base + j + 8];
+            sum += (float)((char)q2.s[j]) * d * input[x_base + j + 16];
+            sum += (float)((char)q3.s[j]) * d * input[x_base + j + 24];
         }
     }
     output[row] = sum;
@@ -280,9 +302,29 @@ __kernel void ggml_gemv_q4_k(
                     float m1v = minv * (float)m0;
                     float d2 = d * (float)sc1;
                     float m2v = minv * (float)m1;
-                    for (int l = 0; l < 32; l++) {
-                        sum += (d1 * (float)(q[qo + l] & 0x0F) - m1v) * local_input[x_base + sub * 64 + l];
-                        sum += (d2 * (float)(q[qo + l] >> 4) - m2v) * local_input[x_base + sub * 64 + 32 + l];
+                    // Vectorized loads: 4 × vload8 cover the 32 qs bytes of the sub-block.
+                    uchar8 qv0 = vload8(0, &q[qo]);
+                    uchar8 qv1 = vload8(0, &q[qo + 8]);
+                    uchar8 qv2 = vload8(0, &q[qo + 16]);
+                    uchar8 qv3 = vload8(0, &q[qo + 24]);
+                    for (int l = 0; l < 8; l++) {
+                        int c0 = qv0.s[l] & 0x0F;
+                        int c1 = qv0.s[l] >> 4;
+                        int c2 = qv1.s[l] & 0x0F;
+                        int c3 = qv1.s[l] >> 4;
+                        int c4 = qv2.s[l] & 0x0F;
+                        int c5 = qv2.s[l] >> 4;
+                        int c6 = qv3.s[l] & 0x0F;
+                        int c7 = qv3.s[l] >> 4;
+                        int xb = x_base + sub * 64;
+                        sum += (d1 * (float)c0 - m1v) * local_input[xb + l];
+                        sum += (d2 * (float)c1 - m2v) * local_input[xb + 32 + l];
+                        sum += (d1 * (float)c2 - m1v) * local_input[xb + 8 + l];
+                        sum += (d2 * (float)c3 - m2v) * local_input[xb + 40 + l];
+                        sum += (d1 * (float)c4 - m1v) * local_input[xb + 16 + l];
+                        sum += (d2 * (float)c5 - m2v) * local_input[xb + 48 + l];
+                        sum += (d1 * (float)c6 - m1v) * local_input[xb + 24 + l];
+                        sum += (d2 * (float)c7 - m2v) * local_input[xb + 56 + l];
                     }
                     qo += 32;
                     is += 2;

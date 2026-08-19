@@ -9,7 +9,7 @@ pub use buffer_pool::{AlignedBuffer, PingPongBuffer};
 pub use reader::{
     open_layer_reader, IoBackend, LayerPrefetcher, LayerReader, StreamStats,
 };
-pub use weight_io::{open_weight_io, FileWeightIo, WeightIo};
+pub use weight_io::{open_weight_io, FileWeightIo, IoRange, WeightIo};
 
 #[cfg(target_os = "linux")]
 pub use iouring_reader::IoUringLayerPrefetcher;

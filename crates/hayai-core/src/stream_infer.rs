@@ -514,7 +514,7 @@ impl StreamingGenerator {
         // Macro-chunk decode: blocks of `block_k` layers per I/O batch.
         if let Some(sc) = scratch.as_mut() {
             if sc.block_k > 1 && !sc.resident {
-                return self.forward_macro_chunk(orch, token, sc);
+                return self.forward_macro_chunk(orch, sc);
             }
         }
 
@@ -756,7 +756,6 @@ impl StreamingGenerator {
     fn forward_macro_chunk(
         &mut self,
         orch: &mut EngineOrchestrator,
-        token: u32,
         scratch: &mut hayai_opencl::StreamingScratch,
     ) -> Result<Vec<f32>, StreamInferError> {
         let h = self.config.hidden_size;
@@ -785,7 +784,6 @@ impl StreamingGenerator {
                 let (ptr, _len) = scratch.host_slot_block_ptr_mut(next_slot);
                 let slot_ptr = PrefetchSlotPtr::new(ptr, scratch.slot_capacity());
                 let stride = scratch.resident_stride;
-                let kk = k;
                 let mut cat = self.catalog.fork_reader()?;
                 prefetch = Some(thread::spawn(move || {
                     let dst = unsafe { slot_ptr.as_mut_slice() };

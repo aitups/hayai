@@ -7,7 +7,7 @@
 use crate::gguf::{parse_header_bytes, tensor_nbytes};
 use crate::gguf_types::{GgufError, MetadataValue, TensorInfo};
 use crate::quant::QuantMatrix;
-use hayai_io::{open_weight_io, IoBackend, WeightIo};
+use hayai_io::{open_weight_io, IoBackend, IoRange, WeightIo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -251,6 +251,7 @@ impl GgufCatalog {
         let mut dims = [(0usize, 0usize); 7];
         let mut types = [crate::gguf_types::GgmlType::F32; 7];
         let mut off = 0usize;
+        let mut ranges: Vec<IoRange> = Vec::with_capacity(8);
         for (i, name) in names.iter().enumerate() {
             let info = self.tensor(name)?.clone();
             let nbytes = tensor_nbytes(&info)?;
@@ -261,9 +262,11 @@ impl GgufCatalog {
                 )));
             }
             let abs = self.tensor_abs_offset(&info);
-            self.io
-                .read_at(abs, &mut dst[off..off + nbytes])
-                .map_err(GgufError::from)?;
+            ranges.push(IoRange {
+                offset: abs,
+                start: off,
+                end: off + nbytes,
+            });
             offs[i] = off;
             lens[i] = nbytes;
             dims[i] = (info.ncols(), info.nrows());
@@ -281,9 +284,11 @@ impl GgufCatalog {
                     )));
                 }
                 let abs = self.tensor_abs_offset(&info);
-                self.io
-                    .read_at(abs, &mut dst[off..off + nbytes])
-                    .map_err(GgufError::from)?;
+                ranges.push(IoRange {
+                    offset: abs,
+                    start: off,
+                    end: off + nbytes,
+                });
                 let ag_off = off;
                 off += nbytes;
                 (
@@ -295,6 +300,8 @@ impl GgufCatalog {
             } else {
                 (0, 0, (0, 0), crate::gguf_types::GgmlType::F32)
             };
+        // Batch: submit all tensor reads of the layer pack at once (io_uring).
+        self.io.read_many_at(dst, &ranges).map_err(GgufError::from)?;
         let layout = LayerPackLayout {
             wq_off: offs[0],
             wk_off: offs[1],
