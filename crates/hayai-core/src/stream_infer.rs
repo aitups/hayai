@@ -1082,6 +1082,12 @@ impl StreamingGenerator {
             );
             let mut cat = self.catalog.fork_reader()?;
             for i in 0..self.config.num_layers {
+                // Hybrid (Qwen3.5 DeltaNet) layers keep their weights in the
+                // DeltaNetLayerWeights cache (ensure_deltanet_cache) and their
+                // scratch slot is not used by the generic llama pack.
+                if crate::deltanet::is_deltanet_layer(&self.catalog, i) {
+                    continue;
+                }
                 let t0 = Instant::now();
                 let layout_total = {
                     let dst = scratch.host_slot_mut(i);
