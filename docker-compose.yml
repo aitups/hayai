@@ -1,0 +1,51 @@
+# Hayai — OpenAI-compatible LLM server
+# Build:   docker compose build
+# Run:     docker compose up -d
+# Push:    docker push aitups/hayai:latest
+
+services:
+  hayai:
+    image: aitups/hayai:latest
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Host models directory. Must be writable by the container user (uid 1000)
+      # for `HAYAI_HF` downloads: `sudo chown 1000:1000 models` on Linux,
+      # or use a named Docker volume instead of a bind mount.
+      - ./models:/hayai/models
+    environment:
+      # All hayai-server options are configurable via HAYAI_* env vars.
+      HAYAI_HOST: "0.0.0.0"
+      HAYAI_PORT: "8080"
+      HAYAI_MODELS_DIR: "/hayai/models"
+
+      # Model selection:
+      #   - auto-scan of HAYAI_MODELS_DIR (*.gguf)
+      #   - explicit paths (comma-separated):
+      # HAYAI_MODEL: "models/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+      #   - download from HuggingFace (defaults to the *Q4_K_M.gguf file):
+      # HAYAI_HF: "bartowski/SmolLM2-135M-Instruct-GGUF"
+      # HAYAI_HF_FILE: "SmolLM2-135M-Instruct-Q4_K_M.gguf"
+
+      # Engine:
+      HAYAI_DEVICE: "cpu"                    # auto | cpu | <OpenCL device substring>
+      HAYAI_MEMORY_STRATEGY: "minimal"       # auto | minimal | cap_mb
+      HAYAI_SINKS: "4"
+      HAYAI_WINDOW: "256"
+      # HAYAI_CHAT_TEMPLATE: "@chat_template.jinja"
+      HAYAI_LOG: "info"
+    restart: unless-stopped
+
+    # io_uring is blocked by Docker's default seccomp profile; Hayai falls back to
+    # buffered file I/O automatically (see WeightIo=file in the logs). To enable
+    # io_uring, uncomment the following lines:
+    # security_opt:
+    #   - seccomp=unconfined
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

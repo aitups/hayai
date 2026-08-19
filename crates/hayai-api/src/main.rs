@@ -8,37 +8,37 @@ use std::sync::Arc;
 #[command(name = "hayai-server")]
 #[command(about = "Hayai — OpenAI-compatible LLM server (weight-streaming engine)")]
 struct Args {
-    /// GGUF model path(s) to serve (repeatable)
-    #[arg(long)]
+    /// GGUF model path(s) to serve (repeatable / comma-separated env)
+    #[arg(long, env = "HAYAI_MODEL", value_delimiter = ',')]
     model: Vec<String>,
     /// Directory scanned for *.gguf (default: models)
-    #[arg(long, default_value = "models")]
+    #[arg(long, default_value = "models", env = "HAYAI_MODELS_DIR")]
     models_dir: String,
     /// HuggingFace repo id, e.g. bartowski/SmolLM2-135M-Instruct-GGUF
     /// (downloads the *Q4_K_M.gguf into --models-dir)
-    #[arg(long)]
+    #[arg(long, env = "HAYAI_HF", value_delimiter = ',')]
     hf: Vec<String>,
     /// Exact GGUF file inside the --hf repo (with --hf)
-    #[arg(long)]
+    #[arg(long, env = "HAYAI_HF_FILE")]
     hf_file: Option<String>,
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1", env = "HAYAI_HOST")]
     host: String,
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "8080", env = "HAYAI_PORT")]
     port: u16,
     /// auto | cpu | <OpenCL device name substring>
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = "auto", env = "HAYAI_DEVICE")]
     device: String,
     /// auto | minimal | cap_mb (server default minimal avoids per-request resident preload)
-    #[arg(long, default_value = "minimal")]
+    #[arg(long, default_value = "minimal", env = "HAYAI_MEMORY_STRATEGY")]
     memory_strategy: String,
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "4", env = "HAYAI_SINKS")]
     sinks: usize,
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "256", env = "HAYAI_WINDOW")]
     window: usize,
     /// Chat template override: template string or @path/to/file
-    #[arg(long)]
+    #[arg(long, env = "HAYAI_CHAT_TEMPLATE")]
     chat_template: Option<String>,
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "info", env = "HAYAI_LOG")]
     log: String,
 }
 

@@ -1,0 +1,38 @@
+# Git / local state
+.git
+.gitignore
+.cargo
+.cursor
+.idea
+.vscode
+
+# Build artifacts (rebuilt inside the image)
+target
+
+# Models and downloaded weights (mounted at run time)
+models
+*.gguf
+*.safetensors
+*.bin
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Benchmark results / logs / intermediate output
+bench_results
+results_*.txt
+*.log
+*.err
+*.out
+
+# Internal plans and design notes (not for distribution)
+implementation_plan*.md
+propuesta_de_optimización.md
+Inferencia de Modelos con Streaming de Pesos.md
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key

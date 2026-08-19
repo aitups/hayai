@@ -176,6 +176,37 @@ it for every model.
   avoids per-request resident preloads on multi-request servers.
 - `n > 1`, `logprobs` and `/v1/embeddings` are not implemented yet.
 
+## Docker
+
+A precompiled image is provided (`aitups/hayai`, Debian bookworm, multi-arch
+amd64/arm64). It ships `hayai-server` and `hayai-cli`, runs as a non-root user
+(uid 1000) and includes the generic OpenCL ICD loader (`ocl-icd-libopencl1`);
+without a vendor ICD the engine falls back to CPU-only.
+
+```bash
+# Build locally
+docker build -t aitups/hayai:latest .
+
+# Run with your models directory mounted (reads work even if read-only; make it
+# writable by uid 1000 for --hf downloads: `sudo chown 1000:1000 models`)
+docker run -d -p 8080:8080 -v "$PWD/models:/hayai/models" aitups/hayai:latest
+
+# Or use compose
+docker compose up -d
+```
+
+All `hayai-server` options are configurable via `HAYAI_*` env vars (see
+`docker-compose.yml`): `HAYAI_HOST`, `HAYAI_PORT`, `HAYAI_MODELS_DIR`,
+`HAYAI_MODEL` (comma-separated), `HAYAI_HF`, `HAYAI_HF_FILE`, `HAYAI_DEVICE`,
+`HAYAI_MEMORY_STRATEGY`, `HAYAI_SINKS`, `HAYAI_WINDOW`, `HAYAI_CHAT_TEMPLATE`,
+`HAYAI_LOG`. Explicit CLI args still take precedence.
+
+> **io_uring & Docker:** the default Docker seccomp profile blocks `io_uring`,
+> so Hayai automatically falls back to buffered file I/O (`WeightIo=file` in the
+> logs). To enable `io_uring` run with `--security-opt seccomp=unconfined`.
+
+
+
 ## Supported models
 
 `ExecPlan` is metadata-driven, so any GGUF whose tensors map to registered layer ops should build a streaming plan. Families exercised in the current suite:
