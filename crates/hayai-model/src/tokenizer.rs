@@ -14,6 +14,10 @@ pub struct Tokenizer {
     pub add_bos: bool,
     /// SentencePiece (Gemma/LLaMA): space marker is `▁` (U+2581). Else GPT-2 `Ġ`.
     pub spm: bool,
+    /// GPT-2 byte-level BPE forward map (byte -> unicode char). Empty for SentencePiece.
+    pub bytes_to_unicode: HashMap<u8, char>,
+    /// GPT-2 byte-level BPE inverse map (unicode char -> byte). Empty for SentencePiece.
+    pub unicode_to_byte: HashMap<char, u8>,
     /// Raw Jinja chat template stored in the GGUF (`tokenizer.chat_template`),
     /// if present. Used by the OpenAI-like API to render chat messages.
     pub chat_template: Option<String>,
@@ -115,6 +119,14 @@ impl Tokenizer {
             .collect();
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+        // GPT-2 byte-level BPE (byte_fallback) vocabularies (GPT-2, Qwen, SmolLM2, Llama-3)
+        // store every raw byte as one token whose text is the `bytes_to_unicode` char.
+        let (bytes_to_unicode, unicode_to_byte) = if spm {
+            (HashMap::new(), HashMap::new())
+        } else {
+            build_byte_maps()
+        };
+
         // Jinja chat template (transformers convention); also accept `general.chat_template`.
         let chat_template = metadata
             .get("tokenizer.chat_template")
@@ -140,6 +152,8 @@ impl Tokenizer {
             eos_id,
             add_bos,
             spm,
+            bytes_to_unicode,
+            unicode_to_byte,
             chat_template,
         })
     }
@@ -214,11 +228,21 @@ impl Tokenizer {
             if let Some(&id) = self.token_to_id.get(&s) {
                 out.push(id);
             } else {
-                // byte fallback via <0xNN> tokens if present, else skip
+                // Byte fallback: byte-level BPE vocabs map raw bytes to the
+                // `bytes_to_unicode` char tokens; also accept <0xNN> tokens if present.
                 for b in s.as_bytes() {
-                    let tok = format!("<0x{b:02X}>");
-                    if let Some(&id) = self.token_to_id.get(&tok) {
-                        out.push(id);
+                    let mut pushed = false;
+                    if let Some(&ch) = self.bytes_to_unicode.get(b) {
+                        if let Some(&id) = self.token_to_id.get(&ch.to_string()) {
+                            out.push(id);
+                            pushed = true;
+                        }
+                    }
+                    if !pushed {
+                        let tok = format!("<0x{b:02X}>");
+                        if let Some(&id) = self.token_to_id.get(&tok) {
+                            out.push(id);
+                        }
                     }
                 }
             }
@@ -227,7 +251,7 @@ impl Tokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> String {
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             if let Some(tok) = self.tokens.get(id as usize) {
                 if tok == "<|endoftext|>"
@@ -238,26 +262,60 @@ impl Tokenizer {
                 }
                 if let Some(hex) = tok.strip_prefix("<0x").and_then(|t| t.strip_suffix('>')) {
                     if let Ok(b) = u8::from_str_radix(hex, 16) {
-                        s.push(b as char);
+                        bytes.push(b);
                         continue;
                     }
                 }
-                // GPT-2 style specials: Ġ=space, Ċ=newline, etc.
-                s.push_str(
-                    &tok.replace('Ġ', " ")
-                        .replace('▁', " ")
-                        .replace('Ċ', "\n")
-                        .replace('ċ', "\t"),
-                );
+                // GPT-2 byte-level BPE: inverse bytes_to_unicode -> raw bytes;
+                // SentencePiece: space marker is U+2581 and tokens are plain UTF-8.
+                if self.spm {
+                    bytes.extend_from_slice(tok.replace('\u{2581}', " ").as_bytes());
+                } else {
+                    for ch in tok.chars() {
+                        match self.unicode_to_byte.get(&ch) {
+                            Some(&b) => bytes.push(b),
+                            None => {
+                                let mut buf = [0u8; 4];
+                                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                        }
+                    }
+                }
             }
         }
-        s
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// ChatML-style wrap used by SmolLM Instruct (and similar) GGUFs.
     pub fn apply_chat_template(&self, user: &str) -> String {
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     }
+}
+
+/// GPT-2 `bytes_to_unicode` mapping (HuggingFace tokenizers). Every byte maps to a
+/// printable char: printable ASCII/Latin-1 map to themselves, the rest to U+0100+.
+/// Used by byte-level BPE vocabularies (GPT-2, Qwen, SmolLM2, Llama-3).
+fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
+    let mut bs: Vec<u8> = Vec::new();
+    let mut cs: Vec<char> = Vec::new();
+    for b in b'!'..=b'~' { bs.push(b); cs.push(b as char); }
+    for b in 0xa1..=0xac { bs.push(b); cs.push(b as char); }
+    for b in 0xae..=0xff { bs.push(b); cs.push(b as char); }
+    let mut n = 0u32;
+    for b in 0..=255u32 {
+        if !bs.contains(&(b as u8)) {
+            bs.push(b as u8);
+            cs.push(char::from_u32(0x100 + n).expect("byte map range"));
+            n += 1;
+        }
+    }
+    let mut fwd = HashMap::with_capacity(256);
+    let mut inv = HashMap::with_capacity(256);
+    for (b, ch) in bs.into_iter().zip(cs.into_iter()) {
+        fwd.insert(b, ch);
+        inv.insert(ch, b);
+    }
+    (fwd, inv)
 }
 
 fn split_words(text: &str, spm: bool) -> Vec<String> {
@@ -336,6 +394,47 @@ mod tests {
         assert!(!tok.spm);
         let ids = tok.bpe_encode_word("ab");
         assert_eq!(ids, vec![5]); // "ab"
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn byte_level_bpe_non_ascii_roundtrip() {
+        let path = temp_dir().join("hayai_tok_bytes_test.gguf");
+        // GPT-2 byte-level BPE vocab for "中" (UTF-8 bytes E4 B8 AD) plus ASCII.
+        let (fwd, _inv) = build_byte_maps();
+        let e4 = fwd[&0xe4u8].to_string();
+        let b8 = fwd[&0xb8u8].to_string();
+        let ad = fwd[&0xadu8].to_string();
+        let tokens = vec![
+            MetadataValue::String("<unk>".into()),
+            MetadataValue::String("<s>".into()),
+            MetadataValue::String("</s>".into()),
+            MetadataValue::String(e4.clone()),
+            MetadataValue::String(b8.clone()),
+            MetadataValue::String(ad.clone()),
+            MetadataValue::String("hi".into()),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                (
+                    "tokenizer.ggml.merges",
+                    MetadataValue::Array(vec![MetadataValue::String("a b".into())]),
+                ),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+            ],
+            &[("dummy", vec![1], vec![0.0f32])],
+        )
+        .unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(!tok.spm);
+        // decode bytes E4 B8 AD -> "中"
+        assert_eq!(tok.decode(&[3, 4, 5]), "中");
+        // encode "中" back to the byte tokens (byte_fallback path)
+        assert_eq!(tok.encode("中", false), vec![3, 4, 5]);
         let _ = std::fs::remove_file(path);
     }
 }
