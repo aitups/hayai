@@ -14,6 +14,9 @@ pub struct Tokenizer {
     pub add_bos: bool,
     /// SentencePiece (Gemma/LLaMA): space marker is `▁` (U+2581). Else GPT-2 `Ġ`.
     pub spm: bool,
+    /// Raw Jinja chat template stored in the GGUF (`tokenizer.chat_template`),
+    /// if present. Used by the OpenAI-like API to render chat messages.
+    pub chat_template: Option<String>,
 }
 
 impl Tokenizer {
@@ -112,6 +115,22 @@ impl Tokenizer {
             .collect();
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+        // Jinja chat template (transformers convention); also accept `general.chat_template`.
+        let chat_template = metadata
+            .get("tokenizer.chat_template")
+            .and_then(|v| match v {
+                crate::gguf_types::MetadataValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                metadata
+                    .get("general.chat_template")
+                    .and_then(|v| match v {
+                        crate::gguf_types::MetadataValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+            });
+
         Ok(Self {
             tokens,
             token_to_id,
@@ -121,6 +140,7 @@ impl Tokenizer {
             eos_id,
             add_bos,
             spm,
+            chat_template,
         })
     }
 

@@ -971,18 +971,15 @@ impl StreamingGenerator {
         Ok(())
     }
 
-    pub fn generate(
+    /// Prepare the generation session: build the ExecPlan, allocate the streaming
+    /// or resident scratch, and (in resident mode) preload every layer pack into
+    /// accelerator memory. Returns the session scratch.
+    ///
+    /// Call once per request before [`Self::prefill`].
+    pub fn prepare_session(
         &mut self,
         orch: &mut EngineOrchestrator,
-        prompt: &str,
-        max_new_tokens: usize,
-    ) -> Result<GenerateStats, StreamInferError> {
-        let prompt_ids = self.tokenizer.encode(prompt, self.tokenizer.add_bos);
-        if prompt_ids.is_empty() {
-            return Err(StreamInferError::Msg("empty prompt tokenization".into()));
-        }
-        debug!("stream prompt tokens: {}", prompt_ids.len());
-
+    ) -> Result<hayai_opencl::StreamingScratch, StreamInferError> {
         // Metadata-driven plan: fail only on unknown layer ops (not arch name).
         {
             let n_gpu = orch.pool.len();
@@ -1111,28 +1108,13 @@ impl StreamingGenerator {
                     .unwrap_or(0);
         }
 
-        let wall0 = Instant::now();
-        let prompt_len = prompt_ids.len();
+        Ok(scratch)
+    }
 
-        let mut last_logits;
-        let mut all_new = Vec::new();
 
-        if self.config.hrm.is_some() {
-            // HRM: each token runs H×(L+1) stack passes (ExecPlan Recurrence).
-            last_logits = Vec::new();
-            for &tok in &prompt_ids {
-                last_logits = self.forward_hrm_token(orch, &mut scratch, tok)?;
-            }
-            for _ in 0..max_new_tokens {
-                let next = sample(&last_logits, self.sampler, &mut self.rng);
-                all_new.push(next);
-                if next == self.tokenizer.eos_id {
-                    break;
-                }
-                last_logits = self.forward_hrm_token(orch, &mut scratch, next)?;
-            }
-        } else if self
-            .exec_plan
+    /// Whether this model routes through the plan-driven hybrid path (Qwen3.5).
+    pub fn is_hybrid(&self) -> bool {
+        self.exec_plan
             .as_ref()
             .map(|p| {
                 p.known_ops
@@ -1140,40 +1122,80 @@ impl StreamingGenerator {
                     .any(|o| matches!(o, crate::exec_plan::LayerOpKind::DeltaNet))
             })
             .unwrap_or(false)
-        {
-            // Qwen3.5 hybrid: route via plan-driven units (full-attn + DeltaNet/SSM).
-            last_logits =
-                crate::hybrid_infer::prefill_hybrid(self, orch, &prompt_ids, &mut scratch)?;
-            for _ in 0..max_new_tokens {
-                let next = sample(&last_logits, self.sampler, &mut self.rng);
-                all_new.push(next);
-                if next == self.tokenizer.eos_id {
-                    break;
-                }
-                last_logits = crate::hybrid_infer::forward_hybrid(self, orch, next, &mut scratch)?;
+    }
+
+    /// Prefill `prompt_ids` and return logits ready for sampling (family dispatch:
+    /// HRM / Qwen3.5 hybrid / Gemma4 / llama). Advances the KV cache over the prompt.
+    pub fn prefill(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        prompt_ids: &[u32],
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if prompt_ids.is_empty() {
+            return Err(StreamInferError::Msg("empty prompt tokenization".into()));
+        }
+        if self.config.hrm.is_some() {
+            // HRM: each prompt token runs H×(L+1) stack passes (ExecPlan Recurrence).
+            let mut last = Vec::new();
+            for &tok in prompt_ids {
+                last = self.forward_hrm_token(orch, scratch, tok)?;
             }
+            Ok(last)
+        } else if self.is_hybrid() {
+            crate::hybrid_infer::prefill_hybrid(self, orch, prompt_ids, scratch)
         } else if crate::gemma_infer::is_gemma4(self) {
-            last_logits =
-                crate::gemma_infer::prefill_gemma(self, orch, &prompt_ids, &mut scratch)?;
-            for _ in 0..max_new_tokens {
-                let next = sample(&last_logits, self.sampler, &mut self.rng);
-                all_new.push(next);
-                if next == self.tokenizer.eos_id {
-                    break;
-                }
-                last_logits = crate::gemma_infer::forward_gemma(self, orch, next, &mut scratch)?;
-            }
+            crate::gemma_infer::prefill_gemma(self, orch, prompt_ids, scratch)
         } else {
-            // Prefill with Attn∥FFN wavefront (PRD §3.3); decode one token at a time.
-            last_logits = self.prefill_wavefront(orch, &prompt_ids, &mut scratch)?;
-            for _ in 0..max_new_tokens {
-                let next = sample(&last_logits, self.sampler, &mut self.rng);
-                all_new.push(next);
-                if next == self.tokenizer.eos_id {
-                    break;
-                }
-                last_logits = self.forward_staged(orch, next, &mut scratch)?;
+            // Prefill with Attn∥FFN wavefront (PRD §3.3).
+            self.prefill_wavefront(orch, prompt_ids, scratch)
+        }
+    }
+
+    /// One decode step for `token`: run the model forward (family dispatch) and
+    /// return the next logits. Advances `self.position` by one.
+    pub fn decode_step(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if self.config.hrm.is_some() {
+            self.forward_hrm_token(orch, scratch, token)
+        } else if self.is_hybrid() {
+            crate::hybrid_infer::forward_hybrid(self, orch, token, scratch)
+        } else if crate::gemma_infer::is_gemma4(self) {
+            crate::gemma_infer::forward_gemma(self, orch, token, scratch)
+        } else {
+            self.forward_staged(orch, token, scratch)
+        }
+    }
+
+
+    pub fn generate(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<GenerateStats, StreamInferError> {
+        let prompt_ids = self.tokenizer.encode(prompt, self.tokenizer.add_bos);
+        if prompt_ids.is_empty() {
+            return Err(StreamInferError::Msg("empty prompt tokenization".into()));
+        }
+        debug!("stream prompt tokens: {}", prompt_ids.len());
+        let prompt_len = prompt_ids.len();
+
+        let mut scratch = self.prepare_session(orch)?;
+        let wall0 = Instant::now();
+        let mut last_logits = self.prefill(orch, &prompt_ids, &mut scratch)?;
+        let mut all_new = Vec::new();
+        for _ in 0..max_new_tokens {
+            let next = sample(&last_logits, self.sampler, &mut self.rng);
+            all_new.push(next);
+            if next == self.tokenizer.eos_id {
+                break;
             }
+            last_logits = self.decode_step(orch, next, &mut scratch)?;
         }
         self.wall_compute_secs = wall0.elapsed().as_secs_f64();
 

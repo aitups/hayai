@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod prefill_wave;
+pub mod session;
 pub mod stream_infer;
 
 pub use adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
@@ -21,4 +22,5 @@ pub use pipeline::{
     run_decode_benchmark, run_overlap_probe, HeterogeneousPipeline, OverlapProbeStats,
     PipelineStats, SyntheticFfnWeights,
 };
+pub use session::GenerationSession;
 pub use stream_infer::{StreamInferError, StreamingGenerator};

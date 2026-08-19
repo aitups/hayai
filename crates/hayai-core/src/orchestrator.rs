@@ -13,6 +13,18 @@ pub enum ExecutionMode {
     CpuOnly,
 }
 
+impl ExecutionMode {
+    /// Parse a `--device` style string: `"auto"`, `"cpu"`, or an OpenCL device
+    /// name substring.
+    pub fn parse(device: &str) -> Self {
+        match device {
+            "cpu" => ExecutionMode::CpuOnly,
+            "auto" => ExecutionMode::Auto,
+            other => ExecutionMode::OpenClDevice(other.to_string()),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum OrchestratorError {
     #[error("OpenCL error: {0}")]
