@@ -1,0 +1,33 @@
+# Hayai — GPU / OpenCL override.
+# Apply together with the base file:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Requires an NVIDIA GPU + NVIDIA container runtime:
+#   - Native Linux with nvidia-container-toolkit. The toolkit mounts the driver
+#     userspace (including the OpenCL ICD libnvidia-opencl.so.1) into the
+#     container; the image already registers it via /etc/OpenCL/vendors/nvidia.icd,
+#     so OpenCL platforms appear automatically.
+#   - Docker Desktop (Windows, WSL2 backend) with GPU support enabled. NOTE:
+#     the WSL2 GPU-PV passthrough only injects the CUDA driver libraries
+#     (libcuda.so.1, libnvidia-ml.so.1) — it does NOT provide an OpenCL ICD,
+#     and NVIDIA WSL drivers ≤ 560.x do not ship libnvidia-opencl.so.1 in
+#     /usr/lib/wsl/lib, so NVIDIA OpenCL is currently unavailable inside
+#     WSL2/Docker Desktop and Hayai falls back to CPU.
+#
+# To debug OpenCL inside a running container:  docker exec -it <name> clinfo -l
+
+services:
+  hayai:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Docker Desktop (Windows, WSL2): if your NVIDIA driver ships the WSL
+    # OpenCL ICD, mounting the driver userspace exposes it to the container:
+    # volumes:
+    #   - /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro

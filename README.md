@@ -180,8 +180,10 @@ it for every model.
 
 A precompiled image is provided (`aitups/hayai`, Debian bookworm, multi-arch
 amd64/arm64). It ships `hayai-server` and `hayai-cli`, runs as a non-root user
-(uid 1000) and includes the generic OpenCL ICD loader (`ocl-icd-libopencl1`);
-without a vendor ICD the engine falls back to CPU-only.
+(uid 1000) and includes the generic OpenCL ICD loader (`ocl-icd-libopencl1`)
+plus an NVIDIA ICD registration file (`/etc/OpenCL/vendors/nvidia.icd`).
+Without a vendor OpenCL runtime available at run time the engine falls back to
+CPU-only.
 
 ```bash
 # Build locally
@@ -191,19 +193,60 @@ docker build -t aitups/hayai:latest .
 # writable by uid 1000 for --hf downloads: `sudo chown 1000:1000 models`)
 docker run -d -p 8080:8080 -v "$PWD/models:/hayai/models" aitups/hayai:latest
 
-# Or use compose
+# Or use compose (CPU-only unless the GPU override is applied)
 docker compose up -d
 ```
+
+### Docker + GPU (OpenCL)
+
+OpenCL uses the **ICD (Installable Client Driver)** model. The loader in the
+image (`libOpenCL.so.1`) only reports a platform when a vendor driver is
+registered through a `*.icd` file in `/etc/OpenCL/vendors/` that points to the
+vendor's OpenCL runtime library (`libnvidia-opencl.so.1` for NVIDIA). The image
+ships the registration file; the **library itself must be provided at run
+time**.
+
+> **CUDA ≠ OpenCL.** Passing the GPU to a container with `--gpus all` (Docker
+> Desktop/WSL2 or `nvidia-container-toolkit`) injects the **CUDA driver
+> libraries** (`libcuda.so.1`, `libnvidia-ml.so.1`) but **not** the OpenCL ICD.
+> If you see `Failed to query OpenCL platforms: CL_PLATFORM_NOT_FOUND_KHR`
+> (or Hayai falls back to CPU-only), the OpenCL runtime library is missing from
+> the container — this is exactly the symptom of "only CUDA was passed".
+> Debug with `docker exec -it <container> clinfo -l`.
+
+**Native Linux** (recommended): install `nvidia-container-toolkit`. It mounts
+the driver userspace — including `libnvidia-opencl.so.1` — into GPU containers,
+and the image's registration file makes it visible:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+```
+
+**Docker Desktop / WSL2 (Windows):** the GPU-PV passthrough only provides the
+CUDA interface, and NVIDIA WSL drivers (at least up to 560.x) do **not** ship
+`libnvidia-opencl.so.1` in `/usr/lib/wsl/lib`, so NVIDIA OpenCL is currently
+**unavailable** inside WSL2 containers; Hayai will run CPU-only. To get GPU
+acceleration with Hayai on Windows, use native Linux (or a Linux VM with GPU
+passthrough) with `nvidia-container-toolkit`. If a future NVIDIA driver ships
+the WSL OpenCL ICD, mount it with `-v /usr/lib/wsl/lib:/usr/lib/wsl/lib:ro`
+(the image's `LD_LIBRARY_PATH` already includes that path).
 
 All `hayai-server` options are configurable via `HAYAI_*` env vars (see
 `docker-compose.yml`): `HAYAI_HOST`, `HAYAI_PORT`, `HAYAI_MODELS_DIR`,
 `HAYAI_MODEL` (comma-separated), `HAYAI_HF`, `HAYAI_HF_FILE`, `HAYAI_DEVICE`,
 `HAYAI_MEMORY_STRATEGY`, `HAYAI_SINKS`, `HAYAI_WINDOW`, `HAYAI_CHAT_TEMPLATE`,
-`HAYAI_LOG`. Explicit CLI args still take precedence.
+`HAYAI_LOG`. Explicit CLI args still take precedence. `HAYAI_DEVICE=auto`
+picks any OpenCL GPU and falls back to CPU-only if none is available.
 
-> **io_uring & Docker:** the default Docker seccomp profile blocks `io_uring`,
-> so Hayai automatically falls back to buffered file I/O (`WeightIo=file` in the
-> logs). To enable `io_uring` run with `--security-opt seccomp=unconfined`.
+> **io_uring & Docker:** Hayai's streaming I/O path uses `io_uring` on Linux.
+> Docker's **default seccomp profile** (not WSL2, not the container, not the
+> kernel) blocks the `io_uring_setup` syscall with `EPERM`, so Hayai logs
+> `io_uring WeightIo open failed (Operation not permitted (os error 1))` and
+> falls back to buffered File I/O (`WeightIo=file`) — which is fully functional.
+> The `docker-compose.yml` ships with `security_opt: [seccomp=unconfined]` so
+> the container uses `io_uring` out of the box; with plain `docker run` add
+> `--security-opt seccomp=unconfined`. Verified behavior: with the flag the
+> logs show `WeightIo=io_uring` and `Opened GGUF catalog v3 (io_uring)`.
 
 
 

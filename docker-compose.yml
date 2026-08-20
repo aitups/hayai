@@ -29,7 +29,7 @@ services:
       # HAYAI_HF_FILE: "SmolLM2-135M-Instruct-Q4_K_M.gguf"
 
       # Engine:
-      HAYAI_DEVICE: "cpu"                    # auto | cpu | <OpenCL device substring>
+      HAYAI_DEVICE: "auto"                    # auto | cpu | <OpenCL device substring>
       HAYAI_MEMORY_STRATEGY: "minimal"       # auto | minimal | cap_mb
       HAYAI_SINKS: "4"
       HAYAI_WINDOW: "256"
@@ -37,11 +37,25 @@ services:
       HAYAI_LOG: "info"
     restart: unless-stopped
 
-    # io_uring is blocked by Docker's default seccomp profile; Hayai falls back to
-    # buffered file I/O automatically (see WeightIo=file in the logs). To enable
-    # io_uring, uncomment the following lines:
-    # security_opt:
-    #   - seccomp=unconfined
+    # ─────────────────────────────────────────────────────────────────────────
+    # GPU / OpenCL: apply the GPU override file (needs an NVIDIA container
+    # runtime and an OpenCL-capable NVIDIA setup — see README "Docker + GPU"):
+    #
+    #     docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+    #
+    # Without it (or when no OpenCL device is available) Hayai runs CPU-only.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # io_uring: Docker's default seccomp profile blocks the io_uring_setup
+    # syscall with EPERM ("Operation not permitted"), so Hayai falls back to
+    # buffered File I/O. This single-purpose server lifts seccomp so the
+    # streaming path actually uses io_uring (verified end-to-end:
+    # WeightIo=io_uring). The buffered fallback remains as a safety net.
+    # If you deploy with plain `docker run`, add --security-opt seccomp=unconfined.
+    # ─────────────────────────────────────────────────────────────────────────
+    security_opt:
+      - seccomp=unconfined
 
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]

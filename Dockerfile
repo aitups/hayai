@@ -25,17 +25,43 @@ RUN cargo build --release --workspace
 # Runtime: Debian bookworm-slim
 #   - ca-certificates: HTTPS (HuggingFace downloads via rustls)
 #   - curl: healthcheck
-#   - ocl-icd-libopencl1: generic OpenCL ICD loader (vendor ICDs can be added
-#     at run time, e.g. NVIDIA container toolkit / Intel / AMD runtimes).
-#     Without an ICD Hayai runs CPU-only.
+#   - clinfo: OpenCL platform/device debug utility (run `docker exec ... clinfo -l`)
+#   - ocl-icd-libopencl1: generic OpenCL ICD loader (libOpenCL.so.1).
+#
+# OpenCL uses the ICD (Installable Client Driver) model: the loader only
+# reports a platform when a vendor driver is REGISTERED through a *.icd file in
+# /etc/OpenCL/vendors/ that points to the vendor's OpenCL runtime library
+# (e.g. libnvidia-opencl.so.1 for NVIDIA). We ship the registration file here;
+# the vendor library itself must be made available at run time:
+#   - native Linux + nvidia-container-toolkit mounts libnvidia-opencl.so.1
+#     into the container automatically (the bare filename in nvidia.icd is then
+#     resolved through the loader search path), or
+#   - mount the NVIDIA driver userspace manually (see docker-compose.gpu.yml).
+#
+# IMPORTANT: passing the CUDA interface to a container (Docker Desktop/WSL2
+# `--gpus all`) does NOT provide OpenCL — CUDA and OpenCL are separate APIs
+# with separate userspace libraries. Without a registered vendor ICD the
+# loader returns CL_PLATFORM_NOT_FOUND_KHR and Hayai runs CPU-only.
 # ─────────────────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        clinfo \
         ocl-icd-libopencl1 \
+    && mkdir -p /etc/OpenCL/vendors \
+    && printf 'libnvidia-opencl.so.1\n' > /etc/OpenCL/vendors/nvidia.icd \
     && rm -rf /var/lib/apt/lists/*
+
+# Where a vendor OpenCL runtime may be injected at run time:
+#   - /usr/lib/wsl/lib   -> NVIDIA driver userspace mounted from the WSL2 host
+#                           (Docker Desktop on Windows, if the driver ships the
+#                           OpenCL ICD).
+#   - /usr/local/nvidia  -> nvidia-container-toolkit injection point.
+# LD_LIBRARY_PATH is additive to the standard loader search path, so pointing
+# at non-existent directories is harmless.
+ENV LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/nvidia/lib64
 
 COPY --from=builder /build/target/release/hayai-server /usr/local/bin/hayai-server
 COPY --from=builder /build/target/release/hayai-cli /usr/local/bin/hayai-cli
