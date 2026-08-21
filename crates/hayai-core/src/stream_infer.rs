@@ -60,6 +60,50 @@ pub enum StreamInferError {
 pub(crate) struct LayerNorms {
     pub(crate) attn_norm: Vec<f32>,
     pub(crate) ffn_norm: Vec<f32>,
+    /// Gemma4 extra per-block norms/scales — preloaded once at session open so the
+    /// decode hot path never issues per-token norm disk reads.
+    pub(crate) attn_q_norm: Option<Vec<f32>>,
+    pub(crate) attn_k_norm: Option<Vec<f32>>,
+    pub(crate) post_attn_norm: Option<Vec<f32>>,
+    pub(crate) post_ffw_norm: Option<Vec<f32>>,
+    pub(crate) layer_output_scale: Option<f32>,
+}
+
+/// Layer-role based model family, derived from **ops/tensors** — never from
+/// `general.architecture`. This is what routes each model to its forward path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    /// Llama-shaped dense blocks (staged ping-pong path).
+    Dense,
+    /// Per-head q/k norms + GELU FFN + optional per-layer embeddings (Gemma4).
+    Gemma,
+    /// DeltaNet / SSM mixed blocks (Qwen3.5 hybrid).
+    Hybrid,
+    /// Router + per-expert FFN units (MoE).
+    MoE,
+}
+
+impl ModelKind {
+    /// Detect from catalog tensor presence (runs before the ExecPlan exists).
+    pub fn from_catalog(cat: &GgufCatalog) -> Self {
+        let has = |suffix: &str| cat.tensor(&format!("blk.0.{suffix}")).is_ok();
+        if has("ssm_out.weight") || has("ssm_a") {
+            ModelKind::Hybrid
+        } else if has("ffn_gate_inp.weight")
+            || has("ffn_exp.0.ffn_gate.weight")
+            || has("ffn_shexp.ffn_gate.weight")
+        {
+            ModelKind::MoE
+        } else if has("post_ffw_norm.weight")
+            || has("layer_output_scale.weight")
+            || has("attn_q_norm.weight")
+            || has("attn_k_norm.weight")
+        {
+            ModelKind::Gemma
+        } else {
+            ModelKind::Dense
+        }
+    }
 }
 
 pub struct StreamingGenerator {
@@ -109,6 +153,8 @@ pub struct StreamingGenerator {
     pub(crate) layer_scratch_cap: usize,
     /// HRM frozen low-cycle init state (`hrm.z_l_init`), length = hidden.
     pub(crate) z_l_init: Option<Vec<f32>>,
+    /// Gemma4 proportional RoPE factors (`rope_freqs.weight`), cached once.
+    pub(crate) gemma_rope_freqs: Option<Vec<f32>>,
     /// Adaptive memory strategy for the resident/macro-chunk window.
     pub memory_strategy: MemoryStrategy,
     /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
@@ -155,7 +201,33 @@ impl StreamingGenerator {
                 .dequant_f32(&format!("blk.{i}.ffn_norm.weight"))
                 .or_else(|_| catalog.dequant_f32(&format!("blk.{i}.post_attention_norm.weight")))
                 .unwrap_or_else(|_| ones(h));
-            layer_norms.push(LayerNorms { attn_norm, ffn_norm });
+            // Gemma4 extra per-block norms/scales: read once here so the decode
+            // hot path never issues per-token norm disk reads.
+            let attn_q_norm = catalog
+                .dequant_f32(&format!("blk.{i}.attn_q_norm.weight"))
+                .ok();
+            let attn_k_norm = catalog
+                .dequant_f32(&format!("blk.{i}.attn_k_norm.weight"))
+                .ok();
+            let post_attn_norm = catalog
+                .dequant_f32(&format!("blk.{i}.post_attention_norm.weight"))
+                .ok();
+            let post_ffw_norm = catalog
+                .dequant_f32(&format!("blk.{i}.post_ffw_norm.weight"))
+                .ok();
+            let layer_output_scale = catalog
+                .dequant_f32(&format!("blk.{i}.layer_output_scale.weight"))
+                .ok()
+                .map(|v| v.first().copied().unwrap_or(1.0));
+            layer_norms.push(LayerNorms {
+                attn_norm,
+                ffn_norm,
+                attn_q_norm,
+                attn_k_norm,
+                post_attn_norm,
+                post_ffw_norm,
+                layer_output_scale,
+            });
         }
         let output_norm = catalog
             .dequant_f32("output_norm.weight")
@@ -167,17 +239,17 @@ impl StreamingGenerator {
             .as_ref()
             .map(|h| h.kv_slots())
             .unwrap_or(config.num_layers);
-        let kv = if config.architecture.contains("gemma") {
-            crate::gemma_infer::build_layer_kv_caches(&catalog, &config, sink, window)?
-        } else if config.architecture.contains("qwen35")
-            || config.architecture.contains("qwen3next")
-        {
-            // Per full-attn layer dims from tensors (not a single 4B-shaped AttentionConfig).
-            crate::layer_cfg::build_hybrid_kv_caches(&catalog, &config, sink, window)?
-        } else {
-            (0..kv_slots)
+        let kv = match ModelKind::from_catalog(&catalog) {
+            ModelKind::Gemma => {
+                crate::gemma_infer::build_layer_kv_caches(&catalog, &config, sink, window)?
+            }
+            ModelKind::Hybrid => {
+                // Per full-attn layer dims from tensors (not a single 4B-shaped AttentionConfig).
+                crate::layer_cfg::build_hybrid_kv_caches(&catalog, &config, sink, window)?
+            }
+            _ => (0..kv_slots)
                 .map(|_| LayerKvCache::new(attn_cfg.num_kv_heads, attn_cfg.head_dim, sink, window))
-                .collect()
+                .collect(),
         };
 
         let z_l_init = if config.hrm.is_some() {
@@ -189,6 +261,8 @@ impl StreamingGenerator {
         } else {
             None
         };
+        // Gemma4 proportional RoPE factors — loaded once, not per token.
+        let gemma_rope_freqs = catalog.dequant_f32("rope_freqs.weight").ok();
 
         info!(
             "StreamingGenerator: arch={} physical_layers={} kv_slots={} — WeightIo={} ping-pong + async FFN (no weight mmap)",
@@ -249,6 +323,7 @@ impl StreamingGenerator {
             ws_down: vec![0.0; hidden],
             layer_scratch_cap: 0,
             z_l_init,
+            gemma_rope_freqs,
             exec_plan: None,
             io_worker: hayai_io::IoWorker::new("hayai-io-worker"),
             deltanet_weights: None,
@@ -1011,8 +1086,14 @@ impl StreamingGenerator {
         }
 
         // ── Adaptive Memory Window ──────────────────────────────────────────────────
-        // Expert Base+Offset: SVM host on APU + dGPU DMA mirrors + parametric offsets.
-        let layer_bytes = self.catalog.max_layer_pack_nbytes()?.max(1);
+        // Plan-driven scratch sizing: the max streaming unit (any op layout, incl.
+        // MoE expert units later) — not the hardcoded LLaMA pack.
+        let layer_bytes = self
+            .exec_plan
+            .as_ref()
+            .map(|p| p.max_unit_bytes)
+            .unwrap_or(self.catalog.max_layer_pack_nbytes().unwrap_or(0))
+            .max(1);
         self.layer_scratch_cap = layer_bytes;
         let win = compute_window_plan(
             &orch.pool,
@@ -1118,16 +1199,29 @@ impl StreamingGenerator {
     }
 
 
-    /// Whether this model routes through the plan-driven hybrid path (Qwen3.5).
-    pub fn is_hybrid(&self) -> bool {
-        self.exec_plan
-            .as_ref()
-            .map(|p| {
-                p.known_ops
-                    .iter()
-                    .any(|o| matches!(o, crate::exec_plan::LayerOpKind::DeltaNet))
-            })
-            .unwrap_or(false)
+    /// Layer-role derived model kind (op-based, never `general.architecture`).
+    pub fn model_kind(&self) -> ModelKind {
+        if let Some(p) = &self.exec_plan {
+            let has = |op: crate::LayerOpKind| p.known_ops.contains(&op);
+            if has(crate::LayerOpKind::DeltaNet) {
+                ModelKind::Hybrid
+            } else if has(crate::LayerOpKind::Router)
+                || has(crate::LayerOpKind::ExpertGate)
+                || has(crate::LayerOpKind::SharedExpert)
+            {
+                ModelKind::MoE
+            } else if has(crate::LayerOpKind::AttnQNorm)
+                || has(crate::LayerOpKind::AttnKNorm)
+                || has(crate::LayerOpKind::PostFfnNorm)
+                || has(crate::LayerOpKind::LayerOutputScale)
+            {
+                ModelKind::Gemma
+            } else {
+                ModelKind::Dense
+            }
+        } else {
+            ModelKind::Dense
+        }
     }
 
     /// Prefill `prompt_ids` and return logits ready for sampling (family dispatch:
@@ -1148,13 +1242,22 @@ impl StreamingGenerator {
                 last = self.forward_hrm_token(orch, scratch, tok)?;
             }
             Ok(last)
-        } else if self.is_hybrid() {
-            crate::hybrid_infer::prefill_hybrid(self, orch, prompt_ids, scratch)
-        } else if crate::gemma_infer::is_gemma4(self) {
-            crate::gemma_infer::prefill_gemma(self, orch, prompt_ids, scratch)
         } else {
-            // Prefill with Attn∥FFN wavefront (PRD §3.3).
-            self.prefill_wavefront(orch, prompt_ids, scratch)
+            match self.model_kind() {
+                ModelKind::Hybrid => {
+                    crate::hybrid_infer::prefill_hybrid(self, orch, prompt_ids, scratch)
+                }
+                ModelKind::Gemma => {
+                    crate::gemma_infer::prefill_gemma(self, orch, prompt_ids, scratch)
+                }
+                ModelKind::MoE => Err(StreamInferError::Msg(
+                    "MoE forward not wired yet (Track M): plan classifies router/experts".into(),
+                )),
+                ModelKind::Dense => {
+                    // Prefill with Attn∥FFN wavefront (PRD §3.3).
+                    self.prefill_wavefront(orch, prompt_ids, scratch)
+                }
+            }
         }
     }
 
@@ -1168,12 +1271,15 @@ impl StreamingGenerator {
     ) -> Result<Vec<f32>, StreamInferError> {
         if self.config.hrm.is_some() {
             self.forward_hrm_token(orch, scratch, token)
-        } else if self.is_hybrid() {
-            crate::hybrid_infer::forward_hybrid(self, orch, token, scratch)
-        } else if crate::gemma_infer::is_gemma4(self) {
-            crate::gemma_infer::forward_gemma(self, orch, token, scratch)
         } else {
-            self.forward_staged(orch, token, scratch)
+            match self.model_kind() {
+                ModelKind::Hybrid => crate::hybrid_infer::forward_hybrid(self, orch, token, scratch),
+                ModelKind::Gemma => crate::gemma_infer::forward_gemma(self, orch, token, scratch),
+                ModelKind::MoE => Err(StreamInferError::Msg(
+                    "MoE forward not wired yet (Track M): plan classifies router/experts".into(),
+                )),
+                ModelKind::Dense => self.forward_staged(orch, token, scratch),
+            }
         }
     }
 
@@ -1597,3 +1703,98 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
         hrm,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hayai_model::gguf::write_minimal_gguf;
+    use hayai_model::MetadataValue;
+    use std::env::temp_dir;
+
+    /// ModelKind must be derived from tensors/ops, never `general.architecture`.
+    fn kind_for(name: &str, tensors: &[(&str, Vec<u64>)]) -> ModelKind {
+        let path = temp_dir().join(format!("hayai_modelkind_{name}.gguf"));
+        let values: Vec<f32> = tensors
+            .iter()
+            .flat_map(|(_, dims)| vec![1.0f32; dims.iter().product::<u64>() as usize])
+            .collect();
+        // write_minimal_gguf needs (name, dims, values) triples; build them inline.
+        let mut t: Vec<(&str, Vec<u64>, Vec<f32>)> = Vec::new();
+        let mut cursor = 0usize;
+        for (n, d) in tensors {
+            let len = d.iter().product::<u64>() as usize;
+            t.push((n, d.clone(), values[cursor..cursor + len].to_vec()));
+            cursor += len;
+        }
+        write_minimal_gguf(
+            &path,
+            &[(
+                "general.architecture",
+                MetadataValue::String("test".into()),
+            )],
+            &t,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let kind = ModelKind::from_catalog(&cat);
+        let _ = std::fs::remove_file(&path);
+        kind
+    }
+
+    #[test]
+    fn model_kind_detects_dense() {
+        assert_eq!(
+            kind_for(
+                "dense",
+                &[("token_embd.weight", vec![16, 8])]
+            ),
+            ModelKind::Dense
+        );
+    }
+
+    #[test]
+    fn model_kind_detects_hybrid_from_ssm() {
+        assert_eq!(
+            kind_for(
+                "hybrid",
+                &[
+                    ("token_embd.weight", vec![16, 8]),
+                    ("blk.0.ssm_out.weight", vec![8, 8]),
+                    ("blk.0.attn_qkv.weight", vec![24, 8]),
+                ]
+            ),
+            ModelKind::Hybrid
+        );
+    }
+
+    #[test]
+    fn model_kind_detects_moe_from_router() {
+        assert_eq!(
+            kind_for(
+                "moe",
+                &[
+                    ("token_embd.weight", vec![16, 8]),
+                    ("blk.0.ffn_gate_inp.weight", vec![4, 8]),
+                    ("blk.0.ffn_exp.0.ffn_gate.weight", vec![8, 8]),
+                ]
+            ),
+            ModelKind::MoE
+        );
+    }
+
+    #[test]
+    fn model_kind_detects_gemma_from_per_head_norms() {
+        assert_eq!(
+            kind_for(
+                "gemma",
+                &[
+                    ("token_embd.weight", vec![16, 8]),
+                    ("blk.0.attn_q_norm.weight", vec![8]),
+                    ("blk.0.attn_k_norm.weight", vec![8]),
+                ]
+            ),
+            ModelKind::Gemma
+        );
+    }
+}
+

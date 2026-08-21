@@ -161,18 +161,25 @@ pub struct UnknownLayerOp {
     pub hint: String,
 }
 
+/// Self-describing tensor inside a streaming unit: name, op role, and enough GGUF
+/// info to load it into a scratch slot and re-derive `QuantMatrix` views.
 #[derive(Debug, Clone)]
-pub struct ClassifiedTensor {
+pub struct TensorRef {
     pub name: String,
     pub op: LayerOpKind,
     pub nbytes: usize,
+    pub ggml_type: hayai_model::GgmlType,
+    pub ncols: usize,
+    pub nrows: usize,
+    /// Byte offset of this tensor within its streaming unit's buffer.
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct StreamingUnit {
     /// Logical block id (e.g. layer index) when detectable.
     pub block_id: Option<usize>,
-    pub tensors: Vec<ClassifiedTensor>,
+    pub tensors: Vec<TensorRef>,
     pub total_bytes: usize,
 }
 
@@ -204,10 +211,14 @@ pub fn build_exec_plan(
         match classify_tensor(catalog, &t.name) {
             Ok(op) => {
                 let nbytes = hayai_model::tensor_nbytes(t).unwrap_or(0);
-                classified.push(ClassifiedTensor {
+                classified.push(TensorRef {
                     name: t.name.clone(),
                     op,
                     nbytes,
+                    ggml_type: t.ggml_type,
+                    ncols: t.ncols(),
+                    nrows: t.nrows(),
+                    offset: 0,
                 });
             }
             Err(hint) => unknowns.push(UnknownLayerOp {
@@ -228,19 +239,25 @@ pub fn build_exec_plan(
     let op_bindings = known_ops.iter().map(|&op| (op, op_binding(op))).collect();
 
     // Group by blk.N / layers.N when present; otherwise one unit per tensor role cluster.
+    // Tensor offsets are assigned in catalog order so units are self-describing:
+    // `load_tensors_into` can stream them straight into a scratch slot.
     let mut units: Vec<StreamingUnit> = Vec::new();
-    let mut by_block: std::collections::BTreeMap<Option<usize>, Vec<ClassifiedTensor>> =
+    let mut by_block: std::collections::BTreeMap<Option<usize>, Vec<TensorRef>> =
         std::collections::BTreeMap::new();
     for c in classified {
         let bid = parse_block_id(&c.name);
         by_block.entry(bid).or_default().push(c);
     }
-    for (block_id, tensors) in by_block {
-        let total_bytes = tensors.iter().map(|t| t.nbytes).sum();
+    for (block_id, mut tensors) in by_block {
+        let mut off = 0usize;
+        for t in tensors.iter_mut() {
+            t.offset = off;
+            off += t.nbytes;
+        }
         units.push(StreamingUnit {
             block_id,
             tensors,
-            total_bytes,
+            total_bytes: off,
         });
     }
     units.sort_by_key(|u| u.block_id.unwrap_or(usize::MAX));

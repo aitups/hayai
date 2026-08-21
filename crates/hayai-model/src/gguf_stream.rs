@@ -336,6 +336,38 @@ impl GgufCatalog {
 
     /// Build layer-pack views into `base` **without any disk read** (resident mode).
     ///
+    /// Deterministic batched read of named tensors into `dst` at per-tensor offsets.
+    ///
+    /// `specs` maps each tensor name to its destination offset inside `dst`; sizes
+    /// come from the in-RAM index. This is the generic unit loader used by the
+    /// plan executor (any op layout, including MoE expert units) — no mmap.
+    pub fn load_tensors_into(
+        &mut self,
+        specs: &[(&str, usize)],
+        dst: &mut [u8],
+    ) -> Result<(), GgufError> {
+        let mut ranges: Vec<IoRange> = Vec::with_capacity(specs.len());
+        for (name, dst_off) in specs {
+            let info = self.tensor(name)?.clone();
+            let nbytes = tensor_nbytes(&info)?;
+            let start = *dst_off;
+            let end = start + nbytes;
+            if end > dst.len() {
+                return Err(GgufError::Msg(format!(
+                    "tensor {name} {nbytes}B at {start} exceeds dst {}",
+                    dst.len()
+                )));
+            }
+            ranges.push(IoRange {
+                offset: self.tensor_abs_offset(&info),
+                start,
+                end,
+            });
+        }
+        self.io.read_many_at(dst, &ranges).map_err(GgufError::from)?;
+        Ok(())
+    }
+
     /// The pack's tensors must already live in `base[..layout.total]` (resident
     /// device memory). Unlike [`Self::load_layer_pack_into`] this never touches the
     /// weight payload — it only re-derives offsets/dims/types from the in-RAM index.

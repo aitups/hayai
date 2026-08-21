@@ -9,10 +9,6 @@ use hayai_model::GgufCatalog;
 use hayai_opencl::StreamingScratch;
 use std::time::Instant;
 
-pub(crate) fn is_gemma4(gen: &StreamingGenerator) -> bool {
-    gen.config.architecture.contains("gemma")
-}
-
 /// Build per-layer KV caches with SWA vs global head dims / windows.
 pub(crate) fn build_layer_kv_caches(
     cat: &GgufCatalog,
@@ -178,8 +174,8 @@ pub(crate) fn forward_gemma(
         *v *= emb_scale;
     }
 
-    // Global-attn proportional RoPE factors (GGUF `rope_freqs.weight`); SWA uses None.
-    let rope_freqs = gen.catalog.dequant_f32("rope_freqs.weight").ok();
+    // Global-attn proportional RoPE factors (cached at session open; SWA uses None).
+    let rope_freqs = gen.gemma_rope_freqs.clone();
 
     // Per-layer inputs: tok_ple + project(h) then scale.
     let ple = if meta.per_layer_dim > 0 {
@@ -211,8 +207,8 @@ pub(crate) fn forward_gemma(
         q.truncate(pack.wq.nrows);
         pack.wq.gemv(&xn, &mut q)?;
         q.resize(q_dim, 0.0);
-        if let Ok(qn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_q_norm.weight")) {
-            apply_head_rmsnorm(&mut q, &qn, layer_cfg.num_heads, layer_cfg.head_dim);
+        if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
+            apply_head_rmsnorm(&mut q, qn, layer_cfg.num_heads, layer_cfg.head_dim);
         }
 
         let write_kv = meta.has_kv(layer);
@@ -224,8 +220,8 @@ pub(crate) fn forward_gemma(
             pack.wk.gemv(&xn, &mut k_raw)?;
             k_raw.resize(kv_dim, 0.0);
             let k_pre_norm = k_raw.clone();
-            if let Ok(kn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_k_norm.weight")) {
-                apply_head_rmsnorm(&mut k_raw, &kn, layer_cfg.num_kv_heads, layer_cfg.head_dim);
+            if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
+                apply_head_rmsnorm(&mut k_raw, kn, layer_cfg.num_kv_heads, layer_cfg.head_dim);
             }
             k = k_raw;
             if pack.wv.nrows > 0 {
@@ -283,11 +279,8 @@ pub(crate) fn forward_gemma(
             )));
         }
         // post_attention_norm BEFORE residual (llama.cpp gemma4).
-        if let Ok(pn) = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.post_attention_norm.weight"))
-        {
-            rms_norm(&mut attn_proj, &pn, eps);
+        if let Some(pn) = &gen.layer_norms[layer].post_attn_norm {
+            rms_norm(&mut attn_proj, pn, eps);
         }
         for i in 0..h {
             x[i] += attn_proj[i];
@@ -330,11 +323,8 @@ pub(crate) fn forward_gemma(
         )?;
         gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
         let mut down = gen.ws_down.clone();
-        if let Ok(pn) = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.post_ffw_norm.weight"))
-        {
-            rms_norm(&mut down, &pn, eps);
+        if let Some(pn) = &gen.layer_norms[layer].post_ffw_norm {
+            rms_norm(&mut down, pn, eps);
         }
         for i in 0..h {
             x[i] = attn_residual[i] + down[i];
@@ -345,11 +335,7 @@ pub(crate) fn forward_gemma(
             apply_per_layer_emb(gen, orch, layer, &meta, ple_all, &mut x)?;
         }
 
-        if let Ok(scale) = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.layer_output_scale.weight"))
-        {
-            let s = scale.first().copied().unwrap_or(1.0);
+        if let Some(s) = gen.layer_norms[layer].layer_output_scale {
             for v in x.iter_mut() {
                 *v *= s;
             }
