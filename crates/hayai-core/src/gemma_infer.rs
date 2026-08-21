@@ -477,7 +477,7 @@ fn apply_per_layer_emb(
     Ok(())
 }
 
-fn apply_head_rmsnorm(x: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize) {
+pub(crate) fn apply_head_rmsnorm(x: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize) {
     for h in 0..n_heads {
         let base = h * head_dim;
         let mut ms = 0.0f32;

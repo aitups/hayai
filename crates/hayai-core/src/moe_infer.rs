@@ -9,7 +9,7 @@
 //! 5. Per-expert gate/up/down via `execute_op` (GpuAsync binding → OpenCL pool),
 //!    SiLU gating, softmax routing weights, accumulated residual.
 
-use crate::exec_plan::{op_binding, parse_expert_id, ExpertUnit, LayerOpKind, TensorRef};
+use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, TensorRef};
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{StreamInferError, StreamingGenerator};
 use hayai_cpu::{attention_decode_step, rms_norm};
@@ -59,29 +59,35 @@ pub(crate) fn forward_moe(
             .cloned()
             .ok_or_else(|| StreamInferError::Msg(format!("plan missing blk.{layer}")))?;
 
-        // Compact non-expert (attn + router + shared expert) offsets.
+        // Compact non-expert (attn + router + shared expert) offsets. Expert tensors
+        // (per-expert `ffn_exp.E` or fused `ffn_*_exps`) are excluded — they stream
+        // on demand via `unit.experts`.
         let mut off = 0usize;
         let mut loaded: Vec<(TensorRef, usize)> = Vec::new();
         for t in unit
             .tensors
             .iter()
-            .filter(|t| parse_expert_id(&t.name).is_none())
+            .filter(|t| !is_expert_op(t.op))
         {
             loaded.push((t.clone(), off));
             off += t.nbytes;
         }
 
-        // Stage non-expert tensors into the layer slot.
+        // Stage non-expert tensors into the layer slot (resident: preloaded once).
         scratch.prepare_host_write(&orch.pool, layer)?;
-        let t_io = Instant::now();
-        {
-            let specs: Vec<(&str, usize)> =
-                loaded.iter().map(|(t, o)| (t.name.as_str(), *o)).collect();
-            let dst = scratch.host_slot_mut(layer);
-            gen.catalog.load_tensors_into(&specs, dst)?;
+        if !scratch.resident {
+            let t_io = Instant::now();
+            {
+                let specs: Vec<(&str, usize, usize, usize)> = loaded
+                    .iter()
+                    .map(|(t, o)| (t.name.as_str(), 0, *o, t.nbytes))
+                    .collect();
+                let dst = scratch.host_slot_mut(layer);
+                gen.catalog.load_tensors_into(&specs, dst)?;
+            }
+            gen.io_secs += t_io.elapsed().as_secs_f64();
+            gen.io_bytes += off as u64;
         }
-        gen.io_secs += t_io.elapsed().as_secs_f64();
-        gen.io_bytes += off as u64;
 
         let t_attn = Instant::now();
         // ── Attention (CPU per binding) ─────────────────────────────────────────
@@ -98,8 +104,15 @@ pub(crate) fn forward_moe(
             let wo = view_of(&base, &loaded, LayerOpKind::AttnO)?;
             let mut q = vec![0.0f32; q_dim];
             wq.gemv(&xn, &mut q)?;
+            // Per-head Q/K RMSNorm (Gemma/OLMoE-style) when present.
+            if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
+                crate::gemma_infer::apply_head_rmsnorm(&mut q, qn, cfg.num_heads, cfg.head_dim);
+            }
             let mut k = vec![0.0f32; kv_dim];
             wk.gemv(&xn, &mut k)?;
+            if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
+                crate::gemma_infer::apply_head_rmsnorm(&mut k, kn, cfg.num_kv_heads, cfg.head_dim);
+            }
             let mut v = vec![0.0f32; kv_dim];
             wv.gemv(&xn, &mut v)?;
             let mut attn_out = vec![0.0f32; q_dim];
@@ -132,27 +145,31 @@ pub(crate) fn forward_moe(
         };
 
         // ── Sparse expert streaming: read only the selected experts (colibri) ──
-        let t_io = Instant::now();
-        {
-            let mut specs: Vec<(&str, usize)> = Vec::with_capacity(top.len() * 3);
-            for (i, eid) in top.iter().enumerate() {
-                let expert = unit
-                    .experts
-                    .iter()
-                    .find(|e| e.expert_id == *eid)
-                    .ok_or_else(|| {
-                        StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
-                    })?;
-                let base_off = unit.non_expert_bytes + i * unit.max_expert_bytes;
-                for t in &expert.tensors {
-                    specs.push((t.name.as_str(), base_off + t.offset));
+        // Resident mode: all experts are preloaded, so nothing is read here.
+        if !scratch.resident {
+            let t_io = Instant::now();
+            {
+                let mut specs: Vec<(&str, usize, usize, usize)> =
+                    Vec::with_capacity(top.len() * 3);
+                for (i, eid) in top.iter().enumerate() {
+                    let expert = unit
+                        .experts
+                        .iter()
+                        .find(|e| e.expert_id == *eid)
+                        .ok_or_else(|| {
+                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
+                        })?;
+                    let base_off = unit.non_expert_bytes + i * unit.max_expert_bytes;
+                    for t in &expert.tensors {
+                        specs.push((t.name.as_str(), t.src_off, base_off + t.offset, t.nbytes));
+                    }
                 }
+                let dst = scratch.host_slot_mut(layer);
+                gen.catalog.load_tensors_into(&specs, dst)?;
             }
-            let dst = scratch.host_slot_mut(layer);
-            gen.catalog.load_tensors_into(&specs, dst)?;
+            gen.io_secs += t_io.elapsed().as_secs_f64();
+            gen.io_bytes += (top.len() * unit.max_expert_bytes) as u64;
         }
-        gen.io_secs += t_io.elapsed().as_secs_f64();
-        gen.io_bytes += (top.len() * unit.max_expert_bytes) as u64;
 
         // ── Per-expert FFN (GpuAsync binding → OpenCL pool) ─────────────────────
         let t_ffn = Instant::now();
@@ -167,7 +184,13 @@ pub(crate) fn forward_moe(
                     .ok_or_else(|| {
                         StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
                     })?;
-                let base_off = unit.non_expert_bytes + i * unit.max_expert_bytes;
+                let base_off = if scratch.resident {
+                    // Resident: expert eid sits at a fixed slot (all preloaded).
+                    unit.non_expert_bytes + eid * unit.max_expert_bytes
+                } else {
+                    // Streaming: top-k experts packed into slots 0..top_k.
+                    unit.non_expert_bytes + i * unit.max_expert_bytes
+                };
                 let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
                 let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
                 let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
@@ -276,7 +299,31 @@ pub(crate) fn forward_moe(
         gen.io_bytes += emb.nbytes() as u64;
     }
     gen.position += 1;
+    if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
+        let at = std::env::var("HAYAI_DUMP_AT_POS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        if gen.position == at {
+            dump_top_logits(&logits, 8);
+        }
+    }
     Ok(logits)
+}
+
+fn dump_top_logits(logits: &[f32], k: usize) {
+    let mut pairs: Vec<(f32, usize)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (v, i))
+        .collect();
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    eprint!("HAYAI_DUMP_TOP:");
+    for &(v, i) in pairs.iter().take(k) {
+        eprint!(" {i}:{v}");
+    }
+    eprintln!();
 }
 
 /// View over a non-expert tensor of the block (compact offset).

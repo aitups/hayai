@@ -1086,23 +1086,30 @@ impl StreamingGenerator {
         }
 
         // ── Adaptive Memory Window ──────────────────────────────────────────────────
-        // Plan-driven scratch sizing: the max streaming unit (any op layout, incl.
-        // MoE expert units later) — not the hardcoded LLaMA pack.
-        let layer_bytes = self
+        // Plan-driven sizing: streaming uses the sparse unit window (MoE: attn/router
+        // + top_k × expert), while resident preload needs the full block (all experts).
+        let window_bytes = self
             .exec_plan
             .as_ref()
             .map(|p| p.max_unit_bytes)
             .unwrap_or(self.catalog.max_layer_pack_nbytes().unwrap_or(0))
             .max(1);
-        self.layer_scratch_cap = layer_bytes;
+        let full_bytes = self
+            .exec_plan
+            .as_ref()
+            .map(|p| p.max_full_block_bytes)
+            .unwrap_or(window_bytes)
+            .max(1);
+        self.layer_scratch_cap = window_bytes;
         let win = compute_window_plan(
             &orch.pool,
-            layer_bytes,
+            full_bytes,
             self.config.num_layers,
             self.memory_strategy,
         );
         self.window_plan = Some(win);
         let resident = win.resident && win.k_chunk >= self.config.num_layers;
+        let layer_bytes = if resident { full_bytes } else { window_bytes };
         info!(
             "AdaptiveWindow: k_chunk={} resident={} window={}  (strategy={:?})",
             win.k_chunk, win.resident,
@@ -1162,6 +1169,7 @@ impl StreamingGenerator {
                 self.config.num_layers
             );
             let mut cat = self.catalog.fork_reader()?;
+            let plan = self.exec_plan.clone();
             for i in 0..self.config.num_layers {
                 // Hybrid (Qwen3.5 DeltaNet) layers keep their weights in the
                 // DeltaNetLayerWeights cache (ensure_deltanet_cache) and their
@@ -1172,8 +1180,44 @@ impl StreamingGenerator {
                 let t0 = Instant::now();
                 let layout_total = {
                     let dst = scratch.host_slot_mut(i);
-                    let (_, layout) = cat.load_layer_pack_into(i, dst)?;
-                    layout.total
+                    if let Some(p) = &plan {
+                        if let Some(unit) = p.units.iter().find(|u| u.block_id == Some(i)) {
+                            if !unit.experts.is_empty() {
+                                // MoE: load the full block (attn/router + ALL experts)
+                                // into the resident slot at the plan's fixed layout.
+                                let mut specs: Vec<(&str, usize, usize, usize)> = Vec::new();
+                                let mut off = 0usize;
+                                for t in unit.tensors.iter() {
+                                    specs.push((t.name.as_str(), 0, off, t.nbytes));
+                                    off += t.nbytes;
+                                }
+                                for e in &unit.experts {
+                                    let base_off =
+                                        unit.non_expert_bytes + e.expert_id * unit.max_expert_bytes;
+                                    for t in &e.tensors {
+                                        specs.push((
+                                            t.name.as_str(),
+                                            t.src_off,
+                                            base_off + t.offset,
+                                            t.nbytes,
+                                        ));
+                                    }
+                                }
+                                cat.load_tensors_into(&specs, dst)?;
+                                unit.non_expert_bytes
+                                    + unit.experts.len() * unit.max_expert_bytes
+                            } else {
+                                let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                                layout.total
+                            }
+                        } else {
+                            let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                            layout.total
+                        }
+                    } else {
+                        let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                        layout.total
+                    }
                 };
                 scratch.dma_layer_to_mirrors(&orch.pool, i, layout_total)?;
                 self.io_secs += t0.elapsed().as_secs_f64();

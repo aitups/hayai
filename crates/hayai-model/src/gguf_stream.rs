@@ -336,30 +336,32 @@ impl GgufCatalog {
 
     /// Build layer-pack views into `base` **without any disk read** (resident mode).
     ///
-    /// Deterministic batched read of named tensors into `dst` at per-tensor offsets.
+    /// Deterministic batched read of named tensors (or byte-slices of them) into
+    /// `dst` at per-tensor offsets.
     ///
-    /// `specs` maps each tensor name to its destination offset inside `dst`; sizes
-    /// come from the in-RAM index. This is the generic unit loader used by the
-    /// plan executor (any op layout, including MoE expert units) — no mmap.
+    /// `specs` maps each read to `(tensor_name, src_off, dst_off, len)` where
+    /// `src_off` is the byte offset **into** the tensor (0 = whole tensor; used to
+    /// stream fused MoE expert slices) and `dst_off`/`len` are the destination
+    /// range. This is the generic unit loader used by the plan executor (any op
+    /// layout, including MoE expert units) — no mmap.
     pub fn load_tensors_into(
         &mut self,
-        specs: &[(&str, usize)],
+        specs: &[(&str, usize, usize, usize)],
         dst: &mut [u8],
     ) -> Result<(), GgufError> {
         let mut ranges: Vec<IoRange> = Vec::with_capacity(specs.len());
-        for (name, dst_off) in specs {
+        for (name, src_off, dst_off, len) in specs {
             let info = self.tensor(name)?.clone();
-            let nbytes = tensor_nbytes(&info)?;
             let start = *dst_off;
-            let end = start + nbytes;
+            let end = start + *len;
             if end > dst.len() {
                 return Err(GgufError::Msg(format!(
-                    "tensor {name} {nbytes}B at {start} exceeds dst {}",
+                    "tensor {name} slice {len}B at {start} exceeds dst {}",
                     dst.len()
                 )));
             }
             ranges.push(IoRange {
-                offset: self.tensor_abs_offset(&info),
+                offset: self.tensor_abs_offset(&info) + (*src_off as u64),
                 start,
                 end,
             });

@@ -171,8 +171,12 @@ pub struct TensorRef {
     pub ggml_type: hayai_model::GgmlType,
     pub ncols: usize,
     pub nrows: usize,
-    /// Byte offset of this tensor within its streaming unit's buffer.
+    /// Byte offset of this tensor within its streaming unit's buffer (dst layout).
     pub offset: usize,
+    /// In-tensor byte offset for sliced reads (fused MoE experts); 0 for whole tensors.
+    pub src_off: usize,
+    /// Tensor dimensionality (2D matmul vs 3D fused-expert).
+    pub ndims: usize,
 }
 
 /// MoE metadata from GGUF keys (`{arch}.expert_count` /
@@ -187,6 +191,8 @@ pub struct MoeMeta {
 #[derive(Debug, Clone)]
 pub struct ExpertUnit {
     pub expert_id: usize,
+    /// True when the expert is a byte-slice of a fused 3D tensor (`ffn_*_exps.weight`).
+    pub fused: bool,
     pub tensors: Vec<TensorRef>,
 }
 
@@ -195,7 +201,10 @@ pub struct StreamingUnit {
     /// Logical block id (e.g. layer index) when detectable.
     pub block_id: Option<usize>,
     pub tensors: Vec<TensorRef>,
+    /// Streaming window bytes (sparse for MoE: attn/router + top_k × expert).
     pub total_bytes: usize,
+    /// Full block bytes (all experts) — used as the resident stride / preload size.
+    pub full_bytes: usize,
     /// MoE: per-expert tensor groups (empty for dense blocks).
     pub experts: Vec<ExpertUnit>,
     /// MoE: bytes of non-expert tensors (attn + router + shared expert).
@@ -208,7 +217,10 @@ pub struct StreamingUnit {
 pub struct ExecPlan {
     pub architecture: String,
     pub units: Vec<StreamingUnit>,
+    /// Sparse streaming window (max unit bytes).
     pub max_unit_bytes: usize,
+    /// Full resident block bytes (all experts for MoE) — resident stride / preload.
+    pub max_full_block_bytes: usize,
     pub known_ops: BTreeSet<LayerOpKind>,
     /// MoE metadata (router/expert layout) when the model is sparse.
     pub moe: Option<MoeMeta>,
@@ -242,6 +254,8 @@ pub fn build_exec_plan(
                     ncols: t.ncols(),
                     nrows: t.nrows(),
                     offset: 0,
+                    src_off: 0,
+                    ndims: t.dims.len(),
                 });
             }
             Err(hint) => unknowns.push(UnknownLayerOp {
@@ -280,6 +294,7 @@ pub fn build_exec_plan(
             t.offset = off;
             off += t.nbytes;
         }
+        let mut full_bytes = off; // resident preload needs the whole block
         // MoE: split expert tensors into per-expert packs; the streaming window is
         // attn/router + top_k × largest expert — sparse disk streaming, not the
         // whole block.
@@ -287,39 +302,80 @@ pub fn build_exec_plan(
         let mut non_expert_bytes = off;
         let mut max_expert_bytes = 0usize;
         if moe.is_some() && tensors.iter().any(|t| is_expert_op(t.op)) {
+            let mm = moe.expect("guarded above");
+            let n_exp = mm.expert_count.max(1);
             let mut by_exp: std::collections::BTreeMap<usize, Vec<TensorRef>> =
                 std::collections::BTreeMap::new();
+            let mut fused: Vec<(TensorRef, usize)> = Vec::new(); // (tensor, slice_bytes)
             for t in tensors.iter() {
                 if let Some(eid) = parse_expert_id(&t.name) {
                     by_exp.entry(eid).or_default().push(t.clone());
+                } else if t.ndims >= 3 {
+                    fused.push((t.clone(), t.nbytes / n_exp));
                 }
             }
             non_expert_bytes = tensors
                 .iter()
-                .filter(|t| parse_expert_id(&t.name).is_none())
+                .filter(|t| parse_expert_id(&t.name).is_none() && t.ndims < 3)
                 .map(|t| t.nbytes)
                 .sum();
-            for (eid, mut ets) in by_exp {
-                let mut eoff = 0usize;
-                for t in ets.iter_mut() {
-                    t.offset = eoff;
-                    eoff += t.nbytes;
+            if fused.is_empty() {
+                // Per-expert tensors (`ffn_exp.E.*` / HF `experts.E.*`).
+                for (eid, mut ets) in by_exp {
+                    let mut eoff = 0usize;
+                    for t in ets.iter_mut() {
+                        t.offset = eoff;
+                        eoff += t.nbytes;
+                    }
+                    max_expert_bytes = max_expert_bytes.max(eoff);
+                    experts.push(ExpertUnit {
+                        expert_id: eid,
+                        fused: false,
+                        tensors: ets,
+                    });
                 }
-                max_expert_bytes = max_expert_bytes.max(eoff);
-                experts.push(ExpertUnit {
-                    expert_id: eid,
-                    tensors: ets,
-                });
+            } else {
+                // Fused 3D experts (`ffn_*_exps.weight`, OLMoE-style): slice each
+                // expert's byte range; pack gate@0 / up@slice / down@2*slice.
+                fused.sort_by_key(|(t, _)| fused_role_rank(t.op));
+                for e in 0..n_exp {
+                    let mut ets: Vec<TensorRef> = Vec::new();
+                    for (t, slice) in &fused {
+                        ets.push(TensorRef {
+                            name: t.name.clone(),
+                            op: t.op,
+                            nbytes: *slice,
+                            ggml_type: t.ggml_type,
+                            ncols: t.ncols,
+                            nrows: t.nrows,
+                            offset: 0,
+                            src_off: e * slice,
+                            ndims: 2,
+                        });
+                    }
+                    let mut eoff = 0usize;
+                    for ts in ets.iter_mut() {
+                        ts.offset = eoff;
+                        eoff += ts.nbytes;
+                    }
+                    max_expert_bytes = max_expert_bytes.max(eoff);
+                    experts.push(ExpertUnit {
+                        expert_id: e,
+                        fused: true,
+                        tensors: ets,
+                    });
+                }
             }
             experts.sort_by_key(|e| e.expert_id);
-            let mm = moe.expect("guarded above");
             let top_k = mm.top_k.min(mm.expert_count).max(1);
+            full_bytes = non_expert_bytes + mm.expert_count * max_expert_bytes;
             off = non_expert_bytes + top_k * max_expert_bytes;
         }
         units.push(StreamingUnit {
             block_id,
             tensors,
             total_bytes: off,
+            full_bytes,
             experts,
             non_expert_bytes,
             max_expert_bytes,
@@ -335,6 +391,12 @@ pub fn build_exec_plan(
         .max()
         .or_else(|| units.iter().map(|u| u.total_bytes).max())
         .unwrap_or(0);
+    let max_full_block_bytes = units
+        .iter()
+        .filter(|u| u.block_id.is_some())
+        .map(|u| u.full_bytes)
+        .max()
+        .unwrap_or(max_unit_bytes);
 
     let mut hw_notes = Vec::new();
     if opencl_devices == 0 {
@@ -358,6 +420,7 @@ pub fn build_exec_plan(
         architecture,
         units,
         max_unit_bytes,
+        max_full_block_bytes,
         known_ops,
         moe,
         op_bindings,
@@ -451,7 +514,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     if n.contains("shared_expert") || n.contains("ffn_shexp") {
         return Ok(SharedExpert);
     }
-    if n.contains("ffn_exp") || n.contains("experts.") {
+    if n.contains("ffn_exp") || n.contains("experts.") || n.contains("exps") {
         return Ok(expert_kind(&n));
     }
 
@@ -607,11 +670,21 @@ pub(crate) fn parse_expert_id(name: &str) -> Option<usize> {
     None
 }
 
-fn is_expert_op(op: LayerOpKind) -> bool {
+pub(crate) fn is_expert_op(op: LayerOpKind) -> bool {
     matches!(
         op,
         LayerOpKind::ExpertGate | LayerOpKind::ExpertUp | LayerOpKind::ExpertDown
     )
+}
+
+/// Pack order for fused expert slices: gate@0, up@slice, down@2*slice.
+fn fused_role_rank(op: LayerOpKind) -> usize {
+    match op {
+        LayerOpKind::ExpertGate => 0,
+        LayerOpKind::ExpertUp => 1,
+        LayerOpKind::ExpertDown => 2,
+        _ => 3,
+    }
 }
 
 /// Detect MoE metadata from llama.cpp / HF GGUF keys.
@@ -934,6 +1007,84 @@ mod tests {
         let sparse_window = unit.non_expert_bytes + 2 * unit.max_expert_bytes;
         assert_eq!(unit.total_bytes, sparse_window);
         assert_eq!(plan.max_unit_bytes, sparse_window);
+        assert!(sparse_window < full_block);
+    }
+
+    /// Track M: fused 3D experts (`ffn_*_exps.weight`, OLMoE-style) must become
+    /// per-expert byte-slices (`src_off`) with a sparse streaming window too.
+    #[test]
+    fn moe_plan_splits_fused_experts() {
+        use hayai_model::{gguf::write_minimal_gguf, GgufCatalog, MetadataValue};
+        use std::env::temp_dir;
+
+        let path = temp_dir().join("hayai_plan_moe_fused.gguf");
+        let h: u64 = 8;
+        let ff: u64 = 4;
+        let vocab: u64 = 16;
+        let ne: u64 = 2;
+        let tensors: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight", vec![h, vocab], vec![0.1f32; (h * vocab) as usize]),
+            ("output_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("output.weight", vec![vocab, h], vec![0.1f32; (vocab * h) as usize]),
+            ("blk.0.attn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.attn_q.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_k.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_v.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_output.weight", vec![2 * h, h], vec![0.1f32; (2 * h * h) as usize]),
+            ("blk.0.ffn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.ffn_gate_inp.weight", vec![h, ne], vec![0.1f32; (h * ne) as usize]),
+            // Fused 3D expert tensors: [n_embd, ffn, n_expert].
+            (
+                "blk.0.ffn_gate_exps.weight",
+                vec![h, ff, ne],
+                vec![0.1f32; (h * ff * ne) as usize],
+            ),
+            (
+                "blk.0.ffn_up_exps.weight",
+                vec![h, ff, ne],
+                vec![0.1f32; (h * ff * ne) as usize],
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                vec![ff, h, ne],
+                vec![0.1f32; (ff * h * ne) as usize],
+            ),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                (
+                    "general.architecture",
+                    MetadataValue::String("olmoe".into()),
+                ),
+                ("olmoe.expert_count", MetadataValue::U32(2)),
+                (
+                    "olmoe.attention.expert_used_count",
+                    MetadataValue::U32(1),
+                ),
+            ],
+            &tensors,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let plan = build_exec_plan(&cat, 0, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let unit = plan.units.iter().find(|u| u.block_id == Some(0)).unwrap();
+        assert_eq!(unit.experts.len(), 2);
+        assert!(unit.experts[0].fused);
+        // Gate/up/down slices, gate@0, up@slice, down@2*slice.
+        assert_eq!(unit.experts[0].tensors.len(), 3);
+        assert_eq!(unit.experts[0].tensors[0].op, LayerOpKind::ExpertGate);
+        assert_eq!(unit.experts[0].tensors[0].offset, 0);
+        let slice = unit.experts[0].tensors[0].nbytes;
+        assert_eq!(unit.experts[1].tensors[0].src_off, slice); // expert 1 starts at slice
+        assert_eq!(unit.experts[0].tensors[1].offset, slice);
+        // Sparse window: attn/router + top_k × (3 slices) < full block.
+        let full_block: usize = unit.tensors.iter().map(|t| t.nbytes).sum::<usize>()
+            + unit.experts.len() * 3 * slice;
+        let sparse_window = unit.non_expert_bytes + unit.max_expert_bytes;
+        assert_eq!(unit.total_bytes, sparse_window);
         assert!(sparse_window < full_block);
     }
 }
