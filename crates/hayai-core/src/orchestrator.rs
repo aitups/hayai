@@ -169,6 +169,30 @@ impl EngineOrchestrator {
             .map_err(|e| OrchestratorError::Msg(e.to_string()))
     }
 
+    /// Execute a GEMV honoring the **plan's per-op binding** (Track L2): ops bound
+    /// to `Cpu`/`HostRowRead` (attention, router, norms) stay on CPU even when a
+    /// GPU pool exists; `GpuAsync` ops (FFN/experts/output) use the pool. Passive
+    /// `Discard` ops are no-ops. This is what the executor consumes instead of
+    /// hardcoded call sites.
+    pub fn execute_op(
+        &mut self,
+        op: crate::LayerOpKind,
+        binding: crate::exec_plan::OpBinding,
+        matrix: &QuantMatrix,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), OrchestratorError> {
+        match binding.device {
+            crate::exec_plan::OpDevice::GpuAsync => self.execute_quant_gemv(matrix, input, output),
+            crate::exec_plan::OpDevice::Cpu | crate::exec_plan::OpDevice::HostRowRead => {
+                matrix
+                    .gemv(input, output)
+                    .map_err(|e| OrchestratorError::Msg(e.to_string()))
+            }
+            crate::exec_plan::OpDevice::Discard => Ok(()),
+        }
+    }
+
     fn gpu_gemv(
         &self,
         cl: &OpenClEngine,
@@ -407,5 +431,75 @@ mod tests {
         let mut expected = vec![0.0f32; m];
         fp32_matmul(m, n, &dense, &input, &mut expected);
         assert!(max_abs_diff(&out, &expected) < 1e-4);
+    }
+
+    /// Track L2: `execute_op` honors the plan's per-op binding — CPU-bound ops
+    /// (router/attn) stay on CPU, GPU-bound FFN falls back to CPU with an empty
+    /// pool, and passive ops are no-ops.
+    #[test]
+    fn execute_op_honors_binding() {
+        use crate::LayerOpKind;
+        use hayai_model::{gguf::write_minimal_gguf, GgufCatalog, MetadataValue};
+        let path = std::env::temp_dir().join("hayai_exec_op_binding.gguf");
+        write_minimal_gguf(
+            &path,
+            &[(
+                "general.architecture",
+                MetadataValue::String("llama".into()),
+            )],
+            &[(
+                "w.weight",
+                vec![4, 6],
+                vec![
+                    0.5, -1.0, 0.25, 2.0, 1.0, 0.0, -0.5, 1.5, 2.0, -2.0, 0.75, -1.25, 0.1, 0.2,
+                    0.3, 0.4, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0,
+                ],
+            )],
+        )
+        .unwrap();
+        let mut cat = GgufCatalog::open(&path).unwrap();
+        let m = cat.load_quant_matrix("w.weight").unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let mut orch = EngineOrchestrator::new(ExecutionMode::CpuOnly, ModelConfig::smollm_135m());
+        let x: Vec<f32> = (0..4).map(|i| i as f32 * 0.5 - 0.25).collect();
+
+        // GpuAsync binding (FFN) with an empty pool → CPU fallback, matches CPU gemv.
+        let mut out_gpu = vec![0.0f32; m.nrows];
+        orch.execute_op(
+            LayerOpKind::FfnGate,
+            crate::exec_plan::op_binding(LayerOpKind::FfnGate),
+            &m,
+            &x,
+            &mut out_gpu,
+        )
+        .unwrap();
+        let mut out_cpu = vec![0.0f32; m.nrows];
+        m.gemv(&x, &mut out_cpu).unwrap();
+        assert!(max_abs_diff(&out_gpu, &out_cpu) < 1e-5);
+
+        // CPU binding (router) is forced to CPU, same result.
+        let mut out_router = vec![0.0f32; m.nrows];
+        orch.execute_op(
+            LayerOpKind::Router,
+            crate::exec_plan::op_binding(LayerOpKind::Router),
+            &m,
+            &x,
+            &mut out_router,
+        )
+        .unwrap();
+        assert!(max_abs_diff(&out_router, &out_cpu) < 1e-5);
+
+        // Discard binding is a no-op: output untouched.
+        let mut out_discard = vec![9.9f32; m.nrows];
+        orch.execute_op(
+            LayerOpKind::LayerOutputScale,
+            crate::exec_plan::op_binding(LayerOpKind::LayerOutputScale),
+            &m,
+            &x,
+            &mut out_discard,
+        )
+        .unwrap();
+        assert!(out_discard.iter().all(|&v| (v - 9.9).abs() < 1e-6));
     }
 }
