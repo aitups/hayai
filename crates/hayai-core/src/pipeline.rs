@@ -437,14 +437,16 @@ mod tests {
     fn overlap_probe_runs() {
         let config = ModelConfig::smollm_135m();
         let mut tiny = config;
-        tiny.hidden_size = 64;
-        tiny.intermediate_size = 128;
-        tiny.num_attention_heads = 4;
-        tiny.num_key_value_heads = 2;
+        // Realistic workload so thread-spawn overhead does not dominate the probe
+        // ratio (tiny sizes make `parallel` slower than `serial` on loaded CI).
+        tiny.hidden_size = 512;
+        tiny.intermediate_size = 2048;
+        tiny.num_attention_heads = 8;
+        tiny.num_key_value_heads = 4;
         tiny.num_layers = 1;
 
         let mut orch = EngineOrchestrator::new(ExecutionMode::CpuOnly, tiny.clone());
-        let stats = run_overlap_probe(&mut orch, &tiny, 3);
+        let stats = run_overlap_probe(&mut orch, &tiny, 16);
         assert!(stats.cpu_only_secs > 0.0);
         assert!(stats.parallel_secs > 0.0);
         // CPU-only probe has thread overhead; require a sane positive ratio.

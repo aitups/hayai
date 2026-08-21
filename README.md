@@ -165,9 +165,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ### Chat templates
 
 The chat template is read from the model's GGUF metadata
-(`tokenizer.chat_template`, Jinja) and rendered with `minijinja`. If the GGUF
-has none, a ChatML fallback is assumed. `--chat-template <string|@file>` overrides
-it for every model.
+(`tokenizer.chat_template`, Jinja) and rendered with `minijinja` — used by the API
+server, the CLI `generate`/`bench-generate` (when not `--raw`), and the session API.
+If the GGUF has none, a ChatML fallback is assumed. `--chat-template <string|@file>`
+overrides it for every model.
+
+Compatibility shims so transformers templates work in `minijinja`:
+`.get('key')` → `['key']`, `.startswith(...)`/`.endswith(...)` → filters. If the
+rendered prompt references a special-token marker (e.g. `<|user|>`) that is not in
+the vocab (a GGUF conversion dropped added tokens), hayai logs a clear warning — the
+prompt would otherwise be BPE-split and degraded. Base models without any chat
+markers get a warning to use `--raw`.
 
 ### Notes
 
