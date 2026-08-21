@@ -51,6 +51,7 @@ Inferencia de Modelos con Streaming de Pesos.md
 .idea/
 .vscode/
 .cursor/
+__pycache__/
 .DS_Store
 Thumbs.db
 

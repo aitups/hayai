@@ -252,14 +252,17 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 
 ## Supported models
 
-`ExecPlan` is metadata-driven, so any GGUF whose tensors map to registered layer ops should build a streaming plan. Families exercised in the current suite:
+`ExecPlan` is metadata-driven: tensors are classified into a **registered layer-op catalog** (`LayerOpKind` + per-op HW binding), so any GGUF whose tensors map to registered ops builds a streaming plan. Failure is only `unknown layer op` for truly novel tensor roles — never the architecture name. Families exercised:
 
 | Family | Architecture / notes |
 | --- | --- |
 | Llama-family | e.g. SmolLM2 (default smoke model) |
-| Gemma 4 E4B | shared-KV, SWA/global attention, PLE, GELU softcap |
+| Gemma 4 | 12B (`post_ffw_norm`, `layer_output_scale`, per-head Q/K norms) and E4B (shared-KV, SWA/global, PLE, GELU softcap) |
 | HRM-Text | recurrent H/L stacks (`hrm_text`) |
 | Qwen 3.5 | hybrid DeltaNet (SSM/linear attention) + full attention + MTP `nextn` draft head |
+| MoE | router (`ffn_gate_inp`) + per-expert (`ffn_exp.E.*`) and fused-3D (`ffn_*_exps.*`) experts; **sparse streaming**: only the top-k experts are read per token (~`top_k/n_expert` of the FFN disk bandwidth). Validated on OLMoE-1B-7B (64 experts / 8 active) |
+
+**Quantization formats:** F32/F16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-family (Q2_K–Q6_K, Q8_K), and IQ2/IQ3/IQ4. **IQ1/TQ** types are recognized but raise a hard unsupported-type error.
 
 **Quantization formats:** F32/F16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-family (Q2_K–Q6_K, Q8_K), and IQ2/IQ3/IQ4. **IQ1/TQ** types are recognized but raise a hard unsupported-type error.
 
