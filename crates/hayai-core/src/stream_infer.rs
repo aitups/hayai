@@ -172,6 +172,8 @@ pub struct StreamingGenerator {
     /// Qwen3.5 DeltaNet weights (None entries for full-attn layers).
     pub(crate) deltanet_weights: Option<Vec<Option<crate::deltanet::DeltaNetLayerWeights>>>,
     pub(crate) deltanet_states: Option<Vec<Option<crate::deltanet::DeltaNetState>>>,
+    /// MoE expert LRU cache (colibri-style) — host RAM, sized at session start.
+    pub(crate) moe_cache: crate::moe_infer::ExpertCache,
 }
 
 impl StreamingGenerator {
@@ -328,6 +330,7 @@ impl StreamingGenerator {
             io_worker: hayai_io::IoWorker::new("hayai-io-worker"),
             deltanet_weights: None,
             deltanet_states: None,
+            moe_cache: crate::moe_infer::ExpertCache::new(0),
             memory_strategy: MemoryStrategy::AutoFit,
             window_plan: None,
             resident_output: None,
@@ -338,6 +341,11 @@ impl StreamingGenerator {
     /// Override the memory strategy before the first `generate()` call.
     pub fn set_memory_strategy(&mut self, strategy: MemoryStrategy) {
         self.memory_strategy = strategy;
+    }
+
+    /// MoE expert LRU cache hit/miss counters (host RAM, colibri-style).
+    pub fn moe_cache_stats(&self) -> (usize, usize) {
+        (self.moe_cache.hits, self.moe_cache.misses)
     }
 
     fn act(&self) -> &[f32] {
@@ -1083,6 +1091,41 @@ impl StreamingGenerator {
                     )));
                 }
             }
+        }
+
+        // MoE expert LRU cache (colibri): byte budget `HAYAI_MOE_CACHE_MB` (default
+        // 512 MiB, 0 disables) → slots = min(n_layers×top_k, budget / max_expert_pack).
+        // Hot experts stay resident → fewer disk reads/token on edge devices.
+        let cache_mb: usize = std::env::var("HAYAI_MOE_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let (cache_slots, cache_bytes) = self
+            .exec_plan
+            .as_ref()
+            .and_then(|p| p.moe.map(|m| (p, m)))
+            .map(|(p, m)| {
+                let max_expert = p
+                    .units
+                    .iter()
+                    .map(|u| u.max_expert_bytes)
+                    .max()
+                    .unwrap_or(0);
+                let desired = self.config.num_layers.saturating_mul(m.top_k).max(1);
+                if cache_mb == 0 || max_expert == 0 {
+                    (0, 0)
+                } else {
+                    let slots = (cache_mb * 1024 * 1024 / max_expert).min(desired).max(1);
+                    (slots, slots * max_expert)
+                }
+            })
+            .unwrap_or((0, 0));
+        self.moe_cache = crate::moe_infer::ExpertCache::new(cache_slots);
+        if cache_slots > 0 {
+            tracing::info!(
+                "MoE expert LRU cache: {cache_slots} packs (~{} MiB host RAM)",
+                cache_bytes / (1024 * 1024)
+            );
         }
 
         // ── Adaptive Memory Window ──────────────────────────────────────────────────

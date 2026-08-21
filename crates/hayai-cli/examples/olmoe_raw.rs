@@ -25,7 +25,11 @@ fn main() {
     let mut last = gen.prefill(&mut orch, &ids, &mut scratch).unwrap();
 
     let mut out: Vec<u32> = Vec::new();
-    for _ in 0..24 {
+    let smoke_n: usize = std::env::var("HAYAI_SMOKE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    for _ in 0..smoke_n {
         let next = sample(&last, gen.sampler, &mut gen.rng);
         if next == gen.tokenizer.eos_id {
             break;
@@ -34,4 +38,13 @@ fn main() {
         last = gen.decode_step(&mut orch, next, &mut scratch).unwrap();
     }
     println!("RAWTEXT: {:?}", gen.tokenizer.decode(&out));
+    let (hits, misses) = gen.moe_cache_stats();
+    println!(
+        "MOE_CACHE: hits={} misses={} io_bytes={} ({:.1} MiB for {} forwards)",
+        hits,
+        misses,
+        gen.io_bytes,
+        gen.io_bytes as f64 / (1024.0 * 1024.0),
+        gen.position
+    );
 }

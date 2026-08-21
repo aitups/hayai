@@ -445,7 +445,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "hayai-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "hayai-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "hayai-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hayai-cpu",
  "hayai-io",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "hayai-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "rayon",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "hayai-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "io-uring",
@@ -519,11 +519,11 @@ dependencies = [
 
 [[package]]
 name = "hayai-kernels"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "hayai-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "hayai-io",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "hayai-opencl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cl3",
  "hayai-cpu",

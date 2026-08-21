@@ -15,6 +15,7 @@ use crate::stream_infer::{StreamInferError, StreamingGenerator};
 use hayai_cpu::{attention_decode_step, rms_norm};
 use hayai_model::QuantMatrix;
 use hayai_opencl::StreamingScratch;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub(crate) fn prefill_moe(
@@ -144,13 +145,16 @@ pub(crate) fn forward_moe(
             (top, weights)
         };
 
-        // ── Sparse expert streaming: read only the selected experts (colibri) ──
+        // ── Sparse expert streaming (colibri): read ONLY the experts missing from
+        // the LRU cache; hot experts are already resident in host RAM. ───────────
         // Resident mode: all experts are preloaded, so nothing is read here.
+        let mut miss_meta: Vec<(usize, usize, usize, usize)> = Vec::new(); // (i,eid,base_off,pack_len)
         if !scratch.resident {
-            let t_io = Instant::now();
+            let mut miss_specs: Vec<(&str, usize, usize, usize)> =
+                Vec::with_capacity(top.len() * 3);
+            let mut miss_bytes = 0usize;
             {
-                let mut specs: Vec<(&str, usize, usize, usize)> =
-                    Vec::with_capacity(top.len() * 3);
+                let dst = scratch.host_slot_mut(layer);
                 for (i, eid) in top.iter().enumerate() {
                     let expert = unit
                         .experts
@@ -160,15 +164,35 @@ pub(crate) fn forward_moe(
                             StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
                         })?;
                     let base_off = unit.non_expert_bytes + i * unit.max_expert_bytes;
-                    for t in &expert.tensors {
-                        specs.push((t.name.as_str(), t.src_off, base_off + t.offset, t.nbytes));
+                    let pack_len = expert_pack_len(expert);
+                    if let Some(bytes) = gen.moe_cache.get(layer, *eid) {
+                        // Cache hit: memcpy into the slot, zero disk I/O.
+                        dst[base_off..base_off + pack_len].copy_from_slice(bytes);
+                        continue;
                     }
+                    for t in &expert.tensors {
+                        miss_specs
+                            .push((t.name.as_str(), t.src_off, base_off + t.offset, t.nbytes));
+                    }
+                    miss_bytes += pack_len;
+                    miss_meta.push((i, *eid, base_off, pack_len));
                 }
-                let dst = scratch.host_slot_mut(layer);
-                gen.catalog.load_tensors_into(&specs, dst)?;
             }
-            gen.io_secs += t_io.elapsed().as_secs_f64();
-            gen.io_bytes += (top.len() * unit.max_expert_bytes) as u64;
+            if !miss_specs.is_empty() {
+                let t_io = Instant::now();
+                let dst = scratch.host_slot_mut(layer);
+                gen.catalog.load_tensors_into(&miss_specs, dst)?;
+                gen.io_secs += t_io.elapsed().as_secs_f64();
+                gen.io_bytes += miss_bytes as u64;
+            }
+            // Populate the LRU cache with the newly loaded expert packs.
+            if !miss_meta.is_empty() {
+                let base = scratch.host_slot(layer);
+                for (_i, eid, base_off, pack_len) in miss_meta.iter() {
+                    let bytes = &base[*base_off..*base_off + pack_len];
+                    gen.moe_cache.insert(layer, *eid, bytes);
+                }
+            }
         }
 
         // ── Per-expert FFN (GpuAsync binding → OpenCL pool) ─────────────────────
@@ -176,6 +200,8 @@ pub(crate) fn forward_moe(
         {
             let base = scratch.host_slot(layer);
             let mut acc = vec![0.0f32; h];
+            // Pre-resolve the selected experts + their fixed (streaming/resident) offsets.
+            let mut expert_meta: Vec<(usize, usize, usize, usize)> = Vec::new(); // (i,eid,base_off,ff)
             for (i, eid) in top.iter().enumerate() {
                 let expert = unit
                     .experts
@@ -193,38 +219,118 @@ pub(crate) fn forward_moe(
                 };
                 let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
                 let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
-                let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
-                let ff = gate.nrows.max(up.nrows);
-                let mut g = vec![0.0f32; ff];
-                let mut u = vec![0.0f32; ff];
-                let mut d = vec![0.0f32; h];
-                orch.execute_op(
-                    LayerOpKind::ExpertGate,
-                    op_binding(LayerOpKind::ExpertGate),
-                    &gate,
-                    &xn,
-                    &mut g,
-                )?;
-                orch.execute_op(
-                    LayerOpKind::ExpertUp,
-                    op_binding(LayerOpKind::ExpertUp),
-                    &up,
-                    &xn,
-                    &mut u,
-                )?;
-                for j in 0..ff {
-                    g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
+                expert_meta.push((i, *eid, base_off, gate.nrows.max(up.nrows)));
+            }
+            if orch.pool.is_empty() {
+                // CPU: synchronous per expert.
+                for &(i, eid, base_off, ff) in &expert_meta {
+                    let expert = unit
+                        .experts
+                        .iter()
+                        .find(|e| e.expert_id == eid)
+                        .ok_or_else(|| {
+                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
+                        })?;
+                    let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
+                    let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
+                    let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
+                    let mut g = vec![0.0f32; ff];
+                    let mut u = vec![0.0f32; ff];
+                    let mut d = vec![0.0f32; h];
+                    orch.execute_op(
+                        LayerOpKind::ExpertGate,
+                        op_binding(LayerOpKind::ExpertGate),
+                        &gate,
+                        &xn,
+                        &mut g,
+                    )?;
+                    orch.execute_op(
+                        LayerOpKind::ExpertUp,
+                        op_binding(LayerOpKind::ExpertUp),
+                        &up,
+                        &xn,
+                        &mut u,
+                    )?;
+                    for j in 0..ff {
+                        g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
+                    }
+                    orch.execute_op(
+                        LayerOpKind::ExpertDown,
+                        op_binding(LayerOpKind::ExpertDown),
+                        &down,
+                        &g,
+                        &mut d,
+                    )?;
+                    let w = weights[i];
+                    for j in 0..h {
+                        acc[j] += w * d[j];
+                    }
                 }
-                orch.execute_op(
-                    LayerOpKind::ExpertDown,
-                    op_binding(LayerOpKind::ExpertDown),
-                    &down,
-                    &g,
-                    &mut d,
-                )?;
-                let w = weights[i];
-                for j in 0..h {
-                    acc[j] += w * d[j];
+            } else {
+                // GPU: async across experts — enqueue all gate∥up, wait, SiLU, down.
+                gen.used_dgpu = true;
+                if orch.pool.len() >= 2 {
+                    gen.used_apu = true;
+                }
+                let mut gate_pending = Vec::with_capacity(expert_meta.len());
+                let mut up_pending = Vec::with_capacity(expert_meta.len());
+                for &(_i, eid, base_off, _ff) in &expert_meta {
+                    let expert = unit
+                        .experts
+                        .iter()
+                        .find(|e| e.expert_id == eid)
+                        .ok_or_else(|| {
+                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
+                        })?;
+                    let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
+                    let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
+                    gate_pending.push(crate::orchestrator::begin_gemv_engine(
+                        orch.pool.for_role(0),
+                        &gate,
+                        &xn,
+                    )?);
+                    up_pending.push(crate::orchestrator::begin_gemv_engine(
+                        orch.pool.for_role(1),
+                        &up,
+                        &xn,
+                    )?);
+                }
+                let mut gs = Vec::with_capacity(expert_meta.len());
+                let mut us = Vec::with_capacity(expert_meta.len());
+                for (gp, up) in gate_pending.into_iter().zip(up_pending) {
+                    gs.push(gp.wait()?);
+                    us.push(up.wait()?);
+                }
+                let mut down_pending = Vec::with_capacity(expert_meta.len());
+                for (k, &(_i, eid, base_off, ff)) in expert_meta.iter().enumerate() {
+                    let g = &mut gs[k];
+                    for j in 0..ff {
+                        g[j] = (g[j] / (1.0 + (-g[j]).exp())) * us[k][j];
+                    }
+                    let expert = unit
+                        .experts
+                        .iter()
+                        .find(|e| e.expert_id == eid)
+                        .ok_or_else(|| {
+                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
+                        })?;
+                    let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
+                    down_pending.push(crate::orchestrator::begin_gemv_engine(
+                        orch.pool.for_role(0),
+                        &down,
+                        &g[..],
+                    )?);
+                }
+                let downs: Vec<Vec<f32>> = down_pending
+                    .into_iter()
+                    .map(|p| p.wait())
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (k, &(i, _eid, _b, _ff)) in expert_meta.iter().enumerate() {
+                    let d = &downs[k];
+                    let w = weights[i];
+                    for j in 0..h {
+                        acc[j] += w * d[j];
+                    }
                 }
             }
             // Shared expert (DeepSeek-style) always active, weight 1.
@@ -432,6 +538,75 @@ fn softmax_weights(scores: &[f32], top: &[usize]) -> Vec<f32> {
     w
 }
 
+/// Total bytes of one expert pack (gate + up + down).
+fn expert_pack_len(expert: &ExpertUnit) -> usize {
+    expert.tensors.iter().map(|t| t.nbytes).sum()
+}
+
+/// LRU cache of recently-used MoE expert packs (colibri-style). Hot experts stay
+/// resident in host RAM so repeat top-k selections skip disk reads — the dominant
+/// win of "stream experts on demand". Capacity in packs; `0` disables caching.
+pub(crate) struct ExpertCache {
+    capacity: usize,
+    slots: Vec<Option<(usize, usize, Vec<u8>)>>,
+    map: HashMap<(usize, usize), usize>,
+    lru: VecDeque<usize>,
+    pub(crate) hits: usize,
+    pub(crate) misses: usize,
+}
+
+impl ExpertCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            slots: vec![None; capacity],
+            map: HashMap::new(),
+            lru: VecDeque::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Cache lookup for `(layer, expert_id)`. Moves the slot to the LRU front.
+    pub(crate) fn get(&mut self, layer: usize, expert_id: usize) -> Option<&[u8]> {
+        if self.capacity == 0 {
+            return None;
+        }
+        let slot = *self.map.get(&(layer, expert_id))?;
+        if let Some(pos) = self.lru.iter().position(|&s| s == slot) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_front(slot);
+        self.hits += 1;
+        self.slots[slot].as_ref().map(|c| c.2.as_slice())
+    }
+
+    /// Store `bytes` for `(layer, expert_id)`, evicting the least-recently-used
+    /// slot when at capacity.
+    pub(crate) fn insert(&mut self, layer: usize, expert_id: usize, bytes: &[u8]) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.map.contains_key(&(layer, expert_id)) {
+            return;
+        }
+        self.misses += 1;
+        let slot = if let Some(free) = self.slots.iter().position(|s| s.is_none()) {
+            free
+        } else if let Some(victim) = self.lru.pop_back() {
+            if let Some(entry) = &self.slots[victim] {
+                self.map.remove(&(entry.0, entry.1));
+            }
+            victim
+        } else {
+            return;
+        };
+        self.slots[slot] = Some((layer, expert_id, bytes.to_vec()));
+        self.map.insert((layer, expert_id), slot);
+        self.lru.push_front(slot);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +627,27 @@ mod tests {
         assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         // The best expert dominates the weight.
         assert!(w[0] > w[1]);
+    }
+
+    #[test]
+    fn expert_cache_hits_and_evicts_lru() {
+        let mut c = ExpertCache::new(2);
+        c.insert(0, 1, b"pack-a");
+        c.insert(0, 2, b"pack-b");
+        // Hit expert 1 (moves it to the front).
+        assert_eq!(c.get(0, 1), Some(&b"pack-a"[..]));
+        // Insert a third → evicts expert 2 (LRU at the back).
+        c.insert(0, 3, b"pack-c");
+        assert!(c.get(0, 2).is_none());
+        assert_eq!(c.get(0, 1), Some(&b"pack-a"[..]));
+        assert_eq!(c.get(0, 3), Some(&b"pack-c"[..]));
+        assert!(c.hits >= 3);
+        assert_eq!(c.misses, 3);
+        // Disabled cache never hits.
+        let mut off = ExpertCache::new(0);
+        assert!(off.get(0, 1).is_none());
+        off.insert(0, 1, b"x");
+        assert!(off.get(0, 1).is_none());
     }
 }
 

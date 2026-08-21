@@ -975,6 +975,15 @@ fn cmd_bench_generate(
         "  Overlap:       io∥ffn={:.2}s attn∥ffn={:.2}s | ratio={:.2}x | prefetch={}",
         gen.overlap_secs, gen.attn_ffn_overlap_secs, speedup, gen.prefetch_hits
     );
+    let (moe_hits, moe_misses) = gen.moe_cache_stats();
+    if moe_hits + moe_misses > 0 {
+        println!(
+            "  MoE cache:     expert hits={} misses={} ({}% hit)",
+            moe_hits,
+            moe_misses,
+            100.0 * moe_hits as f64 / (moe_hits + moe_misses) as f64
+        );
+    }
     if let (Some(a), Some(b)) = (rss0, rss1) {
         println!(
             "  RSS:           {} → {} (Δ {}) | vs budget {:.1}×",
