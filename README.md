@@ -276,6 +276,7 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 | `HAYAI_FORCE_TOKIO_IO` | Force tokio-based I/O instead of `io_uring` on Linux |
 | `HAYAI_O_DIRECT` | Open the GGUF with `O_DIRECT` (Linux, bypass page cache; buffers are page-aligned) |
 | `HAYAI_MAX_LAYERS` | Cap the number of model layers processed (debug) |
+| `HAYAI_MOE_CACHE_MB` | MoE expert LRU cache budget in MiB (default 512; `0` disables) — hot experts stay resident, cutting disk I/O per token |
 | `HAYAI_SKIP_DN_ATTN` / `HAYAI_SKIP_FA_ATTN` | Skip DeltaNet / full-attention residuals (ablation) |
 | `HAYAI_DUMP_TOP` / `HAYAI_DUMP_AT_POS` / `HAYAI_DUMP_LAYER_RMS` | Dump top-k logits / layer RMS norms (debug) |
 | `HAYAI_DN_*` | DeltaNet internal ablations (`HAYAI_CONV_FLIP`, `HAYAI_DN_NO_CONV`, `HAYAI_DN_NO_L2`, `HAYAI_DN_SWAP_AB`, `HAYAI_DN_BETA_RAW`, `HAYAI_DN_A_RAW`, `HAYAI_DN_KMAP`) |
