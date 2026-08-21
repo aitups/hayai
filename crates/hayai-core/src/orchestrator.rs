@@ -176,7 +176,7 @@ impl EngineOrchestrator {
     /// hardcoded call sites.
     pub fn execute_op(
         &mut self,
-        op: crate::LayerOpKind,
+        _op: crate::LayerOpKind,
         binding: crate::exec_plan::OpBinding,
         matrix: &QuantMatrix,
         input: &[f32],

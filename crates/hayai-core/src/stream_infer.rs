@@ -1250,9 +1250,9 @@ impl StreamingGenerator {
                 ModelKind::Gemma => {
                     crate::gemma_infer::prefill_gemma(self, orch, prompt_ids, scratch)
                 }
-                ModelKind::MoE => Err(StreamInferError::Msg(
-                    "MoE forward not wired yet (Track M): plan classifies router/experts".into(),
-                )),
+                ModelKind::MoE => {
+                    crate::moe_infer::prefill_moe(self, orch, prompt_ids, scratch)
+                }
                 ModelKind::Dense => {
                     // Prefill with Attn∥FFN wavefront (PRD §3.3).
                     self.prefill_wavefront(orch, prompt_ids, scratch)
@@ -1275,9 +1275,7 @@ impl StreamingGenerator {
             match self.model_kind() {
                 ModelKind::Hybrid => crate::hybrid_infer::forward_hybrid(self, orch, token, scratch),
                 ModelKind::Gemma => crate::gemma_infer::forward_gemma(self, orch, token, scratch),
-                ModelKind::MoE => Err(StreamInferError::Msg(
-                    "MoE forward not wired yet (Track M): plan classifies router/experts".into(),
-                )),
+                ModelKind::MoE => crate::moe_infer::forward_moe(self, orch, token, scratch),
                 ModelKind::Dense => self.forward_staged(orch, token, scratch),
             }
         }

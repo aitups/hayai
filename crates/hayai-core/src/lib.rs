@@ -7,6 +7,7 @@ pub mod hrm_infer;
 pub mod hybrid_infer;
 pub mod infer;
 pub mod metrics;
+pub mod moe_infer;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod prefill_wave;

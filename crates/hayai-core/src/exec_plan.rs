@@ -175,12 +175,33 @@ pub struct TensorRef {
     pub offset: usize,
 }
 
+/// MoE metadata from GGUF keys (`{arch}.expert_count` /
+/// `{arch}.attention.expert_used_count`), with llama.cpp/HF fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeMeta {
+    pub expert_count: usize,
+    pub top_k: usize,
+}
+
+/// One MoE expert's tensor group. Offsets are relative to the expert pack start.
+#[derive(Debug, Clone)]
+pub struct ExpertUnit {
+    pub expert_id: usize,
+    pub tensors: Vec<TensorRef>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamingUnit {
     /// Logical block id (e.g. layer index) when detectable.
     pub block_id: Option<usize>,
     pub tensors: Vec<TensorRef>,
     pub total_bytes: usize,
+    /// MoE: per-expert tensor groups (empty for dense blocks).
+    pub experts: Vec<ExpertUnit>,
+    /// MoE: bytes of non-expert tensors (attn + router + shared expert).
+    pub non_expert_bytes: usize,
+    /// MoE: largest single expert pack (bytes).
+    pub max_expert_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +210,8 @@ pub struct ExecPlan {
     pub units: Vec<StreamingUnit>,
     pub max_unit_bytes: usize,
     pub known_ops: BTreeSet<LayerOpKind>,
+    /// MoE metadata (router/expert layout) when the model is sparse.
+    pub moe: Option<MoeMeta>,
     /// Per-op hardware binding (executor consumes this).
     pub op_bindings: BTreeMap<LayerOpKind, OpBinding>,
     pub hw_notes: Vec<String>,
@@ -241,6 +264,8 @@ pub fn build_exec_plan(
     // Group by blk.N / layers.N when present; otherwise one unit per tensor role cluster.
     // Tensor offsets are assigned in catalog order so units are self-describing:
     // `load_tensors_into` can stream them straight into a scratch slot.
+    let moe = detect_moe_meta(catalog);
+
     let mut units: Vec<StreamingUnit> = Vec::new();
     let mut by_block: std::collections::BTreeMap<Option<usize>, Vec<TensorRef>> =
         std::collections::BTreeMap::new();
@@ -249,15 +274,55 @@ pub fn build_exec_plan(
         by_block.entry(bid).or_default().push(c);
     }
     for (block_id, mut tensors) in by_block {
+        // Base offset layout: catalog order (executor re-packs experts on demand).
         let mut off = 0usize;
         for t in tensors.iter_mut() {
             t.offset = off;
             off += t.nbytes;
         }
+        // MoE: split expert tensors into per-expert packs; the streaming window is
+        // attn/router + top_k × largest expert — sparse disk streaming, not the
+        // whole block.
+        let mut experts: Vec<ExpertUnit> = Vec::new();
+        let mut non_expert_bytes = off;
+        let mut max_expert_bytes = 0usize;
+        if moe.is_some() && tensors.iter().any(|t| is_expert_op(t.op)) {
+            let mut by_exp: std::collections::BTreeMap<usize, Vec<TensorRef>> =
+                std::collections::BTreeMap::new();
+            for t in tensors.iter() {
+                if let Some(eid) = parse_expert_id(&t.name) {
+                    by_exp.entry(eid).or_default().push(t.clone());
+                }
+            }
+            non_expert_bytes = tensors
+                .iter()
+                .filter(|t| parse_expert_id(&t.name).is_none())
+                .map(|t| t.nbytes)
+                .sum();
+            for (eid, mut ets) in by_exp {
+                let mut eoff = 0usize;
+                for t in ets.iter_mut() {
+                    t.offset = eoff;
+                    eoff += t.nbytes;
+                }
+                max_expert_bytes = max_expert_bytes.max(eoff);
+                experts.push(ExpertUnit {
+                    expert_id: eid,
+                    tensors: ets,
+                });
+            }
+            experts.sort_by_key(|e| e.expert_id);
+            let mm = moe.expect("guarded above");
+            let top_k = mm.top_k.min(mm.expert_count).max(1);
+            off = non_expert_bytes + top_k * max_expert_bytes;
+        }
         units.push(StreamingUnit {
             block_id,
             tensors,
             total_bytes: off,
+            experts,
+            non_expert_bytes,
+            max_expert_bytes,
         });
     }
     units.sort_by_key(|u| u.block_id.unwrap_or(usize::MAX));
@@ -294,6 +359,7 @@ pub fn build_exec_plan(
         units,
         max_unit_bytes,
         known_ops,
+        moe,
         op_bindings,
         hw_notes,
     })
@@ -527,6 +593,48 @@ fn expert_kind(n: &str) -> LayerOpKind {
     }
 }
 
+/// Parse the expert id from `blk.N.ffn_exp.E.*` / HF `experts.E.*` tensor names.
+pub(crate) fn parse_expert_id(name: &str) -> Option<usize> {
+    for marker in ["ffn_exp.", "experts."] {
+        if let Some(idx) = name.find(marker) {
+            let rest = &name[idx + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+fn is_expert_op(op: LayerOpKind) -> bool {
+    matches!(
+        op,
+        LayerOpKind::ExpertGate | LayerOpKind::ExpertUp | LayerOpKind::ExpertDown
+    )
+}
+
+/// Detect MoE metadata from llama.cpp / HF GGUF keys.
+pub fn detect_moe_meta(cat: &GgufCatalog) -> Option<MoeMeta> {
+    let arch = cat.meta_str("general.architecture").unwrap_or("");
+    let expert_count = cat
+        .meta_u32(&format!("{arch}.expert_count"))
+        .or_else(|| cat.meta_u32("llama.expert_count"))
+        .map(|v| v as usize);
+    let top_k = cat
+        .meta_u32(&format!("{arch}.attention.expert_used_count"))
+        .or_else(|| cat.meta_u32(&format!("{arch}.expert_used_count")))
+        .or_else(|| cat.meta_u32("llama.attention.expert_used_count"))
+        .map(|v| v as usize);
+    match (expert_count, top_k) {
+        (Some(n), Some(k)) if n > 0 && k > 0 => Some(MoeMeta {
+            expert_count: n,
+            top_k: k,
+        }),
+        _ => None,
+    }
+}
+
 impl ExecPlan {
     pub fn format_report(&self) -> String {
         let mut s = String::new();
@@ -550,6 +658,14 @@ impl ExecPlan {
         s.push_str("op_bindings:\n");
         for (op, b) in &self.op_bindings {
             s.push_str(&format!("  {op:?} → {} ({:?})\n", b.device, b.kernel));
+        }
+        if let Some(moe) = self.moe {
+            s.push_str(&format!(
+                "moe: experts={} top_k={} (sparse: ~{:.1}% of FFN bytes/token)\n",
+                moe.expert_count,
+                moe.top_k,
+                100.0 * moe.top_k as f64 / moe.expert_count.max(1) as f64
+            ));
         }
         for u in self.units.iter().take(8) {
             s.push_str(&format!(
@@ -732,5 +848,92 @@ mod tests {
         assert_eq!(op_binding(LayerOpKind::Router), OpBinding::CPU_GEMV);
         assert_eq!(op_binding(LayerOpKind::AttnQ), OpBinding::CPU_GEMV);
         assert_eq!(op_binding(LayerOpKind::FfnNorm), OpBinding::CPU_NORM);
+    }
+
+    /// Track M: a synthetic MoE GGUF must split into per-expert units with a
+    /// **sparse** streaming window (attn/router + top_k × expert) — not the whole
+    /// block, which would defeat disk streaming on edge devices.
+    #[test]
+    fn moe_plan_splits_experts_with_sparse_window() {
+        use hayai_model::{gguf::write_minimal_gguf, GgufCatalog, MetadataValue};
+        use std::env::temp_dir;
+
+        let path = temp_dir().join("hayai_plan_moe.gguf");
+        let h: u64 = 8; // hidden
+        let ff: u64 = 16; // expert intermediate
+        let vocab: u64 = 16;
+        let ne: u64 = 4; // experts
+        let mut tensors: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight", vec![h, vocab], vec![0.1f32; (h * vocab) as usize]),
+            ("output_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("output.weight", vec![vocab, h], vec![0.1f32; (vocab * h) as usize]),
+            ("blk.0.attn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.attn_q.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_k.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_v.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_output.weight", vec![2 * h, h], vec![0.1f32; (2 * h * h) as usize]),
+            ("blk.0.ffn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.ffn_gate_inp.weight", vec![h, ne], vec![0.1f32; (h * ne) as usize]),
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for e in 0..ne {
+            names.push(format!("blk.0.ffn_exp.{e}.ffn_gate.weight"));
+            names.push(format!("blk.0.ffn_exp.{e}.ffn_up.weight"));
+            names.push(format!("blk.0.ffn_exp.{e}.ffn_down.weight"));
+        }
+        let mut ti = 0usize;
+        for _ in 0..ne {
+            tensors.push((names[ti].as_str(), vec![h, ff], vec![0.1f32; (h * ff) as usize]));
+            ti += 1;
+            tensors.push((names[ti].as_str(), vec![h, ff], vec![0.1f32; (h * ff) as usize]));
+            ti += 1;
+            tensors.push((names[ti].as_str(), vec![ff, h], vec![0.1f32; (ff * h) as usize]));
+            ti += 1;
+        }
+        write_minimal_gguf(
+            &path,
+            &[
+                (
+                    "general.architecture",
+                    MetadataValue::String("qwen3moe".into()),
+                ),
+                ("qwen3moe.expert_count", MetadataValue::U32(4)),
+                (
+                    "qwen3moe.attention.expert_used_count",
+                    MetadataValue::U32(2),
+                ),
+            ],
+            &tensors,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let plan = build_exec_plan(&cat, 0, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            plan.moe,
+            Some(MoeMeta {
+                expert_count: 4,
+                top_k: 2
+            })
+        );
+        let unit = plan.units.iter().find(|u| u.block_id == Some(0)).unwrap();
+        assert_eq!(unit.experts.len(), 4);
+        assert_eq!(unit.experts[0].expert_id, 0);
+        assert_eq!(unit.experts[0].tensors.len(), 3); // gate + up + down
+        assert!(unit.non_expert_bytes > 0);
+        assert!(unit.max_expert_bytes > 0);
+
+        // Sparse window: attn/router + top_k × expert, strictly less than the full
+        // block (which would include all 4 experts).
+        let full_block: usize = unit
+            .tensors
+            .iter()
+            .map(|t| t.nbytes)
+            .sum();
+        let sparse_window = unit.non_expert_bytes + 2 * unit.max_expert_bytes;
+        assert_eq!(unit.total_bytes, sparse_window);
+        assert_eq!(plan.max_unit_bytes, sparse_window);
+        assert!(sparse_window < full_block);
     }
 }
