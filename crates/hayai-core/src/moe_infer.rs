@@ -16,6 +16,7 @@ use hayai_cpu::{attention_decode_step, rms_norm};
 use hayai_model::QuantMatrix;
 use hayai_opencl::StreamingScratch;
 use std::collections::{HashMap, VecDeque};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 pub(crate) fn prefill_moe(
@@ -52,6 +53,13 @@ pub(crate) fn forward_moe(
     let mut x = vec![0.0f32; h];
     gen.embed_row("token_embd.weight", token, h, &mut x)?;
 
+    // Colibri-style pipeline: the next layer's non-expert tensors are prefetched
+    // into the OTHER ping-pong slot while this layer's attention+FFN compute runs
+    // (spawned before attention, joined after the expert compute). Same shape as
+    // the dense `forward_staged` prefetch.
+    let mut prefetch: Option<JoinHandle<Result<usize, StreamInferError>>> = None;
+    let mut prefetched_ready = false;
+
     for layer in 0..n_layers {
         let unit = plan
             .units
@@ -74,9 +82,12 @@ pub(crate) fn forward_moe(
             off += t.nbytes;
         }
 
-        // Stage non-expert tensors into the layer slot (resident: preloaded once).
+        // Stage non-expert tensors into the layer slot (resident: preloaded once;
+        // streaming: prefetched by the previous layer or loaded here).
         scratch.prepare_host_write(&orch.pool, layer)?;
-        if !scratch.resident {
+        let non_expert_prefetched = prefetched_ready;
+        prefetched_ready = false;
+        if !scratch.resident && !non_expert_prefetched {
             let t_io = Instant::now();
             {
                 let specs: Vec<(&str, usize, usize, usize)> = loaded
@@ -88,6 +99,43 @@ pub(crate) fn forward_moe(
             }
             gen.io_secs += t_io.elapsed().as_secs_f64();
             gen.io_bytes += off as u64;
+        }
+
+        // ── Prefetch the NEXT layer's non-expert into the other ping-pong slot ──
+        // Spawned BEFORE attention so the I/O overlaps with this layer's compute.
+        // Streaming (block_k<=1) only: in macro-chunk mode each layer lives at
+        // `(layer % block_k) × stride` inside its block slot, so the simple
+        // `(layer+1) % 2` ping-pong target is invalid.
+        if !scratch.resident && scratch.block_k <= 1 && layer + 1 < n_layers {
+            let next_unit = plan
+                .units
+                .iter()
+                .find(|u| u.block_id == Some(layer + 1))
+                .cloned();
+            if let Some(next_unit) = next_unit {
+                let mut specs: Vec<(String, usize, usize, usize)> = Vec::new();
+                let mut noff = 0usize;
+                for t in next_unit
+                    .tensors
+                    .iter()
+                    .filter(|t| !is_expert_op(t.op))
+                {
+                    specs.push((t.name.clone(), 0, noff, t.nbytes));
+                    noff += t.nbytes;
+                }
+                let ptr = gen.prepare_prefetch_slot(orch, scratch, (layer + 1) % 2)?;
+                let mut cat = gen.catalog.fork_reader()?;
+                prefetch = Some(std::thread::spawn(move || {
+                    let refs: Vec<(&str, usize, usize, usize)> = specs
+                        .iter()
+                        .map(|(n, a, b, c)| (n.as_str(), *a, *b, *c))
+                        .collect();
+                    let dst = unsafe { ptr.as_mut_slice() };
+                    cat.load_tensors_into(&refs, dst)
+                        .map_err(StreamInferError::from)?;
+                    Ok(noff)
+                }));
+            }
         }
 
         let t_attn = Instant::now();
@@ -376,6 +424,23 @@ pub(crate) fn forward_moe(
             }
         }
         gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
+
+        // ── Join the prefetch → next layer's non-expert is ready in its slot ──
+        if let Some(handle) = prefetch.take() {
+            let t_join = Instant::now();
+            match handle.join() {
+                Ok(Ok(bytes)) => {
+                    gen.overlap_secs += t_join.elapsed().as_secs_f64();
+                    gen.prefetch_hits += 1;
+                    gen.io_bytes += bytes as u64;
+                    prefetched_ready = true;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(StreamInferError::Msg("MoE prefetch join panicked".into()))
+                }
+            }
+        }
     }
     if !orch.pool.is_empty() {
         gen.used_dgpu = true;

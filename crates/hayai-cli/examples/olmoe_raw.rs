@@ -1,5 +1,5 @@
 //! Temp validation: raw continuation (no chat template) through the MoE forward.
-use hayai_core::{EngineOrchestrator, ExecutionMode, StreamingGenerator};
+use hayai_core::{EngineOrchestrator, ExecutionMode, MemoryStrategy, StreamingGenerator};
 use hayai_model::{sample, GgufCatalog, SamplerConfig, Tokenizer};
 
 fn main() {
@@ -16,6 +16,8 @@ fn main() {
         42,
     )
     .unwrap();
+    // Minimal = strict 2-slot ping-pong (block_k=1) → exercises the MoE prefetch.
+    gen.set_memory_strategy(MemoryStrategy::Minimal);
     let mut orch = EngineOrchestrator::new(ExecutionMode::CpuOnly, gen.config.clone());
     let mut scratch = gen.prepare_session(&mut orch).unwrap();
 
@@ -40,9 +42,10 @@ fn main() {
     println!("RAWTEXT: {:?}", gen.tokenizer.decode(&out));
     let (hits, misses) = gen.moe_cache_stats();
     println!(
-        "MOE_CACHE: hits={} misses={} io_bytes={} ({:.1} MiB for {} forwards)",
+        "MOE_CACHE: hits={} misses={} prefetch_hits={} io_bytes={} ({:.1} MiB for {} forwards)",
         hits,
         misses,
+        gen.prefetch_hits,
         gen.io_bytes,
         gen.io_bytes as f64 / (1024.0 * 1024.0),
         gen.position
