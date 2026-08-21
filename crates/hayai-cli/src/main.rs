@@ -24,6 +24,30 @@ struct Cli {
     command: Commands,
 }
 
+/// Render the chat prompt using the model's Jinja template (with warnings for
+/// special tokens missing from the vocab), falling back to the hardcoded ChatML
+/// wrap. Warns when even the ChatML markers are absent (base models → use --raw).
+fn render_chat_prompt(tok: &hayai_model::Tokenizer, prompt: &str) -> String {
+    let mut warnings = Vec::new();
+    if let Some(rendered) = tok.render_chat_template(
+        &[("user".to_string(), prompt.to_string())],
+        true,
+        &mut warnings,
+    ) {
+        for w in &warnings {
+            eprintln!("warning: chat template references special token missing from vocab: {w}");
+        }
+        return rendered;
+    }
+    if tok.token_to_id.get("<|im_start|>").is_none() {
+        eprintln!(
+            "warning: no usable chat template and no <|im_start|> specials — the ChatML \
+             fallback will be BPE-split; use --raw for a plain continuation"
+        );
+    }
+    tok.apply_chat_template(prompt)
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Inspect available hardware (OpenCL APUs, GPUs, CPU SIMD)
@@ -736,7 +760,7 @@ fn cmd_generate(
             weights.packed_nbytes as f64 / (1024.0 * 1024.0)
         );
         let prompt_text = if use_chat {
-            tokenizer.apply_chat_template(&prompt)
+            render_chat_prompt(&tokenizer, &prompt)
         } else {
             prompt
         };
@@ -763,7 +787,7 @@ fn cmd_generate(
         gen.io_backend.as_str()
     );
     let prompt_text = if use_chat {
-        gen.tokenizer.apply_chat_template(&prompt)
+        render_chat_prompt(&gen.tokenizer, &prompt)
     } else {
         prompt
     };
@@ -895,7 +919,7 @@ fn cmd_bench_generate(
     gen.set_memory_strategy(MemoryStrategy::parse(&memory_strategy));
     let load_s = t0.elapsed().as_secs_f64();
     let prompt_text = if use_chat {
-        gen.tokenizer.apply_chat_template(&prompt)
+        render_chat_prompt(&gen.tokenizer, &prompt)
     } else {
         prompt.clone()
     };

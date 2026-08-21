@@ -28,8 +28,12 @@ impl ChatTemplate {
             };
         }
 
+        let raw = hayai_model::Tokenizer::normalize_jinja_template(&raw);
+
         let mut env = minijinja::Environment::new();
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
+        env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
         if env.add_template_owned("chat", raw.clone()).is_err() {
             // Invalid template: fall back to ChatML rather than failing requests.
             tracing::warn!("invalid chat template; falling back to ChatML");
@@ -74,7 +78,13 @@ impl ChatTemplate {
                     "bos_token": bos,
                     "eos_token": eos,
                 }));
-                tpl.render(ctx).unwrap_or_default()
+                let rendered = tpl.render(ctx).unwrap_or_default();
+                for w in tokenizer.unresolved_specials(&rendered) {
+                    tracing::warn!(
+                        "chat template references special token missing from vocab: {w}"
+                    );
+                }
+                rendered
             }
             None => {
                 debug_assert!(self.default_chatml);

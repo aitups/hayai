@@ -117,6 +117,20 @@ impl Tokenizer {
             })
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
+        // Some converters store the added/special tokens in a separate list
+        // (`tokenizer.ggml.special_tokens`). Merge any that are already in the
+        // vocab but not matched by the heuristic above (e.g. `[INST]`, `<|user|>`).
+        for s in metadata
+            .get("tokenizer.ggml.special_tokens")
+            .and_then(|v| v.as_string_array())
+            .unwrap_or_default()
+        {
+            if let Some(&id) = token_to_id.get(&s) {
+                if !special_tokens.iter().any(|(t, _)| t.as_str() == s.as_str()) {
+                    special_tokens.push((s.clone(), id));
+                }
+            }
+        }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         // GPT-2 byte-level BPE (byte_fallback) vocabularies (GPT-2, Qwen, SmolLM2, Llama-3)
@@ -158,7 +172,57 @@ impl Tokenizer {
         })
     }
 
-    /// Byte-level BPE encode (GPT-2 or SentencePiece). Special tokens are matched atomically.
+    /// Normalize a Jinja chat template for minijinja compatibility.
+    ///
+    /// Transformers templates commonly use dict `.get('key')` and string
+    /// `.startswith(...)` / `.endswith(...)`, which minijinja (2.x) does not support
+    /// as methods. We rewrite:
+    ///   * literal `.get('x')` / `.get("x")` → `['x']` (index syntax), and
+    ///   * `.startswith(` / `.endswith(` → `|startswith(` / `|endswith(` (filters).
+pub fn normalize_jinja_template(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let b = raw.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'.' && i + 5 < b.len() {
+            let method = &raw[i + 1..i + 4];
+            if method == "get" && b[i + 4] == b'(' {
+                if let Some(&qc @ (b'\'' | b'"')) = b.get(i + 5) {
+                    let mut k = i + 6;
+                    while k < b.len() && b[k] != qc {
+                        k += 1;
+                    }
+                    if k < b.len() && b.get(k + 1) == Some(&b')') {
+                        // `.get('X')` -> `['X']` (keep the quotes).
+                        out.push('[');
+                        out.push_str(&raw[i + 5..=k]);
+                        out.push(']');
+                        i = k + 2;
+                        continue;
+                    }
+                }
+            } else if raw[i + 1..].starts_with("startswith(")
+                || raw[i + 1..].starts_with("endswith(")
+            {
+                // `.startswith(` / `.endswith(` -> `|startswith(` / `|endswith(`.
+                let method_len = if raw[i + 1..].starts_with("startswith(") {
+                    11
+                } else {
+                    9
+                };
+                out.push('|');
+                out.push_str(&raw[i + 1..i + 1 + method_len]);
+                i += 1 + method_len;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Byte-level BPE encode (GPT-2 or SentencePiece). Special tokens are matched atomically.
     pub fn encode(&self, text: &str, add_special: bool) -> Vec<u32> {
         let mut ids = Vec::new();
         if add_special && self.add_bos {
@@ -290,11 +354,120 @@ impl Tokenizer {
     pub fn apply_chat_template(&self, user: &str) -> String {
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     }
+
+    /// Render a message list with the model's Jinja chat template (`tokenizer.chat_template`)
+    /// when present. Returns `None` when there is no usable template (caller falls back to
+    /// [`Self::apply_chat_template`]).
+    ///
+    /// `warnings` collects special-token markers (e.g. `<|user|>`) referenced by the rendered
+    /// prompt that are **not** in the vocab — they would be BPE-split into subword tokens and
+    /// degrade the prompt. This surfaces GGUF conversions that dropped added tokens.
+    pub fn render_chat_template(
+        &self,
+        messages: &[(String, String)],
+        add_generation_prompt: bool,
+        warnings: &mut Vec<String>,
+    ) -> Option<String> {
+        let raw = self.chat_template.as_ref()?;
+        let raw = Self::normalize_jinja_template(raw);
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
+        env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
+        env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
+        if let Err(e) = env.add_template_owned("chat", raw.clone()) {
+            warnings.push(format!("chat template does not compile: {e}"));
+            return None;
+        }
+        let tpl = match env.get_template("chat") {
+            Ok(t) => t,
+            Err(e) => {
+                warnings.push(format!("chat template lookup failed: {e}"));
+                return None;
+            }
+        };
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect();
+        let bos = self
+            .tokens
+            .get(self.bos_id as usize)
+            .cloned()
+            .unwrap_or_default();
+        let eos = self
+            .tokens
+            .get(self.eos_id as usize)
+            .cloned()
+            .unwrap_or_default();
+        let ctx = minijinja::Value::from_serialize(&serde_json::json!({
+            "messages": msgs,
+            "add_generation_prompt": add_generation_prompt,
+            "bos_token": bos,
+            "eos_token": eos,
+        }));
+        match tpl.render(ctx) {
+            Ok(rendered) => {
+                warnings.extend(self.unresolved_specials(&rendered));
+                Some(rendered)
+            }
+            Err(e) => {
+                warnings.push(format!("chat template render error: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Special-token markers (`<...|...>`) in `text` that are NOT representable as a
+    /// single vocab token (they would be BPE-split into subword tokens, degrading
+    /// the prompt). Checks `token_to_id` first — Gemma4 pairs like `<turn|>` are
+    /// atomic even though they are not matched by the `<|...|>` heuristic.
+    pub fn unresolved_specials(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let b = text.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'<' {
+                // Read up to the next `>` (whitespace or 40 chars caps a "marker").
+                let mut j = i + 1;
+                while j < b.len() && j - i <= 40 {
+                    let c = b[j];
+                    if c == b'>' {
+                        break;
+                    }
+                    if c.is_ascii_whitespace() {
+                        j = b.len();
+                        break;
+                    }
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'>' && j - i <= 32 && marker_like(&text[i..=j]) {
+                    let marker = &text[i..=j];
+                    if self.token_to_id.get(marker).is_none()
+                        && !self
+                            .special_tokens
+                            .iter()
+                            .any(|(t, _)| t.as_str() == marker)
+                    {
+                        out.push(marker.to_string());
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 /// GPT-2 `bytes_to_unicode` mapping (HuggingFace tokenizers). Every byte maps to a
 /// printable char: printable ASCII/Latin-1 map to themselves, the rest to U+0100+.
 /// Used by byte-level BPE vocabularies (GPT-2, Qwen, SmolLM2, Llama-3).
+/// True when a `<...>` span looks like a special-token marker (contains `|`).
+fn marker_like(s: &str) -> bool {
+    s.len() >= 3 && s.contains('|')
+}
+
 fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
     let mut bs: Vec<u8> = Vec::new();
     let mut cs: Vec<char> = Vec::new();
@@ -435,6 +608,161 @@ mod tests {
         assert_eq!(tok.decode(&[3, 4, 5]), "中");
         // encode "中" back to the byte tokens (byte_fallback path)
         assert_eq!(tok.encode("中", false), vec![3, 4, 5]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chat_template_renders_with_jinja_and_atomic_specials() {
+        let path = temp_dir().join("hayai_tok_chat.gguf");
+        let tokens = vec![
+            MetadataValue::String("<unk>".into()),
+            MetadataValue::String("<s>".into()),
+            MetadataValue::String("</s>".into()),
+            MetadataValue::String("<|im_start|>".into()),
+            MetadataValue::String("<|im_end|>".into()),
+            MetadataValue::String("hello".into()),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+                (
+                    "tokenizer.chat_template",
+                    MetadataValue::String(
+                        "{% for m in messages %}{{ '<|im_start|>' + m['role'] + '\\n' + m['content'] + '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+                            .into(),
+                    ),
+                ),
+            ],
+            &[("dummy", vec![1], vec![0.0f32])],
+        )
+        .unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let mut warnings = Vec::new();
+        let rendered = tok
+            .render_chat_template(&[("user".into(), "hi".into())], true, &mut warnings)
+            .unwrap();
+        assert!(rendered.contains("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"));
+        assert!(warnings.is_empty());
+        // The special markers must encode atomically (ids 3 and 4).
+        let ids = tok.encode(&rendered, false);
+        assert!(ids.contains(&3) && ids.contains(&4));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unresolved_specials_reports_missing_markers() {
+        // Template references <|user|> which is NOT in the vocab.
+        let path = temp_dir().join("hayai_tok_chat_missing.gguf");
+        let tokens = vec![
+            MetadataValue::String("<unk>".into()),
+            MetadataValue::String("<s>".into()),
+            MetadataValue::String("</s>".into()),
+            MetadataValue::String("<|endoftext|>".into()),
+            MetadataValue::String("hi".into()),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(3)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(3)),
+                (
+                    "tokenizer.chat_template",
+                    MetadataValue::String(
+                        "<|endoftext|>{{ '<|user|>\\n' + messages[0]['content'] }}".into(),
+                    ),
+                ),
+            ],
+            &[("dummy", vec![1], vec![0.0f32])],
+        )
+        .unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let mut warnings = Vec::new();
+        let rendered = tok
+            .render_chat_template(&[("user".into(), "hi".into())], false, &mut warnings)
+            .unwrap();
+        assert!(rendered.contains("<|user|>"));
+        assert!(warnings.iter().any(|w| w.contains("<|user|>")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn special_tokens_metadata_is_merged() {
+        // `[INST]` is in the vocab but not matched by the `<|...|>` heuristic; the
+        // separate `tokenizer.ggml.special_tokens` list must add it.
+        let path = temp_dir().join("hayai_tok_special_meta.gguf");
+        let tokens = vec![
+            MetadataValue::String("<unk>".into()),
+            MetadataValue::String("<s>".into()),
+            MetadataValue::String("</s>".into()),
+            MetadataValue::String("[INST]".into()),
+            MetadataValue::String("hi".into()),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                (
+                    "tokenizer.ggml.special_tokens",
+                    MetadataValue::Array(vec![MetadataValue::String("[INST]".into())]),
+                ),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+            ],
+            &[("dummy", vec![1], vec![0.0f32])],
+        )
+        .unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(tok.special_tokens.iter().any(|(t, _)| t == "[INST]"));
+        assert_eq!(tok.encode("[INST] hi", false).first(), Some(&3));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalize_rewrites_startswith_and_get() {
+        // Qwen-style template using `.startswith` and dict `.get(...)` must render.
+        let path = temp_dir().join("hayai_tok_startswith.gguf");
+        let tokens = vec![
+            MetadataValue::String("<unk>".into()),
+            MetadataValue::String("<s>".into()),
+            MetadataValue::String("</s>".into()),
+            MetadataValue::String("<|im_start|>".into()),
+            MetadataValue::String("<|im_end|>".into()),
+            MetadataValue::String("hi".into()),
+        ];
+        let tmpl = "{% if messages[0]['role'].startswith('u') %}ok{% endif %}{% for m in messages %}{{ m.get('role') }}:{{ m['content'] }}{% endfor %}";
+        write_minimal_gguf(
+            &path,
+            &[
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+                (
+                    "tokenizer.chat_template",
+                    MetadataValue::String(tmpl.into()),
+                ),
+            ],
+            &[("dummy", vec![1], vec![0.0f32])],
+        )
+        .unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let mut warnings = Vec::new();
+        let rendered = tok
+            .render_chat_template(&[("user".into(), "hi".into())], false, &mut warnings)
+            .unwrap();
+        assert!(rendered.starts_with("ok"), "rendered={rendered}");
+        assert!(rendered.contains("user:hi"), "rendered={rendered}");
         let _ = std::fs::remove_file(path);
     }
 }

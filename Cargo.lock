@@ -528,7 +528,9 @@ dependencies = [
  "bytemuck",
  "hayai-io",
  "memmap2",
+ "minijinja",
  "rayon",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
 ]
