@@ -18,6 +18,8 @@ pub enum OpenClError {
     ClError(String),
     #[error("No OpenCL GEMV kernel for GGML type: {0}")]
     UnsupportedQuant(String),
+    #[error("OpenCL 3.0 required, but device reports {0}")]
+    UnsupportedPlatformVersion(String),
 }
 
 pub struct OpenClEngine {
@@ -83,6 +85,16 @@ impl OpenClEngine {
         let queue =
             CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)
                 .map_err(|e| OpenClError::ClError(e.to_string()))?;
+
+        // Hard requirement: Hayai targets OpenCL 3.0 PLATFORMS. Kernels are written in
+        // the mandatory OpenCL C subset (C 1.2) — the ONLY language every OpenCL 3.0
+        // device must support; OpenCL C 2.0/3.0 language is optional per-device and
+        // NVIDIA's OpenCL 3.0 compiles C 1.2 only. We therefore build with the default
+        // `-cl-std` (C 1.2), which every OpenCL 3.0 platform is required to accept.
+        let platform_version = info.opencl_version.clone();
+        if !platform_version.contains("3.0") {
+            return Err(OpenClError::UnsupportedPlatformVersion(platform_version));
+        }
 
         let source = opencl_program_source();
         let program = Program::create_and_build_from_source(&context, &source, "")

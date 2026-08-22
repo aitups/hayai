@@ -18,6 +18,8 @@ pub struct OpenClDeviceInfo {
     pub device_kind: DeviceKind,
     pub device_id: opencl3::types::cl_device_id,
     pub supports_svm: bool,
+    pub opencl_version: String,
+    pub opencl_c_version: String,
     pub max_compute_units: u32,
     pub global_mem_size: u64,
 }
@@ -52,6 +54,15 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
             // SVM Capability Check (OpenCL 2.0+ / 3.0 SVM coarse/fine grain)
             let supports_svm = dev.svm_mem_capability() != 0;
 
+            // OpenCL platform version (Hayai hard-requires OpenCL 3.0 platforms).
+            let opencl_version = dev.version().unwrap_or_else(|_| "OpenCL Unknown".into());
+
+            // OpenCL C language version (diagnostic; OpenCL 3.0 only guarantees C 1.2,
+            // e.g. NVIDIA's OpenCL 3.0 exposes "OpenCL C 1.2").
+            let opencl_c_version = dev
+                .opencl_c_version()
+                .unwrap_or_else(|_| "OpenCL C Unknown".into());
+
             let device_kind = if dev_type & CL_DEVICE_TYPE_GPU != 0 {
                 // Heuristic for Integrated vs Discrete GPU based on vendor/name and SVM
                 let name_lower = device_name.to_lowercase();
@@ -67,11 +78,13 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
             };
 
             info!(
-                "Discovered OpenCL Device: {} ({}) | Type: {:?} | SVM: {} | VRAM/RAM: {} MB",
+                "Discovered OpenCL Device: {} ({}) | Type: {:?} | SVM: {} | OpenCL: {} | C: {} | VRAM/RAM: {} MB",
                 device_name,
                 platform_name,
                 device_kind,
                 supports_svm,
+                opencl_version,
+                opencl_c_version,
                 global_mem_size / (1024 * 1024)
             );
 
@@ -82,6 +95,8 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
                 device_kind,
                 device_id: dev_id,
                 supports_svm,
+                opencl_version,
+                opencl_c_version,
                 max_compute_units,
                 global_mem_size,
             });

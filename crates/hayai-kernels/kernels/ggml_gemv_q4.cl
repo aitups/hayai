@@ -1,5 +1,11 @@
 // GGML GEMV kernels for GGUF packed weights.
 // One work-item per output row. `weight_off` = byte offset into `weights` (scratch pack).
+//
+// OpenCL 3.0 is a HARD requirement. Kernels are written in the mandatory OpenCL C
+// subset (C 1.2) — the ONLY language every OpenCL 3.0 device must support; OpenCL C
+// 2.0/3.0 language is optional per-device and NVIDIA's OpenCL 3.0 compiles C 1.2 only.
+// Vector quant bytes are indexed through a union of vector + byte array: `.s<N>` needs
+// a constant index and dynamic `v[i]` needs C 2.0+ — the union works on every vendor.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
@@ -48,7 +54,7 @@ inline void hayai_wg_barrier(__local float* lx) {
 __kernel void ggml_gemv_q4_0(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -73,13 +79,16 @@ __kernel void ggml_gemv_q4_0(
                 float d = hayai_half_bits_to_float(hd);
                 int x_base = b * 32 - t0;
                 // Vectorized loads (vload8 tolerates the 18-byte unaligned GGML block).
-                uchar8 q0 = vload8(0, &wbase[base + 2]);
-                uchar8 q1 = vload8(0, &wbase[base + 10]);
+                // `.s<N>` needs a constant index and dynamic `v[i]` needs C 2.0+ (NVIDIA's
+                // OpenCL 3.0 compiles C 1.2 only) — index via a union of vector + array.
+                union { uchar8 v; uchar a[8]; } q0u, q1u;
+                q0u.v = vload8(0, &wbase[base + 2]);
+                q1u.v = vload8(0, &wbase[base + 10]);
                 for (int j = 0; j < 8; j++) {
-                    float x0 = (float)((int)(q0.s[j] & 0x0F) - 8);
-                    float x1 = (float)((int)(q0.s[j] >> 4) - 8);
-                    float x2 = (float)((int)(q1.s[j] & 0x0F) - 8);
-                    float x3 = (float)((int)(q1.s[j] >> 4) - 8);
+                    float x0 = (float)((int)(q0u.a[j] & 0x0F) - 8);
+                    float x1 = (float)((int)(q0u.a[j] >> 4) - 8);
+                    float x2 = (float)((int)(q1u.a[j] & 0x0F) - 8);
+                    float x3 = (float)((int)(q1u.a[j] >> 4) - 8);
                     sum += x0 * d * local_input[x_base + j];
                     sum += x1 * d * local_input[x_base + j + 16];
                     sum += x2 * d * local_input[x_base + j + 8];
@@ -95,7 +104,7 @@ __kernel void ggml_gemv_q4_0(
 __kernel void ggml_gemv_q4_1(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -121,18 +130,18 @@ __kernel void ggml_gemv_q4_1(
                 float m = hayai_half_bits_to_float(hm);
                 int x_base = b * 32 - t0;
                 // Vectorized loads (vload8 tolerates the 20-byte unaligned GGML block).
-                uchar8 q0 = vload8(0, &wbase[base + 4]);
-                uchar8 q1 = vload8(0, &wbase[base + 12]);
+                union { uchar8 v; uchar a[8]; } q0u, q1u;
+                q0u.v = vload8(0, &wbase[base + 4]);
+                q1u.v = vload8(0, &wbase[base + 12]);
                 for (int j = 0; j < 8; j++) {
-                    float a0 = (float)(q0.s[j] & 0x0F) * d + m;
-                    float a1 = (float)(q0.s[j] >> 4) * d + m;
-                    float a2 = (float)(q1.s[j] & 0x0F) * d + m;
-                    float a3 = (float)(q1.s[j] >> 4) * d + m;
+                    float a0 = (float)(q0u.a[j] & 0x0F) * d + m;
+                    float a1 = (float)(q0u.a[j] >> 4) * d + m;
+                    float a2 = (float)(q1u.a[j] & 0x0F) * d + m;
+                    float a3 = (float)(q1u.a[j] >> 4) * d + m;
                     sum += a0 * local_input[x_base + j];
                     sum += a1 * local_input[x_base + j + 16];
                     sum += a2 * local_input[x_base + j + 8];
                     sum += a3 * local_input[x_base + j + 24];
-                }
                 }
             }
         }
@@ -144,7 +153,7 @@ __kernel void ggml_gemv_q4_1(
 __kernel void ggml_gemv_q8_0(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -164,15 +173,16 @@ __kernel void ggml_gemv_q8_0(
         float d = hayai_half_bits_to_float(hd);
         int x_base = b * 32;
         // Vectorized loads (vload8 tolerates the 34-byte unaligned GGML block).
-        uchar8 q0 = vload8(0, &wbase[base + 2]);
-        uchar8 q1 = vload8(0, &wbase[base + 10]);
-        uchar8 q2 = vload8(0, &wbase[base + 18]);
-        uchar8 q3 = vload8(0, &wbase[base + 26]);
+        union { uchar8 v; uchar a[8]; } q0u, q1u, q2u, q3u;
+        q0u.v = vload8(0, &wbase[base + 2]);
+        q1u.v = vload8(0, &wbase[base + 10]);
+        q2u.v = vload8(0, &wbase[base + 18]);
+        q3u.v = vload8(0, &wbase[base + 26]);
         for (int j = 0; j < 8; j++) {
-            sum += (float)((char)q0.s[j]) * d * input[x_base + j];
-            sum += (float)((char)q1.s[j]) * d * input[x_base + j + 8];
-            sum += (float)((char)q2.s[j]) * d * input[x_base + j + 16];
-            sum += (float)((char)q3.s[j]) * d * input[x_base + j + 24];
+            sum += (float)((char)q0u.a[j]) * d * input[x_base + j];
+            sum += (float)((char)q1u.a[j]) * d * input[x_base + j + 8];
+            sum += (float)((char)q2u.a[j]) * d * input[x_base + j + 16];
+            sum += (float)((char)q3u.a[j]) * d * input[x_base + j + 24];
         }
     }
     output[row] = sum;
@@ -181,7 +191,7 @@ __kernel void ggml_gemv_q8_0(
 __kernel void ggml_gemv_q5_0(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -218,7 +228,7 @@ __kernel void ggml_gemv_q5_0(
 __kernel void ggml_gemv_q5_1(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -267,7 +277,7 @@ inline void hayai_get_scale_min_k4(int j, __global const uchar* scales, uchar* s
 __kernel void ggml_gemv_q4_k(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -303,19 +313,20 @@ __kernel void ggml_gemv_q4_k(
                     float d2 = d * (float)sc1;
                     float m2v = minv * (float)m1;
                     // Vectorized loads: 4 × vload8 cover the 32 qs bytes of the sub-block.
-                    uchar8 qv0 = vload8(0, &q[qo]);
-                    uchar8 qv1 = vload8(0, &q[qo + 8]);
-                    uchar8 qv2 = vload8(0, &q[qo + 16]);
-                    uchar8 qv3 = vload8(0, &q[qo + 24]);
+                    union { uchar8 v; uchar a[8]; } qv0u, qv1u, qv2u, qv3u;
+                    qv0u.v = vload8(0, &q[qo]);
+                    qv1u.v = vload8(0, &q[qo + 8]);
+                    qv2u.v = vload8(0, &q[qo + 16]);
+                    qv3u.v = vload8(0, &q[qo + 24]);
                     for (int l = 0; l < 8; l++) {
-                        int c0 = qv0.s[l] & 0x0F;
-                        int c1 = qv0.s[l] >> 4;
-                        int c2 = qv1.s[l] & 0x0F;
-                        int c3 = qv1.s[l] >> 4;
-                        int c4 = qv2.s[l] & 0x0F;
-                        int c5 = qv2.s[l] >> 4;
-                        int c6 = qv3.s[l] & 0x0F;
-                        int c7 = qv3.s[l] >> 4;
+                        int c0 = qv0u.a[l] & 0x0F;
+                        int c1 = qv0u.a[l] >> 4;
+                        int c2 = qv1u.a[l] & 0x0F;
+                        int c3 = qv1u.a[l] >> 4;
+                        int c4 = qv2u.a[l] & 0x0F;
+                        int c5 = qv2u.a[l] >> 4;
+                        int c6 = qv3u.a[l] & 0x0F;
+                        int c7 = qv3u.a[l] >> 4;
                         int xb = x_base + sub * 64;
                         sum += (d1 * (float)c0 - m1v) * local_input[xb + l];
                         sum += (d2 * (float)c1 - m2v) * local_input[xb + 32 + l];
@@ -339,7 +350,7 @@ __kernel void ggml_gemv_q4_k(
 __kernel void ggml_gemv_q6_k(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -391,7 +402,7 @@ __kernel void ggml_gemv_q6_k(
 __kernel void ggml_gemv_f32(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -409,7 +420,7 @@ __kernel void ggml_gemv_f32(
 __kernel void ggml_gemv_f16(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -430,7 +441,7 @@ __kernel void ggml_gemv_f16(
 __kernel void ggml_gemv_q2_k(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -482,7 +493,7 @@ __kernel void ggml_gemv_q2_k(
 __kernel void ggml_gemv_q3_k(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -551,7 +562,7 @@ __kernel void ggml_gemv_q3_k(
 __kernel void ggml_gemv_q5_k(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -619,7 +630,7 @@ __constant char hayai_kvalues_iq4nl[16] = {
 __kernel void ggml_gemv_iq4_nl(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -649,7 +660,7 @@ __kernel void ggml_gemv_iq4_nl(
 __kernel void ggml_gemv_iq4_xs(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -813,7 +824,7 @@ inline uchar hayai_grid_byte(uint g, int j) {
 __kernel void ggml_gemv_iq3_xxs(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -860,7 +871,7 @@ __kernel void ggml_gemv_iq3_xxs(
 __kernel void ggml_gemv_iq3_s(
     const int M,
     const int N,
-    const int weight_off,
+    const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -1394,7 +1405,7 @@ inline float hayai_iq2_signed(float db, uchar g, uchar signs, int j) {
 }
 
 __kernel void ggml_gemv_iq2_xxs(
-    const int M, const int N, const int weight_off,
+    const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -1433,7 +1444,7 @@ __kernel void ggml_gemv_iq2_xxs(
 }
 
 __kernel void ggml_gemv_iq2_xs(
-    const int M, const int N, const int weight_off,
+    const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,
@@ -1472,7 +1483,7 @@ __kernel void ggml_gemv_iq2_xs(
 }
 
 __kernel void ggml_gemv_iq2_s(
-    const int M, const int N, const int weight_off,
+    const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
     __global float* restrict output,

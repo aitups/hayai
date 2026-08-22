@@ -177,7 +177,7 @@ impl OpenClEngine {
         assert_eq!(output.len(), m);
         let m_i = m as cl_int;
         let n_i = n as cl_int;
-        let off_i = 0i32;
+        let off_i = 0i64; // cl_long (kernel arg)
 
         let mut weights_buf = unsafe {
             Buffer::<cl_uchar>::create(
@@ -265,14 +265,32 @@ fn preferred_local_size(m: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use crate::device::{discover_opencl_devices, DeviceKind};
     use crate::OpenClEngine;
     use hayai_cpu::{cpu_lut_matmul_q4, max_abs_diff};
     use hayai_model::quant::gemv_q4_0;
 
+    /// Init the engine, skipping ONLY when no GPU OpenCL device exists. If a GPU is
+    /// present but engine init (kernel compilation) fails, the test FAILS — a compile
+    /// regression must never hide behind a silent skip (that is exactly how the
+    /// v0.2.1 `v.s[j]` kernel breakage slipped through the suite).
+    fn init_engine_or_skip(label: &str) -> Option<OpenClEngine> {
+        let has_gpu = discover_opencl_devices()
+            .iter()
+            .any(|d| d.device_kind != DeviceKind::CpuOpenCl);
+        match OpenClEngine::try_init_any() {
+            Ok(eng) => Some(eng),
+            Err(e) if !has_gpu => {
+                eprintln!("skipping {label}: no OpenCL device");
+                None
+            }
+            Err(e) => panic!("OpenCL device(s) present but engine init failed: {e}"),
+        }
+    }
+
     #[test]
     fn opencl_lut_matches_cpu_when_available() {
-        let Ok(engine) = OpenClEngine::try_init_any() else {
-            eprintln!("skipping OpenCL LUT test: no device");
+        let Some(engine) = init_engine_or_skip("OpenCL LUT test") else {
             return;
         };
 
@@ -301,8 +319,7 @@ mod tests {
 
     #[test]
     fn opencl_ggml_q4_0_matches_cpu_when_available() {
-        let Ok(engine) = OpenClEngine::try_init_any() else {
-            eprintln!("skipping OpenCL ggml gemv test: no device");
+        let Some(engine) = init_engine_or_skip("OpenCL q4_0 gemv test") else {
             return;
         };
 
@@ -341,8 +358,7 @@ mod tests {
     fn opencl_ggml_q4_k_matches_cpu_when_available() {
         use hayai_model::q4k::gemv_q4_k;
 
-        let Ok(engine) = OpenClEngine::try_init_any() else {
-            eprintln!("skipping OpenCL q4_k gemv test: no device");
+        let Some(engine) = init_engine_or_skip("OpenCL q4_k gemv test") else {
             return;
         };
 
@@ -387,8 +403,7 @@ mod tests {
     fn opencl_ggml_q6_k_matches_cpu_when_available() {
         use hayai_model::q6k::gemv_q6_k;
 
-        let Ok(engine) = OpenClEngine::try_init_any() else {
-            eprintln!("skipping OpenCL q6_k gemv test: no device");
+        let Some(engine) = init_engine_or_skip("OpenCL q6_k gemv test") else {
             return;
         };
 
@@ -429,6 +444,138 @@ mod tests {
             "OpenCL ggml Q6_K vs CPU mismatch: {err} on {}",
             engine.device_info.device_name
         );
+    }
+
+    #[test]
+    fn opencl_ggml_q4_1_matches_cpu_when_available() {
+        use hayai_model::quant::gemv_q4_1;
+
+        let Some(engine) = init_engine_or_skip("OpenCL q4_1 gemv test") else {
+            return;
+        };
+
+        let m = 32usize;
+        let n = 256usize; // 8 blocks
+        let blocks = n / 32;
+        let row_bytes = blocks * 20;
+        let mut weights = vec![0u8; m * row_bytes];
+        for row in 0..m {
+            for b in 0..blocks {
+                let base = row * row_bytes + b * 20;
+                weights[base] = 0x66; // d fp16
+                weights[base + 1] = 0x2E;
+                weights[base + 2] = 0x00; // m fp16 = 0
+                weights[base + 3] = 0x00;
+                for j in 0..16 {
+                    weights[base + 4 + j] = ((row + b + j) % 256) as u8;
+                }
+            }
+        }
+
+        let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.4).collect();
+        let mut cpu_out = vec![0.0f32; m];
+        let mut gpu_out = vec![0.0f32; m];
+        gemv_q4_1(n, &weights, &input, &mut cpu_out);
+        engine
+            .ggml_gemv_q4_1(m, n, &weights, &input, &mut gpu_out)
+            .expect("OpenCL ggml_gemv_q4_1 failed");
+
+        let err = max_abs_diff(&cpu_out, &gpu_out);
+        assert!(
+            err < 1e-3,
+            "OpenCL ggml Q4_1 vs CPU mismatch: {err} on {}",
+            engine.device_info.device_name
+        );
+    }
+
+    #[test]
+    fn opencl_ggml_q8_0_matches_cpu_when_available() {
+        use hayai_model::quant::gemv_q8_0;
+
+        let Some(engine) = init_engine_or_skip("OpenCL q8_0 gemv test") else {
+            return;
+        };
+
+        let m = 32usize;
+        let n = 256usize; // 8 blocks
+        let blocks = n / 32;
+        let row_bytes = blocks * 34;
+        let mut weights = vec![0u8; m * row_bytes];
+        for row in 0..m {
+            for b in 0..blocks {
+                let base = row * row_bytes + b * 34;
+                weights[base] = 0x66; // d fp16
+                weights[base + 1] = 0x2E;
+                for j in 0..32 {
+                    weights[base + 2 + j] = ((row + b + j) % 256) as u8;
+                }
+            }
+        }
+
+        let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.4).collect();
+        let mut cpu_out = vec![0.0f32; m];
+        let mut gpu_out = vec![0.0f32; m];
+        gemv_q8_0(n, &weights, &input, &mut cpu_out);
+        engine
+            .ggml_gemv_q8_0(m, n, &weights, &input, &mut gpu_out)
+            .expect("OpenCL ggml_gemv_q8_0 failed");
+
+        let err = max_abs_diff(&cpu_out, &gpu_out);
+        assert!(
+            err < 1e-3,
+            "OpenCL ggml Q8_0 vs CPU mismatch: {err} on {}",
+            engine.device_info.device_name
+        );
+    }
+
+    #[test]
+    fn opencl_all_gpus_compile_and_match_cpu() {
+        // Validates EVERY OpenCL 3.0 GPU in the pool (dGPU + iGPU): kernels must compile
+        // and produce CPU-identical results on each device, not just the primary.
+        use crate::pool::OpenClDevicePool;
+
+        let has_gpu = discover_opencl_devices()
+            .iter()
+            .any(|d| d.device_kind != DeviceKind::CpuOpenCl);
+        let pool = match OpenClDevicePool::try_init_all_gpus() {
+            Ok(p) => p,
+            Err(_) if !has_gpu => {
+                eprintln!("skipping pool test: no OpenCL device");
+                return;
+            }
+            Err(e) => panic!("OpenCL device(s) present but pool init failed: {e}"),
+        };
+
+        let m = 64usize;
+        let n = 128usize;
+        let blocks = n / 32;
+        let row_bytes = blocks * 18;
+        let mut weights = vec![0u8; m * row_bytes];
+        for row in 0..m {
+            for b in 0..blocks {
+                let base = row * row_bytes + b * 18;
+                weights[base] = 0x66;
+                weights[base + 1] = 0x2E;
+                for j in 0..16 {
+                    weights[base + 2 + j] = ((row + b + j) % 256) as u8;
+                }
+            }
+        }
+        let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.4).collect();
+
+        for eng in pool.engines.iter() {
+            let mut cpu_out = vec![0.0f32; m];
+            let mut gpu_out = vec![0.0f32; m];
+            gemv_q4_0(n, &weights, &input, &mut cpu_out);
+            eng.ggml_gemv_q4_0(m, n, &weights, &input, &mut gpu_out)
+                .expect("OpenCL ggml_gemv_q4_0 failed");
+            let err = max_abs_diff(&cpu_out, &gpu_out);
+            assert!(
+                err < 1e-3,
+                "OpenCL ggml Q4_0 vs CPU mismatch: {err} on {}",
+                eng.device_info.device_name
+            );
+        }
     }
 }
 

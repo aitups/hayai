@@ -5,7 +5,7 @@ use crate::context::{OpenClEngine, OpenClError};
 use opencl3::event::Event;
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
-use opencl3::types::{cl_float, cl_int, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
+use opencl3::types::{cl_float, cl_int, cl_long, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
 use std::ptr;
 
 /// In-flight GGML GEMV. Device buffers + host output stay alive until [`PendingGemv::wait`].
@@ -104,7 +104,7 @@ impl OpenClEngine {
         assert_eq!(input.len(), n);
         let m_i = m as cl_int;
         let n_i = n as cl_int;
-        let off_i = weight_off as cl_int;
+        let off_i = weight_off as cl_long;
 
         let mut input_buf = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
@@ -215,7 +215,7 @@ impl OpenClEngine {
         assert_eq!(input.len(), n);
         let m_i = m as cl_int;
         let n_i = n as cl_int;
-        let off_i = weight_off as cl_int;
+        let off_i = weight_off as cl_long;
 
         let mut input_buf = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())

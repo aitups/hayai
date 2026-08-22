@@ -1226,17 +1226,27 @@ impl StreamingGenerator {
                     if let Some(p) = &plan {
                         if let Some(unit) = p.units.iter().find(|u| u.block_id == Some(i)) {
                             if !unit.experts.is_empty() {
-                                // MoE: load the full block (attn/router + ALL experts)
-                                // into the resident slot at the plan's fixed layout.
+                                // MoE: load the full block into the resident slot at the
+                                // PLAN's compact layout. Non-expert tensors (attn/router/
+                                // shared expert) go at COMPACT offsets 0..non_expert_bytes
+                                // (matching the reader's `view_of`), then each expert at
+                                // its fixed slot `non_expert_bytes + eid*max_expert_bytes`.
+                                // Writing the fused 3D tensors at catalog order would
+                                // MISALIGN any non-expert tensor that follows them in the
+                                // catalog and corrupt the expert slots.
                                 let mut specs: Vec<(&str, usize, usize, usize)> = Vec::new();
                                 let mut off = 0usize;
-                                for t in unit.tensors.iter() {
+                                for t in unit
+                                    .tensors
+                                    .iter()
+                                    .filter(|t| !crate::exec_plan::is_expert_op(t.op))
+                                {
                                     specs.push((t.name.as_str(), 0, off, t.nbytes));
                                     off += t.nbytes;
                                 }
                                 for e in &unit.experts {
-                                    let base_off =
-                                        unit.non_expert_bytes + e.expert_id * unit.max_expert_bytes;
+                                    let base_off = unit.non_expert_bytes
+                                        + e.expert_id * unit.max_expert_bytes;
                                     for t in &e.tensors {
                                         specs.push((
                                             t.name.as_str(),
