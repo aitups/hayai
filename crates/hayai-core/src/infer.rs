@@ -1,7 +1,7 @@
 //! End-to-end decode using GGUF mmap weights: Attn on CPU, FFN on OpenCL when available.
 
 use hayai_cpu::{attention_decode_step, rms_norm, AttentionConfig, LayerKvCache};
-use hayai_model::{sample, spmm_csr_cpu, GgufError, LlamaWeights, SamplerConfig, Tokenizer};
+use hayai_model::{sample, spmm_csr_cpu, CsrSparse, GgufError, LlamaWeights, SamplerConfig, Tokenizer};
 use tracing::debug;
 
 use crate::orchestrator::{EngineOrchestrator, OrchestratorError};
@@ -14,6 +14,18 @@ pub enum InferError {
     Orchestrator(#[from] OrchestratorError),
     #[error("{0}")]
     Msg(String),
+}
+
+/// Override del FFN para una capa (evolución global Pareto, D20): sustituye el
+/// path denso/embebido por un CSR en tiempo de ejecución, sin re-embeder.
+#[derive(Clone, Default)]
+pub struct FfnOverride {
+    /// CSR del gate (None = path por defecto).
+    pub gate: Option<CsrSparse>,
+    /// CSR del up (None = path por defecto).
+    pub up: Option<CsrSparse>,
+    /// CSR del down (None = path por defecto).
+    pub down: Option<CsrSparse>,
 }
 
 pub struct Generator {
@@ -69,7 +81,7 @@ impl Generator {
         orch: &mut EngineOrchestrator,
         token: u32,
     ) -> Result<Vec<f32>, InferError> {
-        self.forward_inner(orch, token, None)
+        self.forward_inner(orch, token, None, &[])
     }
 
     /// Igual que [`Self::forward`], además registra la **entrada FFN** (salida del
@@ -80,7 +92,17 @@ impl Generator {
         token: u32,
         hooks: &mut [Vec<f32>],
     ) -> Result<Vec<f32>, InferError> {
-        self.forward_inner(orch, token, Some(hooks))
+        self.forward_inner(orch, token, Some(hooks), &[])
+    }
+
+    /// Igual que [`Self::forward`], con overrides de FFN por capa (D20).
+    pub fn forward_with_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        override_ffn: &[FfnOverride],
+    ) -> Result<Vec<f32>, InferError> {
+        self.forward_inner(orch, token, None, override_ffn)
     }
 
     fn forward_inner(
@@ -88,6 +110,7 @@ impl Generator {
         orch: &mut EngineOrchestrator,
         token: u32,
         mut hooks: Option<&mut [Vec<f32>]>,
+        override_ffn: &[FfnOverride],
     ) -> Result<Vec<f32>, InferError> {
         let h = self.weights.config.hidden_size;
         let mut x = self.weights.embed(token)?;
@@ -136,10 +159,13 @@ impl Generator {
             let mut up = vec![0.0f32; ff];
             let mut down = vec![0.0f32; h];
 
-            // FFN disperso (D16): si el tensor denso fue sustituido por el bloque
-            // embebido, se ejecuta el CSR del profesor en las posiciones activas;
-            // si no, el matvec cuantizado (OpenCL cuando está disponible).
-            if let Some(c) = &layer.gate_csr {
+            // FFN disperso (D16/D20): override de evolución > bloque embebido >
+            // matvec cuantizado denso.
+            let gate_csr = override_ffn
+                .get(layer_idx)
+                .and_then(|o| o.gate.as_ref())
+                .or(layer.gate_csr.as_ref());
+            if let Some(c) = gate_csr {
                 gate.copy_from_slice(&spmm_csr_cpu(
                     &xn,
                     &c.row_ptr,
@@ -151,7 +177,11 @@ impl Generator {
             } else {
                 orch.execute_quant_gemv(&layer.gate, &xn, &mut gate)?;
             }
-            if let Some(c) = &layer.up_csr {
+            let up_csr = override_ffn
+                .get(layer_idx)
+                .and_then(|o| o.up.as_ref())
+                .or(layer.up_csr.as_ref());
+            if let Some(c) = up_csr {
                 up.copy_from_slice(&spmm_csr_cpu(
                     &xn,
                     &c.row_ptr,
@@ -167,7 +197,11 @@ impl Generator {
                 let g = gate[i];
                 gate[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
-            if let Some(c) = &layer.down_csr {
+            let down_csr = override_ffn
+                .get(layer_idx)
+                .and_then(|o| o.down.as_ref())
+                .or(layer.down_csr.as_ref());
+            if let Some(c) = down_csr {
                 down.copy_from_slice(&spmm_csr_cpu(
                     &gate,
                     &c.row_ptr,

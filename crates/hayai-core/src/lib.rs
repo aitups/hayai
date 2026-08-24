@@ -16,7 +16,7 @@ pub mod stream_infer;
 
 pub use adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
 pub use exec_plan::{build_exec_plan, ExecPlan, LayerOpKind, UnknownLayerOp};
-pub use infer::{GenerateStats, Generator, InferError};
+pub use infer::{FfnOverride, GenerateStats, Generator, InferError};
 pub use metrics::{format_bytes, process_rss_bytes, HayaiOwnedMemory, StreamingMemoryBudget};
 pub use orchestrator::{EngineOrchestrator, ExecutionMode, OrchestratorError};
 pub use pipeline::{

@@ -22,6 +22,7 @@ pub struct CsrSparse {
 }
 
 /// Llama-like weights as mmap views into a shared GGUF (zero-copy packed tensors).
+#[derive(Clone)]
 pub struct LlamaWeights {
     pub gguf: Arc<GgufFile>,
     pub config: ModelConfig,
@@ -33,6 +34,7 @@ pub struct LlamaWeights {
     pub packed_nbytes: usize,
 }
 
+#[derive(Clone)]
 pub struct LayerWeights {
     pub attn_norm: Vec<f32>,
     pub wq: QuantMatrix,

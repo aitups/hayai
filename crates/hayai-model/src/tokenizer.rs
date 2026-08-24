@@ -3,6 +3,7 @@ use crate::gguf_types::GgufError;
 use std::collections::HashMap;
 
 /// GPT-2 / SentencePiece BPE tokenizer loaded from GGUF metadata.
+#[derive(Clone)]
 pub struct Tokenizer {
     pub tokens: Vec<String>,
     pub token_to_id: HashMap<String, u32>,
