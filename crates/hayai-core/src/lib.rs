@@ -23,5 +23,9 @@ pub use pipeline::{
     run_decode_benchmark, run_overlap_probe, HeterogeneousPipeline, OverlapProbeStats,
     PipelineStats, SyntheticFfnWeights,
 };
+// FFN disperso (DAG irregular, GGUF de `saor`): carga y SpMM CSR.
+pub use hayai_model::{
+    load_sparse_dag, sparse_dag_to_csr, spmm_csr_cpu, spmm_dense_masked, SparseDagBlock,
+};
 pub use session::GenerationSession;
 pub use stream_infer::{load_config, StreamInferError, StreamingGenerator};

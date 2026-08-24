@@ -71,12 +71,21 @@ impl GgufCatalog {
                     Err(e) => return Err(e),
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Exact read of `size` failed — file may be shorter; try half.
+                    // Exact read of `size` failed — file is shorter. The doubling
+                    // loop can oscillate forever between `Truncated` (parse of
+                    // size/2) and EOF (read of size) when the file length lands
+                    // between two powers of two. Resolve deterministically by
+                    // reading the file's exact length (capped at the header cap).
                     if size <= 64 {
                         return Err(GgufError::Truncated("EOF before GGUF header complete"));
                     }
-                    size /= 2;
-                    continue;
+                    let file_len = std::fs::metadata(io.path())
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(size / 2);
+                    let exact = file_len.clamp(64, 64 << 20).min(size - 1);
+                    let mut exact_buf = vec![0u8; exact];
+                    io.read_at(0, &mut exact_buf).map_err(GgufError::from)?;
+                    return parse_header_bytes(&exact_buf);
                 }
                 Err(e) => return Err(GgufError::from(e)),
             }
@@ -150,6 +159,16 @@ impl GgufCatalog {
             .read_at(abs, &mut dst[..nbytes])
             .map_err(GgufError::from)?;
         Ok((nbytes, info))
+    }
+
+    /// Raw deterministic read of exactly `dst.len()` bytes at a tensor's absolute
+    /// offset. For byte-tensors whose GGML type may be misreported by third-party
+    /// writers (e.g. `saor` GGUF disperso emits `ffn_dag_adjacency` with type 16
+    /// instead of `I8=24`): the caller controls the exact byte count, so the
+    /// payload is read correctly regardless of the type-ID bug.
+    pub fn read_raw_at(&mut self, abs_offset: u64, dst: &mut [u8]) -> Result<(), GgufError> {
+        self.io.read_at(abs_offset, dst).map_err(GgufError::from)?;
+        Ok(())
     }
 
     /// Load tensor into an owned [`QuantMatrix`] (temporary residency for one op).

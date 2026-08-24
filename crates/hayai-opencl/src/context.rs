@@ -46,6 +46,8 @@ pub struct OpenClEngine {
     pub gemv_iq2_s: Kernel,
     pub gemv_f32: Kernel,
     pub gemv_f16: Kernel,
+    /// SpMM CSR del FFN disperso (DAG irregular, GGUF de `saor`).
+    pub spmm_csr: Kernel,
 }
 
 impl OpenClEngine {
@@ -140,6 +142,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("f32 kernel: {}", e)))?;
         let gemv_f16 = Kernel::create(&program, "ggml_gemv_f16")
             .map_err(|e| OpenClError::ClError(format!("f16 kernel: {}", e)))?;
+        let spmm_csr = Kernel::create(&program, "spmm_csr")
+            .map_err(|e| OpenClError::ClError(format!("spmm_csr kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -170,6 +174,7 @@ impl OpenClEngine {
             gemv_iq2_s,
             gemv_f32,
             gemv_f16,
+            spmm_csr,
         })
     }
 

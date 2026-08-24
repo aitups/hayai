@@ -41,6 +41,12 @@ pub enum LayerOpKind {
     FfnGate,
     FfnUp,
     FfnDown,
+    /// FFN sparse DAG (GGUF disperso de `saor`): bit-tensor de adyacencia
+    /// (`ffn_dag_adjacency`, I8 bytes, LSB-first).
+    FfnDagAdjacency,
+    /// FFN sparse DAG (GGUF disperso de `saor`): pesos activos (`ffn_dag_weights`,
+    /// F32, orden i-mayor, solo conexiones vivas).
+    FfnDagWeights,
     /// `post_ffw_norm.weight` / `post_mlp_norm.weight` — norm after FFN (Gemma4 12B).
     PostFfnNorm,
     /// `layer_output_scale.weight` — per-block output scale (Gemma4 12B).
@@ -150,6 +156,7 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         | DeltaNet | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
         FfnGate | FfnUp | FfnDown | ExpertGate | ExpertUp | ExpertDown | SharedExpert
         | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
+        FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
         LayerOutputScale | Aux => OpBinding::DISCARD,
     }
 }
@@ -541,6 +548,14 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
         return Ok(AttnKNorm);
     }
 
+    // ── Phase 5c: FFN disperso (DAG irregular, GGUF de saor) — antes del FFN denso. ─
+    if n.contains("ffn_dag_adjacency") {
+        return Ok(FfnDagAdjacency);
+    }
+    if n.contains("ffn_dag_weights") {
+        return Ok(FfnDagWeights);
+    }
+
     // ── Phase 6: dense FFN. ──────────────────────────────────────────────────
     if n.contains("ffn_gate") || n.contains("gate_proj") {
         return Ok(FfnGate);
@@ -907,6 +922,23 @@ mod tests {
         assert_eq!(cls("blk.0.ffn_gate.weight").unwrap(), LayerOpKind::FfnGate);
     }
 
+    /// FFN disperso (DAG irregular) de `saor`: los dos tensores del bloque se
+    /// clasifican (sin prefijo `blk.N.`) y no caen en denso FFN ni en aux.
+    #[test]
+    fn classifies_saor_sparse_dag_tensors() {
+        assert_eq!(
+            cls("ffn_dag_adjacency").unwrap(),
+            LayerOpKind::FfnDagAdjacency
+        );
+        assert_eq!(cls("ffn_dag_weights").unwrap(), LayerOpKind::FfnDagWeights);
+        // Un GGUF de saor no trae `general.architecture`; la clasificación es por
+        // nombre, no por arquitectura.
+        assert_eq!(
+            cls("ffn_dag_weights").unwrap(),
+            LayerOpKind::FfnDagWeights
+        );
+    }
+
     #[test]
     fn unknown_vision_blocked() {
         assert!(cls("mmproj.weight").is_err());
@@ -921,6 +953,9 @@ mod tests {
         assert_eq!(op_binding(LayerOpKind::Router), OpBinding::CPU_GEMV);
         assert_eq!(op_binding(LayerOpKind::AttnQ), OpBinding::CPU_GEMV);
         assert_eq!(op_binding(LayerOpKind::FfnNorm), OpBinding::CPU_NORM);
+        // Sparse DAG → GPU async SpMM.
+        assert_eq!(op_binding(LayerOpKind::FfnDagAdjacency), OpBinding::GPU_ASYNC);
+        assert_eq!(op_binding(LayerOpKind::FfnDagWeights), OpBinding::GPU_ASYNC);
     }
 
     /// Track M: a synthetic MoE GGUF must split into per-expert units with a
@@ -1086,5 +1121,44 @@ mod tests {
         let sparse_window = unit.non_expert_bytes + unit.max_expert_bytes;
         assert_eq!(unit.total_bytes, sparse_window);
         assert!(sparse_window < full_block);
+    }
+
+    /// Un GGUF disperso de `saor` (2 tensores sin prefijo `blk.N.`) abre y se
+    /// planifica sin `UnknownLayerOp`, agrupándose en un único `StreamingUnit`
+    /// con `block_id = None` y binding GPU-async para el SpMM.
+    #[test]
+    fn sparse_dag_gguf_plans_as_unit() {
+        use hayai_model::{gguf::write_minimal_gguf, GgufCatalog, MetadataValue};
+
+        let path = std::env::temp_dir().join("hayai_plan_sparse_dag.gguf");
+        let tensors: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("ffn_dag_adjacency", vec![4], vec![0.0f32; 4]),
+            ("ffn_dag_weights", vec![6], vec![0.1f32; 6]),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("saor.d_in", MetadataValue::U32(8)),
+                ("saor.d_out", MetadataValue::U32(4)),
+            ],
+            &tensors,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let plan = build_exec_plan(&cat, 0, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(plan.known_ops.contains(&LayerOpKind::FfnDagAdjacency));
+        assert!(plan.known_ops.contains(&LayerOpKind::FfnDagWeights));
+        let unit = plan
+            .units
+            .iter()
+            .find(|u| u.block_id.is_none())
+            .expect("unidad sin blk.N.");
+        assert_eq!(unit.tensors.len(), 2);
+        assert_eq!(
+            plan.op_bindings[&LayerOpKind::FfnDagWeights].device,
+            OpDevice::GpuAsync
+        );
     }
 }

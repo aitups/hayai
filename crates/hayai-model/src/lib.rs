@@ -15,6 +15,7 @@ pub mod q5k;
 pub mod q6k;
 pub mod quant;
 pub mod sampling;
+pub mod sparse_dag;
 pub mod tokenizer;
 pub mod weights;
 
@@ -24,5 +25,8 @@ pub use gguf_stream::{GgufCatalog, LayerPackLayout, LayerWeightPack};
 pub use gguf_types::{GgmlType, GgufError, MetadataValue, TensorInfo};
 pub use quant::QuantMatrix;
 pub use sampling::{sample, SamplerConfig};
+pub use sparse_dag::{
+    load_sparse_dag, sparse_dag_to_csr, spmm_csr_cpu, spmm_dense_masked, SparseDagBlock,
+};
 pub use tokenizer::Tokenizer;
 pub use weights::{LayerWeights, LlamaWeights};

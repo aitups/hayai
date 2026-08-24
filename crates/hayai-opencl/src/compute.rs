@@ -251,6 +251,98 @@ impl OpenClEngine {
                 .map_err(|e| OpenClError::ClError(format!("enqueue_write_layer: {e}")))
         }
     }
+
+    /// SpMM CSR del FFN disperso (DAG irregular, GGUF de `saor`):
+    /// `Y[b][j] = sum_k X[b][col_idx[k]] * vals[k]`, un work-item por `(b, j)`.
+    ///
+    /// Topología vacía (τ alto): `row_ptr`/`col_idx`/`vals` vacíos devuelven
+    /// ceros sin tocar OpenCL (no admite buffers de tamaño 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spmm_csr(
+        &self,
+        x: &[f32],
+        row_ptr: &[i32],
+        col_idx: &[i32],
+        vals: &[f32],
+        d_in: usize,
+        d_out: usize,
+        output: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        let batch = if d_in > 0 { x.len() / d_in } else { 0 };
+        assert_eq!(output.len(), batch * d_out);
+        if col_idx.is_empty() || vals.is_empty() {
+            output.fill(0.0);
+            return Ok(());
+        }
+
+        let mut x_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("x buffer: {e}")))?
+        };
+        let mut rp_buf = unsafe {
+            Buffer::<cl_int>::create(&self.context, CL_MEM_READ_ONLY, row_ptr.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("row_ptr buffer: {e}")))?
+        };
+        let mut ci_buf = unsafe {
+            Buffer::<cl_int>::create(&self.context, CL_MEM_READ_ONLY, col_idx.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("col_idx buffer: {e}")))?
+        };
+        let mut v_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, vals.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("vals buffer: {e}")))?
+        };
+        let output_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                output.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("output buffer: {e}")))?
+        };
+
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut x_buf, CL_BLOCKING, 0, x, &[])
+                .map_err(|e| OpenClError::ClError(format!("write x: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut rp_buf, CL_BLOCKING, 0, row_ptr, &[])
+                .map_err(|e| OpenClError::ClError(format!("write row_ptr: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut ci_buf, CL_BLOCKING, 0, col_idx, &[])
+                .map_err(|e| OpenClError::ClError(format!("write col_idx: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut v_buf, CL_BLOCKING, 0, vals, &[])
+                .map_err(|e| OpenClError::ClError(format!("write vals: {e}")))?;
+        }
+
+        let global = batch * d_out;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.spmm_csr)
+                .set_arg(&x_buf)
+                .set_arg(&rp_buf)
+                .set_arg(&ci_buf)
+                .set_arg(&v_buf)
+                .set_arg(&(d_in as cl_int))
+                .set_arg(&(d_out as cl_int))
+                .set_arg(&output_buf)
+                .set_global_work_size(global)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue spmm_csr: {e}")))?
+        };
+
+        let wait = [kernel_event.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, output, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read spmm_csr: {e}")))?;
+        }
+        debug!(
+            "OpenCL spmm_csr [{batch}×{d_out}×{d_in}] on {}",
+            self.device_info.device_name
+        );
+        Ok(())
+    }
 }
 
 fn preferred_local_size(m: usize) -> usize {
@@ -576,6 +668,49 @@ mod tests {
                 eng.device_info.device_name
             );
         }
+    }
+
+    /// Equivalencia del SpMM CSR del FFN disperso frente a la referencia densa
+    /// enmascarada (CPU), tolerancia FP32 1e-5.
+    #[test]
+    fn opencl_spmm_csr_matches_cpu_when_available() {
+        use hayai_model::sparse_dag::{sparse_dag_to_csr, spmm_dense_masked};
+
+        let Some(engine) = init_engine_or_skip("OpenCL spmm_csr test") else {
+            return;
+        };
+
+        // d_in=64, d_out=32, ~40% de conexiones activas, batch=3.
+        let d_in = 64usize;
+        let d_out = 32usize;
+        let total = d_in * d_out;
+        let mut adjacency = vec![0u8; total.div_ceil(8)];
+        let mut weights = Vec::new();
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        for conn in 0..total {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let keep = (rng >> 33) % 100 < 40;
+            if keep {
+                adjacency[conn / 8] |= 1 << (conn % 8);
+                weights.push(((conn % 13) as f32 - 6.0) * 0.25);
+            }
+        }
+        assert!(!weights.is_empty());
+
+        let x: Vec<f32> = (0..d_in * 3).map(|i| (i as f32) * 0.01 - 0.15).collect();
+        let expected = spmm_dense_masked(&x, &adjacency, &weights, d_in, d_out);
+        let (row_ptr, col_idx, vals) = sparse_dag_to_csr(&adjacency, &weights, d_in, d_out);
+        let mut got = vec![0.0f32; expected.len()];
+        engine
+            .spmm_csr(&x, &row_ptr, &col_idx, &vals, d_in, d_out, &mut got)
+            .expect("OpenCL spmm_csr failed");
+
+        let err = max_abs_diff(&expected, &got);
+        assert!(
+            err < 1e-5,
+            "OpenCL spmm_csr vs CPU mismatch: {err} on {}",
+            engine.device_info.device_name
+        );
     }
 }
 

@@ -6,12 +6,19 @@ pub const LUT_MATMUL_CL: &str = include_str!("../kernels/lut_matmul.cl");
 /// OpenCL C source for GGML Q4_0 / Q4_1 / Q8_0 GEMV (GGUF weights).
 pub const GGML_GEMV_Q4_CL: &str = include_str!("../kernels/ggml_gemv_q4.cl");
 
+/// OpenCL C source for sparse FFN DAG SpMM (CSR, GGUF disperso de `saor`).
+pub const SPMM_CSR_CL: &str = include_str!("../kernels/spmm_csr.cl");
+
 /// Combined program source built by the OpenCL engine.
 pub fn opencl_program_source() -> String {
-    let mut src = String::with_capacity(LUT_MATMUL_CL.len() + GGML_GEMV_Q4_CL.len() + 8);
+    let mut src = String::with_capacity(
+        LUT_MATMUL_CL.len() + GGML_GEMV_Q4_CL.len() + SPMM_CSR_CL.len() + 8,
+    );
     src.push_str(LUT_MATMUL_CL);
     src.push('\n');
     src.push_str(GGML_GEMV_Q4_CL);
+    src.push('\n');
+    src.push_str(SPMM_CSR_CL);
     src
 }
 
@@ -34,6 +41,7 @@ mod tests {
         for (name, src) in [
             ("lut_matmul.cl", LUT_MATMUL_CL),
             ("ggml_gemv_q4.cl", GGML_GEMV_Q4_CL),
+            ("spmm_csr.cl", SPMM_CSR_CL),
         ] {
             for (i, line) in src.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
