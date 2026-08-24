@@ -69,6 +69,26 @@ impl Generator {
         orch: &mut EngineOrchestrator,
         token: u32,
     ) -> Result<Vec<f32>, InferError> {
+        self.forward_inner(orch, token, None)
+    }
+
+    /// Igual que [`Self::forward`], además registra la **entrada FFN** (salida del
+    /// `ffn_norm`) de cada capa en `hooks[layer]` — calibración real (Fase 2).
+    pub fn forward_with_hooks(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        hooks: &mut [Vec<f32>],
+    ) -> Result<Vec<f32>, InferError> {
+        self.forward_inner(orch, token, Some(hooks))
+    }
+
+    fn forward_inner(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        mut hooks: Option<&mut [Vec<f32>]>,
+    ) -> Result<Vec<f32>, InferError> {
         let h = self.weights.config.hidden_size;
         let mut x = self.weights.embed(token)?;
         let pos = self.position;
@@ -106,6 +126,11 @@ impl Generator {
 
             let mut xn = x.clone();
             rms_norm(&mut xn, &layer.ffn_norm, self.weights.config.rms_norm_eps);
+            // Hook de calibración (Fase 2): entrada FFN real de la capa.
+            if let Some(hooks) = hooks.as_deref_mut() {
+                hooks[layer_idx].clear();
+                hooks[layer_idx].extend_from_slice(&xn);
+            }
             let ff = self.weights.config.intermediate_size;
             let mut gate = vec![0.0f32; ff];
             let mut up = vec![0.0f32; ff];
