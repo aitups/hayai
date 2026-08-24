@@ -26,7 +26,8 @@ pub use gguf_types::{GgmlType, GgufError, MetadataValue, TensorInfo};
 pub use quant::QuantMatrix;
 pub use sampling::{sample, SamplerConfig};
 pub use sparse_dag::{
-    load_sparse_dag, sparse_dag_to_csr, spmm_csr_cpu, spmm_dense_masked, SparseDagBlock,
+    load_embedded_block, load_sparse_dag, sparse_dag_to_csr, spmm_csr_cpu, spmm_dense_masked,
+    SparseDagBlock,
 };
 pub use tokenizer::Tokenizer;
-pub use weights::{LayerWeights, LlamaWeights};
+pub use weights::{CsrSparse, LayerWeights, LlamaWeights};

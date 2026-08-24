@@ -2,8 +2,24 @@ use crate::config::ModelConfig;
 use crate::gguf::GgufFile;
 use crate::gguf_types::GgufError;
 use crate::quant::QuantMatrix;
+use crate::sparse_dag::{load_embedded_block, sparse_dag_to_csr};
 use std::sync::Arc;
 use tracing::info;
+
+/// CSR del FFN disperso embebido (D16/D17): filas = salidas, columnas = entradas.
+#[derive(Debug, Clone)]
+pub struct CsrSparse {
+    /// Indice de filas `[d_out + 1]`.
+    pub row_ptr: Vec<i32>,
+    /// Columnas `[nnz]`.
+    pub col_idx: Vec<i32>,
+    /// Valores `[nnz]`.
+    pub vals: Vec<f32>,
+    /// Entradas del bloque.
+    pub d_in: usize,
+    /// Salidas del bloque.
+    pub d_out: usize,
+}
 
 /// Llama-like weights as mmap views into a shared GGUF (zero-copy packed tensors).
 pub struct LlamaWeights {
@@ -27,6 +43,46 @@ pub struct LayerWeights {
     pub gate: QuantMatrix,
     pub up: QuantMatrix,
     pub down: QuantMatrix,
+    /// CSR dispersos del FFN embebido (Some si el tensor denso fue sustituido).
+    pub gate_csr: Option<CsrSparse>,
+    pub up_csr: Option<CsrSparse>,
+    pub down_csr: Option<CsrSparse>,
+}
+
+/// Carga una matriz FFN: densa si el tensor existe; si el tensor denso fue
+/// sustituido por un bloque disperso embebido, devuelve el CSR + un placeholder.
+fn load_ffn(
+    gguf: &Arc<GgufFile>,
+    name: &str,
+    base: &str,
+) -> Result<(QuantMatrix, Option<CsrSparse>), GgufError> {
+    match QuantMatrix::from_gguf(gguf.clone(), name) {
+        Ok(q) => Ok((q, None)),
+        Err(GgufError::MissingTensor(_)) => {
+            let block = load_embedded_block(gguf, base)?
+                .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
+            let (row_ptr, col_idx, vals) =
+                sparse_dag_to_csr(&block.adjacency, &block.weights, block.d_in, block.d_out);
+            let csr = CsrSparse {
+                row_ptr,
+                col_idx,
+                vals,
+                d_in: block.d_in,
+                d_out: block.d_out,
+            };
+            // Placeholder con las dimensiones correctas (nunca se ejecuta: el
+            // runtime consulta gate_csr/up_csr/down_csr antes que la QuantMatrix).
+            let q = QuantMatrix::owned(
+                name,
+                block.d_in,
+                block.d_out,
+                crate::gguf_types::GgmlType::F32,
+                Vec::new(),
+            );
+            Ok((q, Some(csr)))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 impl LlamaWeights {
@@ -117,6 +173,29 @@ impl LlamaWeights {
         let mut layers = Vec::with_capacity(layers_n);
         for i in 0..layers_n {
             info!("Mapping layer {i}/{layers_n}");
+            let (gate, gate_csr) = load_ffn(
+                &gguf,
+                &format!("blk.{i}.ffn_gate.weight"),
+                &format!("blk.{i}.ffn_gate"),
+            )?;
+            let (up, up_csr) = load_ffn(
+                &gguf,
+                &format!("blk.{i}.ffn_up.weight"),
+                &format!("blk.{i}.ffn_up"),
+            )?;
+            let (down, down_csr) = load_ffn(
+                &gguf,
+                &format!("blk.{i}.ffn_down.weight"),
+                &format!("blk.{i}.ffn_down"),
+            )?;
+            if gate_csr.is_some() || up_csr.is_some() || down_csr.is_some() {
+                info!(
+                    "  layer {i}: FFN disperso embebido (gate={}, up={}, down={})",
+                    gate_csr.is_some(),
+                    up_csr.is_some(),
+                    down_csr.is_some()
+                );
+            }
             let layer = LayerWeights {
                 attn_norm: gguf.dequant_f32(&format!("blk.{i}.attn_norm.weight"))?,
                 wq: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.attn_q.weight"))?,
@@ -124,9 +203,12 @@ impl LlamaWeights {
                 wv: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.attn_v.weight"))?,
                 wo: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.attn_output.weight"))?,
                 ffn_norm: gguf.dequant_f32(&format!("blk.{i}.ffn_norm.weight"))?,
-                gate: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.ffn_gate.weight"))?,
-                up: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.ffn_up.weight"))?,
-                down: QuantMatrix::from_gguf(gguf.clone(), &format!("blk.{i}.ffn_down.weight"))?,
+                gate,
+                up,
+                down,
+                gate_csr,
+                up_csr,
+                down_csr,
             };
             packed_nbytes += layer.wq.nbytes()
                 + layer.wk.nbytes()

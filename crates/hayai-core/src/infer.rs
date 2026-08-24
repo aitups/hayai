@@ -1,7 +1,7 @@
 //! End-to-end decode using GGUF mmap weights: Attn on CPU, FFN on OpenCL when available.
 
 use hayai_cpu::{attention_decode_step, rms_norm, AttentionConfig, LayerKvCache};
-use hayai_model::{sample, GgufError, LlamaWeights, SamplerConfig, Tokenizer};
+use hayai_model::{sample, spmm_csr_cpu, GgufError, LlamaWeights, SamplerConfig, Tokenizer};
 use tracing::debug;
 
 use crate::orchestrator::{EngineOrchestrator, OrchestratorError};
@@ -111,14 +111,49 @@ impl Generator {
             let mut up = vec![0.0f32; ff];
             let mut down = vec![0.0f32; h];
 
-            // FFN on OpenCL when kernels support the quant type; else CPU.
-            orch.execute_quant_gemv(&layer.gate, &xn, &mut gate)?;
-            orch.execute_quant_gemv(&layer.up, &xn, &mut up)?;
+            // FFN disperso (D16): si el tensor denso fue sustituido por el bloque
+            // embebido, se ejecuta el CSR del profesor en las posiciones activas;
+            // si no, el matvec cuantizado (OpenCL cuando está disponible).
+            if let Some(c) = &layer.gate_csr {
+                gate.copy_from_slice(&spmm_csr_cpu(
+                    &xn,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.gate, &xn, &mut gate)?;
+            }
+            if let Some(c) = &layer.up_csr {
+                up.copy_from_slice(&spmm_csr_cpu(
+                    &xn,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.up, &xn, &mut up)?;
+            }
             for i in 0..ff {
                 let g = gate[i];
                 gate[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
-            orch.execute_quant_gemv(&layer.down, &gate, &mut down)?;
+            if let Some(c) = &layer.down_csr {
+                down.copy_from_slice(&spmm_csr_cpu(
+                    &gate,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.down, &gate, &mut down)?;
+            }
             for i in 0..h {
                 x[i] += down[i];
             }

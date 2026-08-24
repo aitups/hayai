@@ -5,6 +5,7 @@
 //! `ffn_dag_*`) y conversión del bit-tensor de adyacencia + pesos activos a CSR,
 //! con referencias CPU (SpMM CSR y denso enmascarado) para validación.
 
+use crate::gguf::GgufFile;
 use crate::{GgufCatalog, GgufError, MetadataValue};
 
 /// Clave de metadato: dimensión de entrada (`saor.d_in`, UINT64).
@@ -104,6 +105,43 @@ pub fn load_sparse_dag(cat: &mut GgufCatalog) -> Result<Option<SparseDagBlock>, 
         d_out,
         tau,
         genome,
+        adjacency,
+        weights,
+    }))
+}
+
+/// Carga un bloque disperso **embebido** en un GGUF completo (formato D16 de
+/// `saor`): para la base `blk.0.ffn_gate` lee los tensores
+/// `blk.0.ffn_gate.ffn_dag_adjacency` / `ffn_dag_weights` + los metadatos
+/// `saor.blk.0.ffn_gate.{d_in,d_out,tau}`. Devuelve `Ok(None)` si el tensor
+/// base no está marcado como disperso (ausencia del tensor de adyacencia).
+pub fn load_embedded_block(
+    gguf: &GgufFile,
+    base: &str,
+) -> Result<Option<SparseDagBlock>, GgufError> {
+    let adj_name = format!("{base}.{TENSOR_ADJACENCY}");
+    let w_name = format!("{base}.{TENSOR_WEIGHTS}");
+    if gguf.tensor(&adj_name).is_err() {
+        return Ok(None);
+    }
+    let adj_info = gguf.tensor(&adj_name)?;
+    let w_info = gguf.tensor(&w_name)?;
+    let adj_len = adj_info.dims.first().copied().unwrap_or(0) as usize;
+    let mut adjacency = vec![0u8; adj_len];
+    adjacency.copy_from_slice(&gguf.tensor_bytes(adj_info)?[..adj_len]);
+
+    let w_bytes = gguf.tensor_bytes(w_info)?;
+    let mut weights = vec![0.0f32; w_bytes.len() / 4];
+    for (i, chunk) in w_bytes.chunks_exact(4).enumerate() {
+        weights[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+    }
+
+    let m = |k: &str| gguf.meta_u32(&format!("saor.{base}.{k}"));
+    Ok(Some(SparseDagBlock {
+        d_in: m("d_in").unwrap_or(0) as usize,
+        d_out: m("d_out").unwrap_or(0) as usize,
+        tau: gguf.meta_f32(&format!("saor.{base}.tau")).unwrap_or(0.0),
+        genome: Vec::new(),
         adjacency,
         weights,
     }))
@@ -362,4 +400,89 @@ mod tests {
             assert!((a - b).abs() < 1e-6, "CSR vs dense mismatch: {a} != {b}");
         }
     }
+
+    /// Test-only writer del formato **embebido** (D16): tensores por bloque
+    /// `blk.0.ffn_gate.ffn_dag_*` + metadatos `saor.blk.0.ffn_gate.*`.
+    fn write_embedded_gguf(path: &Path, base: &str, block: &SparseDagBlock) -> Result<(), String> {
+        const ALIGN: u64 = 32;
+        let adj_name = format!("{base}.{TENSOR_ADJACENCY}");
+        let w_name = format!("{base}.{TENSOR_WEIGHTS}");
+
+        let mut data = Vec::new();
+        align(&mut data, ALIGN);
+        let adj_off = data.len() as u64;
+        data.extend_from_slice(&block.adjacency);
+        align(&mut data, ALIGN);
+        let w_off = data.len() as u64;
+        for w in &block.weights {
+            data.extend_from_slice(&w.to_le_bytes());
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&5u64.to_le_bytes()); // kv_count
+
+        // Metadatos por bloque `saor.<base>.*`.
+        for (k, vtype, value) in [
+            (format!("saor.{base}.d_in"), 10u32, (block.d_in as u64).to_le_bytes().to_vec()),
+            (format!("saor.{base}.d_out"), 10u32, (block.d_out as u64).to_le_bytes().to_vec()),
+            (format!("saor.{base}.tau"), 6u32, block.tau.to_le_bytes().to_vec()),
+            (format!("saor.{base}.sparse"), 7u32, vec![1u8]),
+            (format!("saor.{base}.genome"), 9u32, {
+                let mut v = Vec::new();
+                v.extend_from_slice(&6u32.to_le_bytes());
+                v.extend_from_slice(&(block.genome.len() as u64).to_le_bytes());
+                for g in &block.genome {
+                    v.extend_from_slice(&g.to_le_bytes());
+                }
+                v
+            }),
+        ] {
+            wstr(&mut buf, &k);
+            buf.extend_from_slice(&vtype.to_le_bytes());
+            buf.extend_from_slice(&value);
+        }
+
+        wstr(&mut buf, &adj_name);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(block.adjacency.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&24u32.to_le_bytes()); // GGML I8
+        buf.extend_from_slice(&adj_off.to_le_bytes());
+        wstr(&mut buf, &w_name);
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(block.weights.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // F32
+        buf.extend_from_slice(&w_off.to_le_bytes());
+
+        align(&mut buf, ALIGN);
+        buf.extend_from_slice(&data);
+        std::fs::write(path, buf).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn load_embedded_block_roundtrip() {
+        let path = std::env::temp_dir().join("hayai_embed_block.gguf");
+        let block = sample_block();
+        write_embedded_gguf(&path, "blk.0.ffn_gate", &block).expect("write");
+        let gguf = GgufFile::open(&path).expect("open");
+
+        let loaded = load_embedded_block(&gguf, "blk.0.ffn_gate")
+            .expect("load")
+            .expect("is sparse");
+        assert_eq!(loaded.d_in, block.d_in);
+        assert_eq!(loaded.d_out, block.d_out);
+        assert_eq!(loaded.tau, block.tau);
+        assert_eq!(loaded.adjacency, block.adjacency);
+        assert_eq!(loaded.weights, block.weights);
+
+        // Un tensor no marcado como disperso devuelve None.
+        let none = load_embedded_block(&gguf, "blk.1.ffn_up").expect("load");
+        assert!(none.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
+
+
