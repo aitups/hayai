@@ -122,9 +122,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompts = prompts.ok_or("falta --prompts <txt>")?;
     let sparsities = sparsities.ok_or("falta --sparsities <file>")?;
 
-    let sp: Vec<f32> = std::fs::read_to_string(&sparsities)?
+    let sp_raw: Vec<String> = std::fs::read_to_string(&sparsities)?
         .lines()
-        .map(|l| l.trim().parse::<f32>().unwrap_or(0.0))
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Cada línea: "gate up down" (3 floats) o "gate" (solo gate, retrocompatible).
+    let sp_gate: Vec<f32> = sp_raw
+        .iter()
+        .map(|l| l.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0))
+        .collect();
+    let sp_up: Vec<f32> = sp_raw
+        .iter()
+        .map(|l| {
+            l.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0)
+        })
+        .collect();
+    let sp_down: Vec<f32> = sp_raw
+        .iter()
+        .map(|l| {
+            l.split_whitespace().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)
+        })
         .collect();
 
     let texts: Vec<String> = std::fs::read_to_string(&prompts)?
@@ -147,22 +165,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = tokenizer.encode(&corpus, false);
     let n_pos = tokens.len().min(n_positions);
 
-    // Overrides: poda por magnitud del gate del profesor por capa (sp>0).
+    // Overrides: poda por magnitud del profesor por bloque y capa (sp>0).
     let mut overrides: Vec<FfnOverride> = vec![FfnOverride::default(); n_layers];
     let mut d_arch_num = 0.0f32;
     let mut d_arch_den = 0.0f32;
-    for (layer_idx, &s) in sp.iter().enumerate() {
-        if layer_idx >= n_layers || s <= 0.0 {
+    for (layer_idx, _) in sp_gate.iter().enumerate() {
+        if layer_idx >= n_layers {
             continue;
         }
-        let name = format!("blk.{layer_idx}.ffn_gate.weight");
-        let gate = &weights.layers[layer_idx].gate;
-        let w0 = weights.gguf.dequant_f32(&name)?;
-        let csr = magnitude_prune_csr(&w0, gate.ncols, gate.nrows, s.min(0.999));
-        overrides[layer_idx].gate = Some(csr);
-        let params = (gate.ncols * gate.nrows) as f32;
-        d_arch_num += s * params;
-        d_arch_den += params;
+        let trio: [(&str, f32, &hayai_model::QuantMatrix); 3] = [
+            ("ffn_gate", sp_gate[layer_idx], &weights.layers[layer_idx].gate),
+            ("ffn_up", sp_up[layer_idx], &weights.layers[layer_idx].up),
+            ("ffn_down", sp_down[layer_idx], &weights.layers[layer_idx].down),
+        ];
+        for (block, sp, m) in trio {
+            if sp <= 0.0 {
+                continue;
+            }
+            let name = format!("blk.{layer_idx}.{block}.weight");
+            let w0 = weights.gguf.dequant_f32(&name)?;
+            let csr = magnitude_prune_csr(&w0, m.ncols, m.nrows, sp.min(0.999));
+            match block {
+                "ffn_gate" => overrides[layer_idx].gate = Some(csr),
+                "ffn_up" => overrides[layer_idx].up = Some(csr),
+                _ => overrides[layer_idx].down = Some(csr),
+            }
+            let params = (m.ncols * m.nrows) as f32;
+            d_arch_num += sp * params;
+            d_arch_den += params;
+        }
     }
     let d_arch_global = if d_arch_den > 0.0 {
         d_arch_num / d_arch_den
