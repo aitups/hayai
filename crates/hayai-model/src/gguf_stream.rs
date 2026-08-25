@@ -230,7 +230,29 @@ impl GgufCatalog {
         crate::gguf::dequantize(&info, &buf)
     }
 
-    /// Load all weight matrices for one transformer block (deterministic reads).
+    /// Carga las matrices FFN de una capa (densas o con CSR disperso embebido D16).
+/// No toca la atención: útil para capas DeltaNet/SSM (sin `attn_q` separado).
+pub fn load_ffn_matrices(
+    &mut self,
+    layer: usize,
+) -> Result<
+    (
+        QuantMatrix,
+        QuantMatrix,
+        QuantMatrix,
+        Option<crate::weights::CsrSparse>,
+        Option<crate::weights::CsrSparse>,
+        Option<crate::weights::CsrSparse>,
+    ),
+    GgufError,
+> {
+    let (gate, gate_csr) = load_ffn_pack(self, layer, "ffn_gate")?;
+    let (up, up_csr) = load_ffn_pack(self, layer, "ffn_up")?;
+    let (down, down_csr) = load_ffn_pack(self, layer, "ffn_down")?;
+    Ok((gate, up, down, gate_csr, up_csr, down_csr))
+}
+
+/// Load all weight matrices for one transformer block (deterministic reads).
     pub fn load_layer_pack(&mut self, layer: usize) -> Result<LayerWeightPack, GgufError> {
         let attn_gate = match self.tensor(&format!("blk.{layer}.attn_gate.weight")) {
             Ok(_) => Some(self.load_quant_matrix(&format!("blk.{layer}.attn_gate.weight"))?),

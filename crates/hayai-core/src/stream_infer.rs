@@ -179,7 +179,7 @@ pub struct StreamingGenerator {
 impl StreamingGenerator {
     /// FFN disperso embebido (D16): ejecuta gate/up/down vía CSR (CPU) cuando el
     /// pack trae bloques sustituidos; los bloques densos usan el orchestrator.
-    fn run_ffn_block(
+    pub(crate) fn run_ffn_block(
         &mut self,
         orch: &mut EngineOrchestrator,
         pack: &hayai_model::LayerWeightPack,

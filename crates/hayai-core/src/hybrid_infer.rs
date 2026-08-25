@@ -285,16 +285,10 @@ fn run_deltanet_block(
     gen.attn_secs += t0.elapsed().as_secs_f64();
 
     // FFN via WeightIo (owned matrices — DeltaNet layers have no attn_q pack).
+    // Los bloques dispersos embebidos (D16) cargan con CSR.
     let t_io = Instant::now();
-    let gate = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_gate.weight"))?;
-    let up = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_up.weight"))?;
-    let down = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_down.weight"))?;
+    let (gate, up, down, gate_csr, up_csr, down_csr) =
+        gen.catalog.load_ffn_matrices(layer)?;
     gen.io_secs += t_io.elapsed().as_secs_f64();
     gen.io_bytes += (gate.nbytes() + up.nbytes() + down.nbytes()) as u64;
 
@@ -304,31 +298,49 @@ fn run_deltanet_block(
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
     let t_ffn = Instant::now();
-    let inflight = ffn_begin_gate_up_scratch(
-        orch,
-        &gate,
-        &up,
-        &xn,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.used_dgpu,
-        &mut gen.used_apu,
-        None,
-        0,
-        None,
-    )?;
-    ffn_finish_scratch(
-        orch,
-        inflight,
-        &down,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.ws_down,
-        &mut gen.used_dgpu,
-        None,
-        0,
-        None,
-    )?;
+    if gate_csr.is_some() || up_csr.is_some() || down_csr.is_some() {
+        // FFN disperso embebido (D16): CSR en CPU (pack temporal).
+        let pack = hayai_model::LayerWeightPack {
+            wq: gate.clone(),
+            wk: gate.clone(),
+            wv: gate.clone(),
+            wo: gate.clone(),
+            gate,
+            up,
+            down,
+            attn_gate: None,
+            gate_csr,
+            up_csr,
+            down_csr,
+        };
+        gen.run_ffn_block(orch, &pack, &xn)?;
+    } else {
+        let inflight = ffn_begin_gate_up_scratch(
+            orch,
+            &gate,
+            &up,
+            &xn,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.used_dgpu,
+            &mut gen.used_apu,
+            None,
+            0,
+            None,
+        )?;
+        ffn_finish_scratch(
+            orch,
+            inflight,
+            &down,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.ws_down,
+            &mut gen.used_dgpu,
+            None,
+            0,
+            None,
+        )?;
+    }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
@@ -434,31 +446,38 @@ fn run_full_attn_block(
     gen.ws_down.fill(0.0);
     gen.finish_ffn_unmap(orch, scratch, slot)?;
     let t_ffn = Instant::now();
-    let inflight = ffn_begin_gate_up_scratch(
-        orch,
-        &pack.gate,
-        &pack.up,
-        &xn,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.used_dgpu,
-        &mut gen.used_apu,
-        Some(scratch),
-        layer,
-        Some(&layout),
-    )?;
-    ffn_finish_scratch(
-        orch,
-        inflight,
-        &pack.down,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.ws_down,
-        &mut gen.used_dgpu,
-        Some(scratch),
-        layer,
-        Some(&layout),
-    )?;
+    let sparse_ffn =
+        pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
+    if sparse_ffn {
+        // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
+        gen.run_ffn_block(orch, &pack, &xn)?;
+    } else {
+        let inflight = ffn_begin_gate_up_scratch(
+            orch,
+            &pack.gate,
+            &pack.up,
+            &xn,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.used_dgpu,
+            &mut gen.used_apu,
+            Some(scratch),
+            layer,
+            Some(&layout),
+        )?;
+        ffn_finish_scratch(
+            orch,
+            inflight,
+            &pack.down,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.ws_down,
+            &mut gen.used_dgpu,
+            Some(scratch),
+            layer,
+            Some(&layout),
+        )?;
+    }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
