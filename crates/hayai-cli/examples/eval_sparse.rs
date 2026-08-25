@@ -55,9 +55,15 @@ fn magnitude_prune_csr(w0: &[f32], d_in: usize, d_out: usize, sparsity: f32) -> 
     for &idx in order.iter().take(keep) {
         active[idx] = true;
     }
+    topology_prune_csr(w0, d_in, d_out, &active)
+}
+
+/// CSR con los pesos del profesor en las posiciones activas (i-mayor).
+fn topology_prune_csr(w0: &[f32], d_in: usize, d_out: usize, active: &[bool]) -> CsrSparse {
+    let total = d_in * d_out;
     // Adyacencia (conn = i*d_out+j) + pesos en orden i-mayor.
     let mut bits = vec![0u8; total.div_ceil(8)];
-    let mut weights = Vec::with_capacity(keep);
+    let mut weights = Vec::with_capacity(active.iter().filter(|a| **a).count());
     for i in 0..d_in {
         for j in 0..d_out {
             let conn = i * d_out + j;
@@ -77,11 +83,93 @@ fn magnitude_prune_csr(w0: &[f32], d_in: usize, d_out: usize, sparsity: f32) -> 
     }
 }
 
+// ---------------------------------------------------------------------------
+// CPPN global (Vía B): decodifica la adyacencia de una capa desde el genoma
+// (sustrato v5, 9 dims con `y_layer`). Espejo de `saor_domain::cppn` y del
+// kernel `cppn_decode.cl`: w0[16*9] | b0[16] | w1[16*16] | b1[16] | w2[2*16] | b2[2].
+const CPPN_HIDDEN: usize = 16;
+const CPPN_INPUT_DIM: usize = 9;
+
+fn cppn_eval(genome: &[f32], v: &[f32; CPPN_INPUT_DIM]) -> (f32, f32) {
+    let h = CPPN_HIDDEN;
+    let off_b0 = h * CPPN_INPUT_DIM;
+    let off_w1 = off_b0 + h;
+    let off_b1 = off_w1 + h * h;
+    let off_w2 = off_b1 + h;
+    let off_b2 = off_w2 + 2 * h;
+    let mut h0 = [0.0f32; CPPN_HIDDEN];
+    for o in 0..h {
+        let mut acc = genome[off_b0 + o];
+        for k in 0..CPPN_INPUT_DIM {
+            acc += genome[o * CPPN_INPUT_DIM + k] * v[k];
+        }
+        h0[o] = acc.tanh();
+    }
+    let mut acc_w = genome[off_b2];
+    let mut acc_l = genome[off_b2 + 1];
+    for o in 0..h {
+        let mut h1 = genome[off_b1 + o];
+        for k in 0..h {
+            h1 += genome[off_w1 + o * h + k] * h0[k];
+        }
+        h1 = h1.sin();
+        acc_w += genome[off_w2 + o] * h1;
+        acc_l += genome[off_w2 + h + o] * h1;
+    }
+    (acc_w, 1.0 / (1.0 + (-acc_l).exp()))
+}
+
+/// Máscara de activos de una capa: `active[conn] = l_ij > tau` con la
+/// coordenada de profundidad `y_layer` (Vía B, un CPPN para todo el modelo).
+/// Paralelizado con rayon (una conexión por tarea).
+fn cppn_layer_active(
+    genome: &[f32],
+    d_in: usize,
+    d_out: usize,
+    tau: f32,
+    y_layer: f32,
+) -> Vec<bool> {
+    use rayon::prelude::*;
+    (0..d_in)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let y_i = if d_in > 1 { -1.0 + 2.0 * i as f32 / (d_in - 1) as f32 } else { 0.0 };
+            (0..d_out).map(move |j| {
+                let y_j = if d_out > 1 { -1.0 + 2.0 * j as f32 / (d_out - 1) as f32 } else { 0.0 };
+                let v: [f32; CPPN_INPUT_DIM] = [
+                    -1.0,
+                    y_i,
+                    1.0,
+                    y_j,
+                    2.0,
+                    y_j - y_i,
+                    (std::f32::consts::PI * y_i).sin(),
+                    (std::f32::consts::PI * y_j).cos(),
+                    y_layer,
+                ];
+                let (_, l) = cppn_eval(genome, &v);
+                l > tau
+            })
+        })
+        .collect()
+}
+
+/// Coordenada de profundidad de la capa `layer` de `n_layers` (centro de banda).
+fn layer_coord(layer: usize, n_layers: usize) -> f32 {
+    if n_layers <= 1 {
+        0.0
+    } else {
+        -1.0 + 2.0 * (layer as f32 + 0.5) / n_layers as f32
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut prompts: Option<PathBuf> = None;
     let mut sparsities: Option<PathBuf> = None;
+    let mut genome: Option<PathBuf> = None;
+    let mut tau = 0.42f32;
     let mut device = "cpu".to_string();
     let mut n_positions = 128usize;
     let mut i = 1;
@@ -98,6 +186,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--sparsities" => {
                 i += 1;
                 sparsities = args.get(i).map(PathBuf::from);
+            }
+            "--genome" => {
+                i += 1;
+                genome = args.get(i).map(PathBuf::from);
+            }
+            "--tau" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
+                    tau = v;
+                }
             }
             "--device" => {
                 i += 1;
@@ -120,30 +218,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let model = model.ok_or("falta --model <gguf>")?;
     let prompts = prompts.ok_or("falta --prompts <txt>")?;
-    let sparsities = sparsities.ok_or("falta --sparsities <file>")?;
 
-    let sp_raw: Vec<String> = std::fs::read_to_string(&sparsities)?
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    // Cada línea: "gate up down" (3 floats) o "gate" (solo gate, retrocompatible).
-    let sp_gate: Vec<f32> = sp_raw
-        .iter()
-        .map(|l| l.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0))
-        .collect();
-    let sp_up: Vec<f32> = sp_raw
-        .iter()
-        .map(|l| {
-            l.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0)
-        })
-        .collect();
-    let sp_down: Vec<f32> = sp_raw
-        .iter()
-        .map(|l| {
-            l.split_whitespace().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)
-        })
-        .collect();
+    // Modo Vía B: `--genome <genome.bin>` (CPPN global, 466 f32) decodifica la
+    // topología por capa (adyacencia del CPPN con y_layer); sin él, `--sparsities`.
+    let genome_bin: Option<Vec<f32>> = match &genome {
+        Some(p) => {
+            let raw = std::fs::read(p)?;
+            if raw.len() % 4 != 0 {
+                return Err("genoma: tamaño no múltiplo de 4 bytes".into());
+            }
+            let n = raw.len() / 4;
+            let mut g = Vec::with_capacity(n);
+            for c in raw.chunks_exact(4) {
+                g.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            Some(g)
+        }
+        None => None,
+    };
+
+    let sp_gate: Vec<f32>;
+    let sp_up: Vec<f32>;
+    let sp_down: Vec<f32>;
+    if genome_bin.is_some() {
+        sp_gate = Vec::new();
+        sp_up = Vec::new();
+        sp_down = Vec::new();
+    } else {
+        let sparsities = sparsities.ok_or("falta --sparsities <file> (o --genome <bin>)")?;
+        let sp_raw: Vec<String> = std::fs::read_to_string(&sparsities)?
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        // Cada línea: "gate up down" (3 floats) o "gate" (solo gate, retrocompatible).
+        sp_gate = sp_raw
+            .iter()
+            .map(|l| l.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0))
+            .collect();
+        sp_up = sp_raw
+            .iter()
+            .map(|l| {
+                l.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            })
+            .collect();
+        sp_down = sp_raw
+            .iter()
+            .map(|l| {
+                l.split_whitespace().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            })
+            .collect();
+    }
 
     let texts: Vec<String> = std::fs::read_to_string(&prompts)?
         .lines()
@@ -165,33 +290,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = tokenizer.encode(&corpus, false);
     let n_pos = tokens.len().min(n_positions);
 
-    // Overrides: poda por magnitud del profesor por bloque y capa (sp>0).
+    // Overrides: poda por magnitud del profesor por bloque y capa (sp>0), o
+    // topología CPPN global (Vía B, `--genome`).
     let mut overrides: Vec<FfnOverride> = vec![FfnOverride::default(); n_layers];
     // D_arch global: esparsidad ponderada por TODOS los parámetros FFN del modelo
     // (denominador completo — no solo las capas esparsas).
     let mut d_arch_num = 0.0f32;
     let mut d_arch_den = 0.0f32;
     for layer_idx in 0..n_layers {
-        let trio: [(&str, f32, &hayai_model::QuantMatrix); 3] = [
-            ("ffn_gate", sp_gate.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].gate),
-            ("ffn_up", sp_up.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].up),
-            ("ffn_down", sp_down.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].down),
+        let trio: [(&str, &hayai_model::QuantMatrix); 3] = [
+            ("ffn_gate", &weights.layers[layer_idx].gate),
+            ("ffn_up", &weights.layers[layer_idx].up),
+            ("ffn_down", &weights.layers[layer_idx].down),
         ];
-        for (block, sp, m) in trio {
+        let y_layer = layer_coord(layer_idx, n_layers);
+        for (block, m) in trio {
             let params = (m.ncols * m.nrows) as f32;
             d_arch_den += params;
-            if sp <= 0.0 {
-                continue;
-            }
             let name = format!("blk.{layer_idx}.{block}.weight");
             let w0 = weights.gguf.dequant_f32(&name)?;
-            let csr = magnitude_prune_csr(&w0, m.ncols, m.nrows, sp.min(0.999));
+            let csr = if let Some(g) = &genome_bin {
+                // Vía B: adyacencia del CPPN global (coordenada de capa).
+                let active = cppn_layer_active(g, m.ncols, m.nrows, tau, y_layer);
+                let sp = 1.0 - active.iter().filter(|a| **a).count() as f32 / params;
+                d_arch_num += sp * params;
+                topology_prune_csr(&w0, m.ncols, m.nrows, &active)
+            } else {
+                let sp = match block {
+                    "ffn_gate" => sp_gate.get(layer_idx).copied().unwrap_or(0.0),
+                    "ffn_up" => sp_up.get(layer_idx).copied().unwrap_or(0.0),
+                    _ => sp_down.get(layer_idx).copied().unwrap_or(0.0),
+                };
+                if sp <= 0.0 {
+                    continue;
+                }
+                d_arch_num += sp * params;
+                magnitude_prune_csr(&w0, m.ncols, m.nrows, sp.min(0.999))
+            };
             match block {
                 "ffn_gate" => overrides[layer_idx].gate = Some(csr),
                 "ffn_up" => overrides[layer_idx].up = Some(csr),
                 _ => overrides[layer_idx].down = Some(csr),
             }
-            d_arch_num += sp * params;
         }
     }
     let d_arch_global = if d_arch_den > 0.0 {

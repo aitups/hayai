@@ -476,6 +476,7 @@ dependencies = [
  "hayai-io",
  "hayai-model",
  "hayai-opencl",
+ "rayon",
  "tokio",
  "tracing",
  "tracing-subscriber",
