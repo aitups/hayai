@@ -11,7 +11,7 @@ use crate::stream_infer::{
     StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step, rms_norm};
-use hayai_model::{LayerPackLayout, LayerWeightPack};
+use hayai_model::{LayerPackLayout, LayerWeightPack, QuantMatrix};
 use hayai_opencl::StreamingScratch;
 use std::thread;
 use std::time::Instant;
@@ -22,6 +22,52 @@ struct PendingFfn {
     up_out: Vec<f32>,
     down_out: Vec<f32>,
     token_idx: usize,
+    /// CSR disperso embebido (D16) para `down`; Some ⇒ finish por CPU.
+    down_csr: Option<hayai_model::CsrSparse>,
+}
+
+/// Completa el FFN de un token prefilled: espera el inflight (o lo omite si gate/up
+/// ya se calcularon por CSR), aplica silu(gate)*up y proyecta `down` (CSR o denso).
+fn finish_pending_ffn(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    p: PendingFfn,
+    down: &QuantMatrix,
+    scratch: &mut StreamingScratch,
+    layer_idx: usize,
+    layout: &LayerPackLayout,
+) -> Result<Vec<f32>, StreamInferError> {
+    let mut gate_out = p.gate_out;
+    let mut up_out = p.up_out;
+    let mut down_out = p.down_out;
+    if let Some(c) = p.down_csr {
+        for i in 0..gate_out.len() {
+            let g = gate_out[i];
+            gate_out[i] = (g / (1.0 + (-g).exp())) * up_out[i];
+        }
+        down_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
+            &gate_out,
+            &c.row_ptr,
+            &c.col_idx,
+            &c.vals,
+            c.d_in,
+            c.d_out,
+        ));
+    } else {
+        ffn_finish_scratch(
+            orch,
+            p.inflight,
+            down,
+            &mut gate_out,
+            &mut up_out,
+            &mut down_out,
+            &mut gen.used_dgpu,
+            Some(scratch),
+            layer_idx,
+            Some(layout),
+        )?;
+    }
+    Ok(down_out)
 }
 
 type PrefetchOk = (LayerWeightPack, LayerPackLayout);
@@ -154,24 +200,12 @@ impl StreamingGenerator {
 
                 if let Some(p) = pending.take() {
                     let t_ffn = Instant::now();
-                    let mut gate_out = p.gate_out;
-                    let mut up_out = p.up_out;
-                    let mut down_out = p.down_out;
-                    ffn_finish_scratch(
-                        orch,
-                        p.inflight,
-                        &current.down,
-                        &mut gate_out,
-                        &mut up_out,
-                        &mut down_out,
-                        &mut self.used_dgpu,
-                        Some(scratch),
-                        layer_idx,
-                        Some(&layout),
-                    )?;
+                    let token_idx = p.token_idx;
+                    let down_out =
+                        finish_pending_ffn(self, orch, p, &current.down, scratch, layer_idx, &layout)?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                     for i in 0..h {
-                        xs[p.token_idx][i] += down_out[i];
+                        xs[token_idx][i] += down_out[i];
                     }
                 }
 
@@ -187,19 +221,49 @@ impl StreamingGenerator {
                 }
 
                 let t_enq = Instant::now();
-                let inflight = ffn_begin_gate_up_scratch(
-                    orch,
-                    &current.gate,
-                    &current.up,
-                    &xn,
-                    &mut gate_out,
-                    &mut up_out,
-                    &mut self.used_dgpu,
-                    &mut self.used_apu,
-                    Some(scratch),
-                    layer_idx,
-                    Some(&layout),
-                )?;
+                let inflight = if current.gate_csr.is_some() || current.up_csr.is_some() {
+                    // Bloque disperso embebido (D16): gate/up vía CSR en CPU;
+                    // los bloques densos mixtos usan el orchestrator.
+                    if let Some(c) = &current.gate_csr {
+                        gate_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
+                            &xn,
+                            &c.row_ptr,
+                            &c.col_idx,
+                            &c.vals,
+                            c.d_in,
+                            c.d_out,
+                        ));
+                    } else {
+                        orch.execute_quant_gemv(&current.gate, &xn, &mut gate_out)?;
+                    }
+                    if let Some(c) = &current.up_csr {
+                        up_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
+                            &xn,
+                            &c.row_ptr,
+                            &c.col_idx,
+                            &c.vals,
+                            c.d_in,
+                            c.d_out,
+                        ));
+                    } else {
+                        orch.execute_quant_gemv(&current.up, &xn, &mut up_out)?;
+                    }
+                    GateUpInflight::Done
+                } else {
+                    ffn_begin_gate_up_scratch(
+                        orch,
+                        &current.gate,
+                        &current.up,
+                        &xn,
+                        &mut gate_out,
+                        &mut up_out,
+                        &mut self.used_dgpu,
+                        &mut self.used_apu,
+                        Some(scratch),
+                        layer_idx,
+                        Some(&layout),
+                    )?
+                };
                 self.ffn_secs += t_enq.elapsed().as_secs_f64();
 
                 if t == 0 {
@@ -227,6 +291,7 @@ impl StreamingGenerator {
                     up_out,
                     down_out,
                     token_idx: t,
+                    down_csr: current.down_csr.clone(),
                 });
             }
 
@@ -305,24 +370,19 @@ impl StreamingGenerator {
                     self.attn_ffn_overlap_secs += attn_dt;
 
                     let t_ffn = Instant::now();
-                    let mut gate_out = p.gate_out;
-                    let mut up_out = p.up_out;
-                    let mut down_out = p.down_out;
-                    ffn_finish_scratch(
+                    let token_idx = p.token_idx;
+                    let down_out = finish_pending_ffn(
+                        self,
                         orch,
-                        p.inflight,
+                        p,
                         &finishing.down,
-                        &mut gate_out,
-                        &mut up_out,
-                        &mut down_out,
-                        &mut self.used_dgpu,
-                        Some(scratch),
+                        scratch,
                         layer_idx,
-                        Some(&fin_layout),
+                        &fin_layout,
                     )?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                     for i in 0..h {
-                        xs[p.token_idx][i] += down_out[i];
+                        xs[token_idx][i] += down_out[i];
                     }
 
                     // Layer i+1 already has DMA in flight; unmap when first FFN of that layer runs.
@@ -351,24 +411,12 @@ impl StreamingGenerator {
 
             if let Some(p) = pending.take() {
                 let t_ffn = Instant::now();
-                let mut gate_out = p.gate_out;
-                let mut up_out = p.up_out;
-                let mut down_out = p.down_out;
-                ffn_finish_scratch(
-                    orch,
-                    p.inflight,
-                    &current.down,
-                    &mut gate_out,
-                    &mut up_out,
-                    &mut down_out,
-                    &mut self.used_dgpu,
-                    Some(scratch),
-                    layer_idx,
-                    Some(&layout),
-                )?;
+                let token_idx = p.token_idx;
+                let down_out =
+                    finish_pending_ffn(self, orch, p, &current.down, scratch, layer_idx, &layout)?;
                 self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                 for i in 0..h {
-                    xs[p.token_idx][i] += down_out[i];
+                    xs[token_idx][i] += down_out[i];
                 }
             }
         }

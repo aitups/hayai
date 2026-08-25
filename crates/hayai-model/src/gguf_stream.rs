@@ -7,6 +7,7 @@
 use crate::gguf::{parse_header_bytes, tensor_nbytes};
 use crate::gguf_types::{GgufError, MetadataValue, TensorInfo};
 use crate::quant::QuantMatrix;
+use crate::sparse_dag::{sparse_dag_to_csr, TENSOR_ADJACENCY, TENSOR_WEIGHTS};
 use hayai_io::{open_weight_io, IoBackend, IoRange, WeightIo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -235,15 +236,21 @@ impl GgufCatalog {
             Ok(_) => Some(self.load_quant_matrix(&format!("blk.{layer}.attn_gate.weight"))?),
             Err(_) => None,
         };
+        let (gate, gate_csr) = load_ffn_pack(self, layer, "ffn_gate")?;
+        let (up, up_csr) = load_ffn_pack(self, layer, "ffn_up")?;
+        let (down, down_csr) = load_ffn_pack(self, layer, "ffn_down")?;
         Ok(LayerWeightPack {
             wq: self.load_quant_matrix(&format!("blk.{layer}.attn_q.weight"))?,
             wk: self.load_quant_matrix(&format!("blk.{layer}.attn_k.weight"))?,
             wv: self.load_quant_matrix(&format!("blk.{layer}.attn_v.weight"))?,
             wo: self.load_quant_matrix(&format!("blk.{layer}.attn_output.weight"))?,
-            gate: self.load_quant_matrix(&format!("blk.{layer}.ffn_gate.weight"))?,
-            up: self.load_quant_matrix(&format!("blk.{layer}.ffn_up.weight"))?,
-            down: self.load_quant_matrix(&format!("blk.{layer}.ffn_down.weight"))?,
+            gate,
+            up,
+            down,
             attn_gate,
+            gate_csr,
+            up_csr,
+            down_csr,
         })
     }
 
@@ -271,26 +278,44 @@ impl GgufCatalog {
         let mut types = [crate::gguf_types::GgmlType::F32; 7];
         let mut off = 0usize;
         let mut ranges: Vec<IoRange> = Vec::with_capacity(8);
+        // CSR de los bloques FFN sustituidos (D16): índice 0=gate, 1=up, 2=down.
+        let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
+        let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
         for (i, name) in names.iter().enumerate() {
-            let info = self.tensor(name)?.clone();
-            let nbytes = tensor_nbytes(&info)?;
-            if off + nbytes > dst.len() {
-                return Err(GgufError::Msg(format!(
-                    "layer {layer} pack {nbytes}B at {off} exceeds scratch {}",
-                    dst.len()
-                )));
+            match self.tensor(name).cloned() {
+                Ok(info) => {
+                    let nbytes = tensor_nbytes(&info)?;
+                    if off + nbytes > dst.len() {
+                        return Err(GgufError::Msg(format!(
+                            "layer {layer} pack {nbytes}B at {off} exceeds scratch {}",
+                            dst.len()
+                        )));
+                    }
+                    let abs = self.tensor_abs_offset(&info);
+                    ranges.push(IoRange {
+                        offset: abs,
+                        start: off,
+                        end: off + nbytes,
+                    });
+                    offs[i] = off;
+                    lens[i] = nbytes;
+                    dims[i] = (info.ncols(), info.nrows());
+                    types[i] = info.ggml_type;
+                    off += nbytes;
+                }
+                Err(_) if i >= 4 => {
+                    // Tensor denso ausente: bloque disperso embebido (D16).
+                    let base = format!("blk.{layer}.{}", ffn_blocks[i - 4]);
+                    let (csr, cdim) = load_embedded_csr(self, &base)?
+                        .ok_or_else(|| GgufError::MissingTensor(name.clone()))?;
+                    offs[i] = off; // layout 0 bytes (el CSR vive aparte)
+                    lens[i] = 0;
+                    dims[i] = cdim;
+                    types[i] = crate::gguf_types::GgmlType::F32;
+                    ffn_csrs[i - 4] = Some(csr);
+                }
+                Err(e) => return Err(e),
             }
-            let abs = self.tensor_abs_offset(&info);
-            ranges.push(IoRange {
-                offset: abs,
-                start: off,
-                end: off + nbytes,
-            });
-            offs[i] = off;
-            lens[i] = nbytes;
-            dims[i] = (info.ncols(), info.nrows());
-            types[i] = info.ggml_type;
-            off += nbytes;
         }
         let gate_name = format!("blk.{layer}.attn_gate.weight");
         let (attn_gate_off, attn_gate_len, attn_gate_dim, attn_gate_ty) =
@@ -350,6 +375,9 @@ impl GgufCatalog {
                 &dst[attn_gate_off..attn_gate_off + attn_gate_len],
             ));
         }
+        pack.gate_csr = ffn_csrs[0].take();
+        pack.up_csr = ffn_csrs[1].take();
+        pack.down_csr = ffn_csrs[2].take();
         Ok((pack, layout))
     }
 
@@ -393,7 +421,7 @@ impl GgufCatalog {
     /// device memory). Unlike [`Self::load_layer_pack_into`] this never touches the
     /// weight payload — it only re-derives offsets/dims/types from the in-RAM index.
     pub fn layer_pack_views_from_base(
-        &self,
+        &mut self,
         layer: usize,
         base: &[u8],
     ) -> Result<(LayerWeightPack, LayerPackLayout), GgufError> {
@@ -410,21 +438,38 @@ impl GgufCatalog {
         let mut lens = [0usize; 7];
         let mut dims = [(0usize, 0usize); 7];
         let mut types = [crate::gguf_types::GgmlType::F32; 7];
+        let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
+        let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
         let mut off = 0usize;
         for (i, name) in names.iter().enumerate() {
-            let info = self.tensor(name)?.clone();
-            let nbytes = tensor_nbytes(&info)?;
-            if off + nbytes > base.len() {
-                return Err(GgufError::Msg(format!(
-                    "layer {layer} pack {nbytes}B at {off} exceeds resident base {}",
-                    base.len()
-                )));
+            match self.tensor(name).cloned() {
+                Ok(info) => {
+                    let nbytes = tensor_nbytes(&info)?;
+                    if off + nbytes > base.len() {
+                        return Err(GgufError::Msg(format!(
+                            "layer {layer} pack {nbytes}B at {off} exceeds resident base {}",
+                            base.len()
+                        )));
+                    }
+                    offs[i] = off;
+                    lens[i] = nbytes;
+                    dims[i] = (info.ncols(), info.nrows());
+                    types[i] = info.ggml_type;
+                    off += nbytes;
+                }
+                Err(_) if i >= 4 => {
+                    // Tensor denso ausente: bloque disperso embebido (D16).
+                    let base_name = format!("blk.{layer}.{}", ffn_blocks[i - 4]);
+                    let (csr, cdim) = load_embedded_csr(self, &base_name)?
+                        .ok_or_else(|| GgufError::MissingTensor(name.clone()))?;
+                    offs[i] = off;
+                    lens[i] = 0;
+                    dims[i] = cdim;
+                    types[i] = crate::gguf_types::GgmlType::F32;
+                    ffn_csrs[i - 4] = Some(csr);
+                }
+                Err(e) => return Err(e),
             }
-            offs[i] = off;
-            lens[i] = nbytes;
-            dims[i] = (info.ncols(), info.nrows());
-            types[i] = info.ggml_type;
-            off += nbytes;
         }
         let gate_name = format!("blk.{layer}.attn_gate.weight");
         let (attn_gate_off, attn_gate_len, attn_gate_dim, attn_gate_ty) =
@@ -471,6 +516,9 @@ impl GgufCatalog {
                 &base[attn_gate_off..attn_gate_off + attn_gate_len],
             ));
         }
+        pack.gate_csr = ffn_csrs[0].take();
+        pack.up_csr = ffn_csrs[1].take();
+        pack.down_csr = ffn_csrs[2].take();
         Ok((pack, layout))
     }
 
@@ -487,7 +535,10 @@ impl GgufCatalog {
         ];
         let mut total = 0usize;
         for n in &names {
-            total += tensor_nbytes(self.tensor(n)?)?;
+            // FFN disperso embebido (D16): el tensor denso no existe -> 0 bytes.
+            if let Ok(info) = self.tensor(n) {
+                total += tensor_nbytes(info)?;
+            }
         }
         if let Ok(info) = self.tensor(&format!("blk.{layer}.attn_gate.weight")) {
             total += tensor_nbytes(info)?;
@@ -541,6 +592,69 @@ impl GgufCatalog {
     }
 }
 
+/// Carga el bloque disperso embebido de un bloque FFN desde el catálogo
+/// (formato D16): tensores `blk.N.<rol>.ffn_dag_adjacency/ffn_dag_weights` +
+/// metadatos `saor.blk.N.<rol>.*`. Devuelve `Ok(None)` si no está marcado.
+pub fn load_embedded_csr(
+    cat: &mut GgufCatalog,
+    base: &str,
+) -> Result<Option<(crate::weights::CsrSparse, (usize, usize))>, GgufError> {
+    let adj_name = format!("{base}.{TENSOR_ADJACENCY}");
+    let w_name = format!("{base}.{TENSOR_WEIGHTS}");
+    let Ok(adj_info) = cat.tensor(&adj_name).cloned() else {
+        return Ok(None);
+    };
+    cat.tensor(&w_name)?;
+    let adj_len = adj_info.dims.first().copied().unwrap_or(0) as usize;
+    let mut adj_buf = vec![0u8; adj_len];
+    cat.read_raw_at(cat.tensor_abs_offset(&adj_info), &mut adj_buf)?;
+    let w_buf = cat.dequant_f32(&w_name)?;
+    let d_in = cat
+        .meta_u32(&format!("saor.{base}.d_in"))
+        .unwrap_or(0) as usize;
+    let d_out = cat
+        .meta_u32(&format!("saor.{base}.d_out"))
+        .unwrap_or(0) as usize;
+    let (row_ptr, col_idx, vals) = sparse_dag_to_csr(&adj_buf, &w_buf, d_in, d_out);
+    Ok(Some((
+        crate::weights::CsrSparse {
+            row_ptr,
+            col_idx,
+            vals,
+            d_in,
+            d_out,
+        },
+        (d_in, d_out),
+    )))
+}
+
+/// Carga una matriz FFN del pack: densa si el tensor existe; si fue sustituida
+/// por un bloque disperso embebido, devuelve el CSR + un placeholder.
+fn load_ffn_pack(
+    cat: &mut GgufCatalog,
+    layer: usize,
+    block: &str,
+) -> Result<(QuantMatrix, Option<crate::weights::CsrSparse>), GgufError> {
+    let name = format!("blk.{layer}.{block}.weight");
+    match cat.load_quant_matrix(&name) {
+        Ok(q) => Ok((q, None)),
+        Err(GgufError::MissingTensor(_)) => {
+            let base = format!("blk.{layer}.{block}");
+            let (csr, dims) = load_embedded_csr(cat, &base)?
+                .ok_or_else(|| GgufError::MissingTensor(name.clone()))?;
+            let q = QuantMatrix::owned(
+                name,
+                dims.0,
+                dims.1,
+                crate::gguf_types::GgmlType::F32,
+                Vec::new(),
+            );
+            Ok((q, Some(csr)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// One decoder layer's packed weights (resident only while that layer is active / prefetched).
 #[derive(Clone)]
 pub struct LayerWeightPack {
@@ -553,6 +667,10 @@ pub struct LayerWeightPack {
     pub down: QuantMatrix,
     /// Optional sigmoid attention gate (HRM / Qwen3-Next style). `None` for plain LLaMA.
     pub attn_gate: Option<QuantMatrix>,
+    /// CSR dispersos embebidos (D16): Some si el tensor denso fue sustituido.
+    pub gate_csr: Option<crate::weights::CsrSparse>,
+    pub up_csr: Option<crate::weights::CsrSparse>,
+    pub down_csr: Option<crate::weights::CsrSparse>,
 }
 
 /// Byte offsets + lengths of each matrix inside the contiguous layer-pack blob.
@@ -649,6 +767,9 @@ impl LayerWeightPack {
                 slice(layout.down_off, layout.down_len),
             ),
             attn_gate: None,
+            gate_csr: None,
+            up_csr: None,
+            down_csr: None,
         }
     }
 
@@ -701,6 +822,10 @@ impl LayerWeightPack {
                 &base[layout.attn_gate_off..layout.attn_gate_off + layout.attn_gate_len],
             ));
         }
+        // Preservar los CSR dispersos embebidos (D16) al re-enlazar el pack.
+        pack.gate_csr = self.gate_csr.clone();
+        pack.up_csr = self.up_csr.clone();
+        pack.down_csr = self.down_csr.clone();
         pack
     }
 

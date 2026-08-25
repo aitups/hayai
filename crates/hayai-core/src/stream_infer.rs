@@ -177,6 +177,60 @@ pub struct StreamingGenerator {
 }
 
 impl StreamingGenerator {
+    /// FFN disperso embebido (D16): ejecuta gate/up/down vía CSR (CPU) cuando el
+    /// pack trae bloques sustituidos; los bloques densos usan el orchestrator.
+    fn run_ffn_block(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        pack: &hayai_model::LayerWeightPack,
+        xn: &[f32],
+    ) -> Result<(), StreamInferError> {
+        if let Some(c) = &pack.gate_csr {
+            let out = hayai_model::spmm_csr_cpu(
+                xn,
+                &c.row_ptr,
+                &c.col_idx,
+                &c.vals,
+                c.d_in,
+                c.d_out,
+            );
+            self.ws_gate.copy_from_slice(&out);
+        } else {
+            orch.execute_quant_gemv(&pack.gate, xn, &mut self.ws_gate)?;
+        }
+        if let Some(c) = &pack.up_csr {
+            let out = hayai_model::spmm_csr_cpu(
+                xn,
+                &c.row_ptr,
+                &c.col_idx,
+                &c.vals,
+                c.d_in,
+                c.d_out,
+            );
+            self.ws_up.copy_from_slice(&out);
+        } else {
+            orch.execute_quant_gemv(&pack.up, xn, &mut self.ws_up)?;
+        }
+        for i in 0..self.ws_gate.len() {
+            let g = self.ws_gate[i];
+            self.ws_gate[i] = (g / (1.0 + (-g).exp())) * self.ws_up[i];
+        }
+        if let Some(c) = &pack.down_csr {
+            let out = hayai_model::spmm_csr_cpu(
+                &self.ws_gate,
+                &c.row_ptr,
+                &c.col_idx,
+                &c.vals,
+                c.d_in,
+                c.d_out,
+            );
+            self.ws_down.copy_from_slice(&out);
+        } else {
+            orch.execute_quant_gemv(&pack.down, &self.ws_gate, &mut self.ws_down)?;
+        }
+        Ok(())
+    }
+
     pub fn open(
         path: impl AsRef<std::path::Path>,
         tokenizer: Tokenizer,
@@ -728,19 +782,26 @@ impl StreamingGenerator {
             }
 
             let t_ffn_enq = Instant::now();
-            let inflight = ffn_begin_gate_up_scratch(
-                orch,
-                &current.gate,
-                &current.up,
-                &xn,
-                &mut self.ws_gate,
-                &mut self.ws_up,
-                &mut self.used_dgpu,
-                &mut self.used_apu,
-                scratch.as_deref(),
-                layer_idx,
-                Some(&layout),
-            )?;
+            let sparse_ffn = current.gate_csr.is_some()
+                || current.up_csr.is_some()
+                || current.down_csr.is_some();
+            let inflight = if sparse_ffn {
+                None
+            } else {
+                Some(ffn_begin_gate_up_scratch(
+                    orch,
+                    &current.gate,
+                    &current.up,
+                    &xn,
+                    &mut self.ws_gate,
+                    &mut self.ws_up,
+                    &mut self.used_dgpu,
+                    &mut self.used_apu,
+                    scratch.as_deref(),
+                    layer_idx,
+                    Some(&layout),
+                )?)
+            };
             self.ffn_secs += t_ffn_enq.elapsed().as_secs_f64();
 
             let mut next_staged: Option<PrefetchOk> = None;
@@ -761,18 +822,23 @@ impl StreamingGenerator {
             }
 
             let t_ffn_fin = Instant::now();
-            ffn_finish_scratch(
-                orch,
-                inflight,
-                &current.down,
-                &mut self.ws_gate,
-                &mut self.ws_up,
-                &mut self.ws_down,
-                &mut self.used_dgpu,
-                scratch.as_deref(),
-                layer_idx,
-                Some(&layout),
-            )?;
+            if let Some(inflight) = inflight {
+                ffn_finish_scratch(
+                    orch,
+                    inflight,
+                    &current.down,
+                    &mut self.ws_gate,
+                    &mut self.ws_up,
+                    &mut self.ws_down,
+                    &mut self.used_dgpu,
+                    scratch.as_deref(),
+                    layer_idx,
+                    Some(&layout),
+                )?;
+            } else {
+                // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
+                self.run_ffn_block(orch, &current, &xn)?;
+            }
             self.ffn_secs += t_ffn_fin.elapsed().as_secs_f64();
 
             {
@@ -945,31 +1011,39 @@ impl StreamingGenerator {
                 self.finish_ffn_unmap(orch, scratch, layer)?;
 
                 let t_ffn = Instant::now();
-                let inflight = ffn_begin_gate_up_scratch(
-                    orch,
-                    &current.gate,
-                    &current.up,
-                    &xn,
-                    &mut self.ws_gate,
-                    &mut self.ws_up,
-                    &mut self.used_dgpu,
-                    &mut self.used_apu,
-                    Some(scratch),
-                    layer,
-                    Some(&layout),
-                )?;
-                ffn_finish_scratch(
-                    orch,
-                    inflight,
-                    &current.down,
-                    &mut self.ws_gate,
-                    &mut self.ws_up,
-                    &mut self.ws_down,
-                    &mut self.used_dgpu,
-                    Some(scratch),
-                    layer,
-                    Some(&layout),
-                )?;
+                let sparse_ffn = current.gate_csr.is_some()
+                    || current.up_csr.is_some()
+                    || current.down_csr.is_some();
+                if sparse_ffn {
+                    // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
+                    self.run_ffn_block(orch, &current, &xn)?;
+                } else {
+                    let inflight = ffn_begin_gate_up_scratch(
+                        orch,
+                        &current.gate,
+                        &current.up,
+                        &xn,
+                        &mut self.ws_gate,
+                        &mut self.ws_up,
+                        &mut self.used_dgpu,
+                        &mut self.used_apu,
+                        Some(scratch),
+                        layer,
+                        Some(&layout),
+                    )?;
+                    ffn_finish_scratch(
+                        orch,
+                        inflight,
+                        &current.down,
+                        &mut self.ws_gate,
+                        &mut self.ws_up,
+                        &mut self.ws_down,
+                        &mut self.used_dgpu,
+                        Some(scratch),
+                        layer,
+                        Some(&layout),
+                    )?;
+                }
                 self.ffn_secs += t_ffn.elapsed().as_secs_f64();
 
                 {
