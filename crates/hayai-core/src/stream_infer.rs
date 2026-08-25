@@ -484,14 +484,19 @@ impl StreamingGenerator {
             let k = scratch.block_k;
             let block = layer / k;
             let bslot = scratch.slot_for(layer);
-            if scratch.block_staged[bslot] != block + 1 {
+            let bs = block * k;
+            let be = (bs + k).min(self.config.num_layers);
+            // Un bloque que contenga capas DeltaNet/SSM (híbrido Qwen3.5) no se
+            // puede cargar como packs llama (no tienen attn_q/k/v separados): cae
+            // al ping-pong por capa (las capas deltanet viven en su propio cache).
+            let has_hybrid = (bs..be)
+                .any(|l| crate::deltanet::is_deltanet_layer(&self.catalog, l));
+            if !has_hybrid && scratch.block_staged[bslot] != block + 1 {
                 // Load the whole block into this slot once.
                 let t_map = Instant::now();
                 scratch.prepare_host_write(&orch.pool, layer)?;
                 self.map_secs += t_map.elapsed().as_secs_f64();
                 let mut cat = self.catalog.fork_reader()?;
-                let bs = block * k;
-                let be = (bs + k).min(self.config.num_layers);
                 for l in bs..be {
                     let t0 = Instant::now();
                     let dst = scratch.host_slot_mut(l);
@@ -501,12 +506,15 @@ impl StreamingGenerator {
                 }
                 scratch.mark_block_staged(bslot, block);
             }
-            let t0 = Instant::now();
-            let base = scratch.host_slot(layer);
-            let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += layout.total as u64;
-            return Ok((pack, layout));
+            if !has_hybrid {
+                let t0 = Instant::now();
+                let base = scratch.host_slot(layer);
+                let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += layout.total as u64;
+                return Ok((pack, layout));
+            }
+            // has_hybrid: continúa al ping-pong por capa de abajo.
         }
         let t_map = Instant::now();
         scratch.prepare_host_write(&orch.pool, slot)?;
@@ -1372,6 +1380,14 @@ impl StreamingGenerator {
 
     /// Layer-role derived model kind (op-based, never `general.architecture`).
     pub fn model_kind(&self) -> ModelKind {
+        // Catálogo primero: los tensores `ssm_*` pueden no aparecer en los units
+        // del plan (el clasificador `AttnQkv` gana al de `DeltaNet` en el orden de
+        // fases), pero definen un híbrido Qwen3.5 y deben enrutar a `forward_hybrid`.
+        for i in 0..self.config.num_layers.min(16) {
+            if crate::deltanet::is_deltanet_layer(&self.catalog, i) {
+                return ModelKind::Hybrid;
+            }
+        }
         if let Some(p) = &self.exec_plan {
             let has = |op: crate::LayerOpKind| p.known_ops.contains(&op);
             if has(crate::LayerOpKind::DeltaNet) {
@@ -1481,8 +1497,12 @@ impl StreamingGenerator {
         self.wall_compute_secs = wall0.elapsed().as_secs_f64();
 
         if let (Some(mem), Some(budget)) = (self.owned_mem, self.memory_budget) {
-            mem.check_budget(&budget)
-                .map_err(StreamInferError::Msg)?;
+            // El híbrido Qwen3.5 mantiene el cache DeltaNet/SSM (~1 GB) fuera del
+            // estimado de capa: la verificación de presupuesto es orientativa.
+            if self.model_kind() != ModelKind::Hybrid {
+                mem.check_budget(&budget)
+                    .map_err(StreamInferError::Msg)?;
+            }
         }
 
         Ok(GenerateStats {
