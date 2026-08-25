@@ -167,18 +167,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Overrides: poda por magnitud del profesor por bloque y capa (sp>0).
     let mut overrides: Vec<FfnOverride> = vec![FfnOverride::default(); n_layers];
+    // D_arch global: esparsidad ponderada por TODOS los parámetros FFN del modelo
+    // (denominador completo — no solo las capas esparsas).
     let mut d_arch_num = 0.0f32;
     let mut d_arch_den = 0.0f32;
-    for (layer_idx, _) in sp_gate.iter().enumerate() {
-        if layer_idx >= n_layers {
-            continue;
-        }
+    for layer_idx in 0..n_layers {
         let trio: [(&str, f32, &hayai_model::QuantMatrix); 3] = [
-            ("ffn_gate", sp_gate[layer_idx], &weights.layers[layer_idx].gate),
-            ("ffn_up", sp_up[layer_idx], &weights.layers[layer_idx].up),
-            ("ffn_down", sp_down[layer_idx], &weights.layers[layer_idx].down),
+            ("ffn_gate", sp_gate.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].gate),
+            ("ffn_up", sp_up.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].up),
+            ("ffn_down", sp_down.get(layer_idx).copied().unwrap_or(0.0), &weights.layers[layer_idx].down),
         ];
         for (block, sp, m) in trio {
+            let params = (m.ncols * m.nrows) as f32;
+            d_arch_den += params;
             if sp <= 0.0 {
                 continue;
             }
@@ -190,9 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ffn_up" => overrides[layer_idx].up = Some(csr),
                 _ => overrides[layer_idx].down = Some(csr),
             }
-            let params = (m.ncols * m.nrows) as f32;
             d_arch_num += sp * params;
-            d_arch_den += params;
         }
     }
     let d_arch_global = if d_arch_den > 0.0 {
