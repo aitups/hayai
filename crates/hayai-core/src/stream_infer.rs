@@ -211,7 +211,7 @@ impl StreamingGenerator {
     }
 
     /// SpMM CSR del FFN disperso: OpenCL si hay pool, si no CPU.
-    fn spmm_csr(
+    pub(crate) fn spmm_csr(
         &self,
         orch: &EngineOrchestrator,
         x: &[f32],

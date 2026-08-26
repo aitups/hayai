@@ -45,14 +45,8 @@ fn finish_pending_ffn(
             let g = gate_out[i];
             gate_out[i] = (g / (1.0 + (-g).exp())) * up_out[i];
         }
-        down_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
-            &gate_out,
-            &c.row_ptr,
-            &c.col_idx,
-            &c.vals,
-            c.d_in,
-            c.d_out,
-        ));
+        // SpMM CSR: OpenCL si hay pool, si no CPU.
+        down_out.copy_from_slice(&gen.spmm_csr(orch, &gate_out, &c)?);
     } else {
         ffn_finish_scratch(
             orch,
@@ -225,26 +219,12 @@ impl StreamingGenerator {
                     // Bloque disperso embebido (D16): gate/up vía CSR en CPU;
                     // los bloques densos mixtos usan el orchestrator.
                     if let Some(c) = &current.gate_csr {
-                        gate_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
-                            &xn,
-                            &c.row_ptr,
-                            &c.col_idx,
-                            &c.vals,
-                            c.d_in,
-                            c.d_out,
-                        ));
+                        gate_out.copy_from_slice(&self.spmm_csr(orch, &xn, c)?);
                     } else {
                         orch.execute_quant_gemv(&current.gate, &xn, &mut gate_out)?;
                     }
                     if let Some(c) = &current.up_csr {
-                        up_out.copy_from_slice(&hayai_model::spmm_csr_cpu(
-                            &xn,
-                            &c.row_ptr,
-                            &c.col_idx,
-                            &c.vals,
-                            c.d_in,
-                            c.d_out,
-                        ));
+                        up_out.copy_from_slice(&self.spmm_csr(orch, &xn, c)?);
                     } else {
                         orch.execute_quant_gemv(&current.up, &xn, &mut up_out)?;
                     }
