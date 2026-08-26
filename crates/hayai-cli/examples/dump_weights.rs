@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut blocks: Option<String> = None; // "gate" | "all" (default)
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -26,6 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 out = args.get(i).map(PathBuf::from);
             }
+            "--blocks" => {
+                i += 1;
+                blocks = args.get(i).cloned();
+            }
             other => {
                 eprintln!("dump_weights: argumento desconocido '{other}'");
                 std::process::exit(2);
@@ -35,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let model = model.ok_or("falta --model <gguf>")?;
     let out = out.ok_or("falta --out <dir>")?;
+    let only_gate = blocks.as_deref() == Some("gate");
     fs::create_dir_all(&out)?;
 
     let gguf = GgufFile::open(&model)?;
@@ -54,6 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut meta = String::from("{");
     for layer in 0..n_layers {
         for block in ["ffn_gate", "ffn_up", "ffn_down"] {
+            if only_gate && block != "ffn_gate" {
+                continue;
+            }
             let name = format!("blk.{layer}.{block}.weight");
             let info = match gguf.tensor(&name) {
                 Ok(t) => t.clone(),
