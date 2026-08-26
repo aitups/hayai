@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut orig: Option<PathBuf> = None;
     let mut sparse: Option<PathBuf> = None;
     let mut prompts: Option<PathBuf> = None;
-    let mut device = "cpu".to_string();
+    let mut device = "auto".to_string();
     let mut n_positions = 128usize;
     let mut i = 1;
     while i < args.len() {
@@ -167,17 +167,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StreamingGenerator::open(&orig, tokenizer.clone(), 4, 128, SamplerConfig::default(), 42)?;
     let mut gen_s =
         StreamingGenerator::open(&sparse, tokenizer, 4, 128, SamplerConfig::default(), 42)?;
+    // VRAM limitada (RTX 4050: 6 GB): modo minimal (2 slots ping-pong), sin
+    // ventana residente que supere la VRAM en modelos de 40B.
+    gen_o.set_memory_strategy(hayai_core::MemoryStrategy::Minimal);
+    gen_s.set_memory_strategy(hayai_core::MemoryStrategy::Minimal);
     let mode = ExecutionMode::parse(&device);
-    let mut orch_o = EngineOrchestrator::new(mode.clone(), gen_o.config.clone());
-    let mut orch_s = EngineOrchestrator::new(mode, gen_s.config.clone());
-    let mut so = gen_o.prepare_session(&mut orch_o)?;
-    let mut ss = gen_s.prepare_session(&mut orch_s)?;
+    let mut orch = EngineOrchestrator::new(mode, gen_o.config.clone());
 
-    let mut kl_sum = 0.0f32;
+    // Secuencial (un scratch SVM a la vez): el forward de 40B en GPU no deja
+    // espacio en VRAM para dos generadores simultáneos (RTX 4050: 6 GB).
+    let mut so = gen_o.prepare_session(&mut orch)?;
+    let mut orig_logits: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
     for &tok in tokens.iter().take(n_pos) {
-        let lo = gen_o.decode_step(&mut orch_o, tok, &mut so)?;
-        let ls = gen_s.decode_step(&mut orch_s, tok, &mut ss)?;
-        kl_sum += softmax_kl(&lo, &ls);
+        orig_logits.push(gen_o.decode_step(&mut orch, tok, &mut so)?);
+    }
+    drop(so);
+
+    let mut ss = gen_s.prepare_session(&mut orch)?;
+    let mut kl_sum = 0.0f32;
+    for (i, &tok) in tokens.iter().take(n_pos).enumerate() {
+        let ls = gen_s.decode_step(&mut orch, tok, &mut ss)?;
+        kl_sum += softmax_kl(&orig_logits[i], &ls);
     }
     let kl_global = kl_sum / n_pos as f32;
 
