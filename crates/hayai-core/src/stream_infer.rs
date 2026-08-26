@@ -186,27 +186,13 @@ impl StreamingGenerator {
         xn: &[f32],
     ) -> Result<(), StreamInferError> {
         if let Some(c) = &pack.gate_csr {
-            let out = hayai_model::spmm_csr_cpu(
-                xn,
-                &c.row_ptr,
-                &c.col_idx,
-                &c.vals,
-                c.d_in,
-                c.d_out,
-            );
+            let out = self.spmm_csr(orch, xn, c)?;
             self.ws_gate.copy_from_slice(&out);
         } else {
             orch.execute_quant_gemv(&pack.gate, xn, &mut self.ws_gate)?;
         }
         if let Some(c) = &pack.up_csr {
-            let out = hayai_model::spmm_csr_cpu(
-                xn,
-                &c.row_ptr,
-                &c.col_idx,
-                &c.vals,
-                c.d_in,
-                c.d_out,
-            );
+            let out = self.spmm_csr(orch, xn, c)?;
             self.ws_up.copy_from_slice(&out);
         } else {
             orch.execute_quant_gemv(&pack.up, xn, &mut self.ws_up)?;
@@ -216,19 +202,36 @@ impl StreamingGenerator {
             self.ws_gate[i] = (g / (1.0 + (-g).exp())) * self.ws_up[i];
         }
         if let Some(c) = &pack.down_csr {
-            let out = hayai_model::spmm_csr_cpu(
-                &self.ws_gate,
-                &c.row_ptr,
-                &c.col_idx,
-                &c.vals,
-                c.d_in,
-                c.d_out,
-            );
+            let out = self.spmm_csr(orch, &self.ws_gate, c)?;
             self.ws_down.copy_from_slice(&out);
         } else {
             orch.execute_quant_gemv(&pack.down, &self.ws_gate, &mut self.ws_down)?;
         }
         Ok(())
+    }
+
+    /// SpMM CSR del FFN disperso: OpenCL si hay pool, si no CPU.
+    fn spmm_csr(
+        &self,
+        orch: &EngineOrchestrator,
+        x: &[f32],
+        c: &hayai_model::CsrSparse,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if let Some(eng) = orch.opencl_engine() {
+            let mut out = vec![0.0f32; (x.len() / c.d_in.max(1)) * c.d_out];
+            eng.spmm_csr(x, &c.row_ptr, &c.col_idx, &c.vals, c.d_in, c.d_out, &mut out)
+                .map_err(|e| StreamInferError::Msg(format!("spmm_csr OpenCL: {e}")))?;
+            Ok(out)
+        } else {
+            Ok(hayai_model::spmm_csr_cpu(
+                x,
+                &c.row_ptr,
+                &c.col_idx,
+                &c.vals,
+                c.d_in,
+                c.d_out,
+            ))
+        }
     }
 
     pub fn open(
