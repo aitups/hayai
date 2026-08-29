@@ -179,19 +179,24 @@ pub struct StreamingGenerator {
 impl StreamingGenerator {
     /// FFN disperso embebido (D16): ejecuta gate/up/down vía CSR (CPU) cuando el
     /// pack trae bloques sustituidos; los bloques densos usan el orchestrator.
+    /// `ov` (override de evolución, Vía B) tiene prioridad sobre el CSR embebido
+    /// — agnóstico a arquitectura: lo usan el path Dense y los bloques híbridos.
     pub(crate) fn run_ffn_block(
         &mut self,
         orch: &mut EngineOrchestrator,
         pack: &hayai_model::LayerWeightPack,
         xn: &[f32],
+        ov: Option<&FfnOverride>,
     ) -> Result<(), StreamInferError> {
-        if let Some(c) = &pack.gate_csr {
+        let gate_csr = ov.and_then(|o| o.gate.as_ref()).or(pack.gate_csr.as_ref());
+        if let Some(c) = gate_csr {
             let out = self.spmm_csr(orch, xn, c)?;
             self.ws_gate.copy_from_slice(&out);
         } else {
             orch.execute_quant_gemv(&pack.gate, xn, &mut self.ws_gate)?;
         }
-        if let Some(c) = &pack.up_csr {
+        let up_csr = ov.and_then(|o| o.up.as_ref()).or(pack.up_csr.as_ref());
+        if let Some(c) = up_csr {
             let out = self.spmm_csr(orch, xn, c)?;
             self.ws_up.copy_from_slice(&out);
         } else {
@@ -201,7 +206,8 @@ impl StreamingGenerator {
             let g = self.ws_gate[i];
             self.ws_gate[i] = (g / (1.0 + (-g).exp())) * self.ws_up[i];
         }
-        if let Some(c) = &pack.down_csr {
+        let down_csr = ov.and_then(|o| o.down.as_ref()).or(pack.down_csr.as_ref());
+        if let Some(c) = down_csr {
             let out = self.spmm_csr(orch, &self.ws_gate, c)?;
             self.ws_down.copy_from_slice(&out);
         } else {
@@ -654,6 +660,7 @@ impl StreamingGenerator {
         orch: &mut EngineOrchestrator,
         token: u32,
         mut scratch: Option<&mut hayai_opencl::StreamingScratch>,
+        override_ffn: Option<&[FfnOverride]>,
     ) -> Result<Vec<f32>, StreamInferError> {
         let h = self.config.hidden_size;
         self.act_sel = 0;
@@ -664,7 +671,7 @@ impl StreamingGenerator {
 
         // Macro-chunk decode: blocks of `block_k` layers per I/O batch.
         if let Some(sc) = scratch.as_mut() {
-            if sc.block_k > 1 && !sc.resident {
+            if sc.block_k > 1 && !sc.resident && override_ffn.is_none() {
                 return self.forward_macro_chunk(orch, sc);
             }
         }
@@ -796,7 +803,12 @@ impl StreamingGenerator {
             let sparse_ffn = current.gate_csr.is_some()
                 || current.up_csr.is_some()
                 || current.down_csr.is_some();
-            let inflight = if sparse_ffn {
+            let ov = override_ffn.and_then(|o| o.get(layer_idx));
+            let has_ov = match ov {
+                Some(o) => o.gate.is_some() || o.up.is_some() || o.down.is_some(),
+                None => false,
+            };
+            let inflight = if has_ov || sparse_ffn {
                 None
             } else {
                 Some(ffn_begin_gate_up_scratch(
@@ -847,8 +859,8 @@ impl StreamingGenerator {
                     Some(&layout),
                 )?;
             } else {
-                // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
-                self.run_ffn_block(orch, &current, &xn)?;
+                // FFN disperso embebido (D16) u override de evolución: CSR en GPU/CPU.
+                self.run_ffn_block(orch, &current, &xn, ov)?;
             }
             self.ffn_secs += t_ffn_fin.elapsed().as_secs_f64();
 
@@ -1027,7 +1039,7 @@ impl StreamingGenerator {
                     || current.down_csr.is_some();
                 if sparse_ffn {
                     // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
-                    self.run_ffn_block(orch, &current, &xn)?;
+                    self.run_ffn_block(orch, &current, &xn, None)?;
                 } else {
                     let inflight = ffn_begin_gate_up_scratch(
                         orch,
@@ -1463,11 +1475,36 @@ impl StreamingGenerator {
             self.forward_hrm_token(orch, scratch, token)
         } else {
             match self.model_kind() {
-                ModelKind::Hybrid => crate::hybrid_infer::forward_hybrid(self, orch, token, scratch),
+                ModelKind::Hybrid => crate::hybrid_infer::forward_hybrid(self, orch, token, scratch, None),
                 ModelKind::Gemma => crate::gemma_infer::forward_gemma(self, orch, token, scratch),
                 ModelKind::MoE => crate::moe_infer::forward_moe(self, orch, token, scratch),
                 ModelKind::Dense => self.forward_staged(orch, token, scratch),
             }
+        }
+    }
+
+
+    pub fn decode_step_with_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        scratch: &mut hayai_opencl::StreamingScratch,
+        override_ffn: &[FfnOverride],
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if self.config.hrm.is_some() {
+            return Err(StreamInferError::Msg(
+                "decode_step_with_override: HRM sin soporte de override todavía".into(),
+            ));
+        }
+        match self.model_kind() {
+            ModelKind::Hybrid => {
+                crate::hybrid_infer::forward_hybrid(self, orch, token, scratch, Some(override_ffn))
+            }
+            ModelKind::Dense => self.forward_inner(orch, token, Some(scratch), Some(override_ffn)),
+            other => Err(StreamInferError::Msg(format!(
+                "decode_step_with_override: ModelKind {} sin override (Dense/Hybrid soportados)",
+                format!("{other:?}")
+            ))),
         }
     }
 
@@ -1523,7 +1560,7 @@ impl StreamingGenerator {
         token: u32,
         scratch: &mut hayai_opencl::StreamingScratch,
     ) -> Result<Vec<f32>, StreamInferError> {
-        self.forward_inner(orch, token, Some(scratch))
+        self.forward_inner(orch, token, Some(scratch), None)
     }
 
     pub fn forward(
@@ -1531,7 +1568,18 @@ impl StreamingGenerator {
         orch: &mut EngineOrchestrator,
         token: u32,
     ) -> Result<Vec<f32>, StreamInferError> {
-        self.forward_inner(orch, token, None)
+        self.forward_inner(orch, token, None, None)
+    }
+
+    /// Forward Dense con override de FFN por capa (Vía B) — sin re-embeder.
+    /// Requiere `MemoryStrategy::Minimal` (block_k = 1).
+    pub fn forward_with_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        override_ffn: &[FfnOverride],
+    ) -> Result<Vec<f32>, StreamInferError> {
+        self.forward_inner(orch, token, None, Some(override_ffn))
     }
 
     /// Forward **batcheado** de N candidatos (Fase 2, path Dense — llama/ALIA):

@@ -4,6 +4,7 @@
 //! not from a single model-size hardcode.
 
 use crate::deltanet::{is_deltanet_layer, DeltaNetLayerWeights, DeltaNetState};
+use crate::infer::FfnOverride;
 use crate::layer_cfg::{hybrid_layer_kind, resolve_full_attn_cfg, HybridLayerKind};
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
@@ -21,7 +22,7 @@ pub(crate) fn prefill_hybrid(
 ) -> Result<Vec<f32>, StreamInferError> {
     let mut logits = Vec::new();
     for &tok in tokens {
-        logits = forward_hybrid(gen, orch, tok, scratch)?;
+        logits = forward_hybrid(gen, orch, tok, scratch, None)?;
     }
     Ok(logits)
 }
@@ -31,6 +32,7 @@ pub(crate) fn forward_hybrid(
     orch: &mut EngineOrchestrator,
     token: u32,
     scratch: &mut StreamingScratch,
+    override_ffn: Option<&[FfnOverride]>,
 ) -> Result<Vec<f32>, StreamInferError> {
     let h = gen.config.hidden_size;
     let eps = gen.config.rms_norm_eps;
@@ -66,20 +68,21 @@ pub(crate) fn forward_hybrid(
         .unwrap_or(n_layers)
         .min(n_layers);
     for layer in 0..max_layers {
+        let ov = override_ffn.and_then(|o| o.get(layer));
         match hybrid_layer_kind(&gen.catalog, layer) {
             HybridLayerKind::NextN => continue,
             HybridLayerKind::DeltaNet => {
                 if skip_dn {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
                 } else {
-                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x)?;
+                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
                 }
             }
             HybridLayerKind::FullAttn => {
                 if skip_fa {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
                 } else {
-                    run_full_attn_block(gen, orch, scratch, layer, pos, eps, &mut x)?;
+                    run_full_attn_block(gen, orch, scratch, layer, pos, eps, &mut x, ov)?;
                 }
             }
         }
@@ -182,6 +185,7 @@ fn run_ffn_only_block(
     layer: usize,
     eps: f32,
     x: &mut [f32],
+    ov: Option<&FfnOverride>,
 ) -> Result<(), StreamInferError> {
     let h = x.len();
     let t_io = Instant::now();
@@ -203,31 +207,49 @@ fn run_ffn_only_block(
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
     let t_ffn = Instant::now();
-    let inflight = ffn_begin_gate_up_scratch(
-        orch,
-        &gate,
-        &up,
-        &xn,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.used_dgpu,
-        &mut gen.used_apu,
-        None,
-        0,
-        None,
-    )?;
-    ffn_finish_scratch(
-        orch,
-        inflight,
-        &down,
-        &mut gen.ws_gate,
-        &mut gen.ws_up,
-        &mut gen.ws_down,
-        &mut gen.used_dgpu,
-        None,
-        0,
-        None,
-    )?;
+    let has_ov = ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false);
+    if has_ov {
+        let pack = hayai_model::LayerWeightPack {
+            wq: gate.clone(),
+            wk: gate.clone(),
+            wv: gate.clone(),
+            wo: gate.clone(),
+            gate,
+            up,
+            down,
+            attn_gate: None,
+            gate_csr: None,
+            up_csr: None,
+            down_csr: None,
+        };
+        gen.run_ffn_block(orch, &pack, &xn, ov)?;
+    } else {
+        let inflight = ffn_begin_gate_up_scratch(
+            orch,
+            &gate,
+            &up,
+            &xn,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.used_dgpu,
+            &mut gen.used_apu,
+            None,
+            0,
+            None,
+        )?;
+        ffn_finish_scratch(
+            orch,
+            inflight,
+            &down,
+            &mut gen.ws_gate,
+            &mut gen.ws_up,
+            &mut gen.ws_down,
+            &mut gen.used_dgpu,
+            None,
+            0,
+            None,
+        )?;
+    }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
@@ -243,6 +265,7 @@ fn run_deltanet_block(
     layer: usize,
     eps: f32,
     x: &mut [f32],
+    ov: Option<&FfnOverride>,
 ) -> Result<(), StreamInferError> {
     let h = x.len();
     // Norm + DeltaNet residual
@@ -298,8 +321,10 @@ fn run_deltanet_block(
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
     let t_ffn = Instant::now();
-    if gate_csr.is_some() || up_csr.is_some() || down_csr.is_some() {
-        // FFN disperso embebido (D16): CSR en CPU (pack temporal).
+    if gate_csr.is_some() || up_csr.is_some() || down_csr.is_some()
+        || ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false)
+    {
+        // FFN disperso embebido (D16) u override de evolución: CSR.
         let pack = hayai_model::LayerWeightPack {
             wq: gate.clone(),
             wk: gate.clone(),
@@ -313,7 +338,7 @@ fn run_deltanet_block(
             up_csr,
             down_csr,
         };
-        gen.run_ffn_block(orch, &pack, &xn)?;
+        gen.run_ffn_block(orch, &pack, &xn, ov)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
@@ -357,6 +382,7 @@ fn run_full_attn_block(
     pos: usize,
     eps: f32,
     x: &mut [f32],
+    ov: Option<&FfnOverride>,
 ) -> Result<(), StreamInferError> {
     let h = x.len();
     let slot = layer % 2;
@@ -448,9 +474,10 @@ fn run_full_attn_block(
     let t_ffn = Instant::now();
     let sparse_ffn =
         pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
-    if sparse_ffn {
-        // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
-        gen.run_ffn_block(orch, &pack, &xn)?;
+    let has_ov = ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false);
+    if sparse_ffn || has_ov {
+        // FFN disperso embebido (D16) u override de evolución: CSR.
+        gen.run_ffn_block(orch, &pack, &xn, ov)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
