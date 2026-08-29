@@ -20,7 +20,7 @@ use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
-use crate::infer::GenerateStats;
+use crate::infer::{FfnOverride, GenerateStats};
 use crate::orchestrator::EngineOrchestrator;
 
 /// Raw host-slot pointer for prefetch threads (other ping-pong slot only).
@@ -1532,6 +1532,137 @@ impl StreamingGenerator {
         token: u32,
     ) -> Result<Vec<f32>, StreamInferError> {
         self.forward_inner(orch, token, None)
+    }
+
+    /// Forward **batcheado** de N candidatos (Fase 2, path Dense — llama/ALIA):
+    /// procesa los N candidatos en un único paso por capa con override de FFN por
+    /// (candidato, capa) construido al vuelo por `get_override(cand, layer)` y
+    /// liberado al terminar la capa (RAM acotada). El modelo (pesos de capa) se
+    /// carga UNA vez por token.
+    ///
+    /// `pos` y `kv` (por candidato, por capa) son **persistentes**: en
+    /// teacher-forcing el token `t` debe atender a su historia (KV acumulada).
+    /// El llamador crea el KV una vez y avanza `pos` por token.
+    ///
+    /// Híbridos/gemma/MoE despachan por `ModelKind` (ver `decode_step`); la
+    /// extensión batcheada para cada familia vive en su módulo.
+    pub fn forward_batched(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        pos: usize,
+        kv: &mut [Vec<LayerKvCache>],
+        n_candidates: usize,
+        mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+    ) -> Result<Vec<Vec<f32>>, StreamInferError> {
+        let h = self.config.hidden_size;
+        let n_layers = self.config.num_layers;
+        let eps = self.config.rms_norm_eps;
+        let q_dim = self.attn_cfg.hidden_size();
+        let kv_dim = self.attn_cfg.kv_dim();
+        let ff = self.config.intermediate_size;
+        if kv.len() < n_candidates {
+            return Err(StreamInferError::Msg(format!(
+                "forward_batched: kv tiene {} filas, se necesitan {n_candidates}",
+                kv.len()
+            )));
+        }
+
+        // Activaciones por candidato (mismo token).
+        let mut x: Vec<Vec<f32>> = Vec::with_capacity(n_candidates);
+        for _ in 0..n_candidates {
+            let mut emb = vec![0.0f32; h];
+            self.embed_row("token_embd.weight", token, h, &mut emb)?;
+            x.push(emb);
+        }
+
+        for layer_idx in 0..n_layers {
+            let pack = self.load_pack(layer_idx)?;
+            for c in 0..n_candidates {
+                let ov = get_override(c, layer_idx);
+
+                // Atención (CPU) — como forward_inner.
+                let mut xn = x[c].clone();
+                rms_norm(&mut xn, &self.layer_norms[layer_idx].attn_norm, eps);
+                let mut q = vec![0.0f32; q_dim];
+                let mut k = vec![0.0f32; kv_dim];
+                let mut v = vec![0.0f32; kv_dim];
+                pack.wq.gemv(&xn, &mut q)?;
+                pack.wk.gemv(&xn, &mut k)?;
+                pack.wv.gemv(&xn, &mut v)?;
+                let mut attn_out = vec![0.0f32; q_dim];
+                attention_decode_step(
+                    &self.attn_cfg,
+                    &mut kv[c][layer_idx],
+                    &mut q,
+                    &mut k,
+                    &v,
+                    pos,
+                    &mut attn_out,
+                );
+                if let Some(ref gate_w) = pack.attn_gate {
+                    let mut gate = vec![0.0f32; q_dim];
+                    gate_w.gemv(&xn, &mut gate)?;
+                    for i in 0..q_dim {
+                        attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+                    }
+                }
+                let mut attn_proj = vec![0.0f32; h];
+                pack.wo.gemv(&attn_out, &mut attn_proj)?;
+                for i in 0..h {
+                    x[c][i] += attn_proj[i];
+                }
+
+                // FFN: override (Vía B) > CSR embebido > denso.
+                let mut xn = x[c].clone();
+                rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
+                let gate_csr = ov.gate.as_ref().or(pack.gate_csr.as_ref());
+                let mut gate = vec![0.0f32; ff];
+                let mut up = vec![0.0f32; ff];
+                let mut down = vec![0.0f32; h];
+                if let Some(cs) = gate_csr {
+                    gate.copy_from_slice(&self.spmm_csr(orch, &xn, cs)?);
+                } else {
+                    orch.execute_quant_gemv(&pack.gate, &xn, &mut gate)?;
+                }
+                let up_csr = ov.up.as_ref().or(pack.up_csr.as_ref());
+                if let Some(cs) = up_csr {
+                    up.copy_from_slice(&self.spmm_csr(orch, &xn, cs)?);
+                } else {
+                    orch.execute_quant_gemv(&pack.up, &xn, &mut up)?;
+                }
+                for i in 0..ff {
+                    let g = gate[i];
+                    gate[i] = (g / (1.0 + (-g).exp())) * up[i];
+                }
+                let down_csr = ov.down.as_ref().or(pack.down_csr.as_ref());
+                if let Some(cs) = down_csr {
+                    down.copy_from_slice(&self.spmm_csr(orch, &gate, cs)?);
+                } else {
+                    orch.execute_quant_gemv(&pack.down, &gate, &mut down)?;
+                }
+                for i in 0..h {
+                    x[c][i] += down[i];
+                }
+                // `ov` (y sus CSR) se libera aquí.
+            }
+        }
+
+        // lm_head por candidato.
+        let vocab = self.config.vocab_size;
+        let ow = self
+            .catalog
+            .load_quant_matrix("output.weight")
+            .or_else(|_| self.catalog.load_quant_matrix("token_embd.weight"))?;
+        let mut out = Vec::with_capacity(n_candidates);
+        for c in 0..n_candidates {
+            let mut xn = x[c].clone();
+            rms_norm(&mut xn, &self.output_norm, eps);
+            let mut logits = vec![0.0f32; vocab];
+            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            out.push(logits);
+        }
+        Ok(out)
     }
 }
 
