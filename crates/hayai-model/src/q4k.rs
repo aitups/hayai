@@ -43,6 +43,123 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Convierte `f32` a bits `f16` (IEEE 754 half).
+pub fn f32_to_f16(value: f32) -> u16 {
+    let f = value.to_bits();
+    let sign = (f >> 16) & 0x8000;
+    let mut exponent = ((f >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = f & 0x7fffff;
+    if exponent <= 0 {
+        if exponent < -10 {
+            return sign as u16;
+        }
+        // subnormal f16
+        let m = mantissa | 0x800000;
+        let shift = (14 - exponent) as u32;
+        let mut m = m >> shift;
+        if mantissa & (1 << (shift.saturating_sub(1))) != 0 {
+            m += 1;
+        }
+        return (sign as u16) | m as u16;
+    }
+    if exponent >= 31 {
+        return (sign as u16) | 0x7c00; // inf/overflow
+    }
+    let mut m = mantissa >> 13;
+    if mantissa & 0x1000 != 0 {
+        m += 1;
+    }
+    if m & 0x400 == 0x400 {
+        m = 0;
+        exponent += 1;
+    }
+    if exponent >= 31 {
+        return (sign as u16) | 0x7c00;
+    }
+    (sign as u16) | ((exponent as u16) << 10) | m as u16
+}
+
+/// Cuantiza un bloque contiguo de `n` f32 a Q4_K (n % 256 == 0). Espejo de la
+/// referencia `quantize_row_q4_K_reference` de ggml: por sub-bloque de 32 se
+/// deriva `scale=(max-min)/15` y `min`; el bloque empaqueta `d=max_scale/63` y
+/// `dmin=max_min/63` (f16) más escalas de 6 bits y nibbles de 4 bits.
+pub fn quantize_q4_k(x: &[f32], n: usize) -> Result<Vec<u8>, GgufError> {
+    if n % QK_K != 0 {
+        return Err(GgufError::Truncated("q4_k n not multiple of 256"));
+    }
+    let blocks = n / QK_K;
+    let mut out = vec![0u8; blocks * Q4_K_BLOCK_BYTES];
+    for b in 0..blocks {
+        quantize_q4_k_block(&x[b * QK_K..b * QK_K + QK_K], &mut out[b * Q4_K_BLOCK_BYTES..]);
+    }
+    Ok(out)
+}
+
+fn quantize_q4_k_block(x: &[f32], out: &mut [u8]) {
+    let mut scales = [0.0f32; 8];
+    let mut mins = [0.0f32; 8];
+    let mut l = [0u8; QK_K];
+    for j in 0..8 {
+        let sub = &x[j * 32..j * 32 + 32];
+        let mut mn = f32::INFINITY;
+        let mut mx = f32::NEG_INFINITY;
+        for &v in sub {
+            mn = mn.min(v);
+            mx = mx.max(v);
+        }
+        scales[j] = (mx - mn) / 15.0;
+        mins[j] = mn;
+    }
+    let max_scale = scales.iter().cloned().fold(0.0f32, f32::max).max(1e-30);
+    let max_min = mins.iter().map(|m| m.abs()).fold(0.0f32, f32::max).max(1e-30);
+    let d = max_scale / 63.0;
+    let dmin = max_min / 63.0;
+    let mut ls = [0u8; 8];
+    let mut lm = [0u8; 8];
+    for j in 0..8 {
+        ls[j] = (scales[j] * 63.0 / max_scale).round().clamp(0.0, 63.0) as u8;
+        // El dequant resta `dmin*m`; para que `-dmin*m ≈ mins[j]` se usa el
+        // offset positivo: `m = -mins[j] / dmin`.
+        lm[j] = (-mins[j] * 63.0 / max_min).round().clamp(0.0, 63.0) as u8;
+    }
+    for j in 0..8 {
+        let d1 = d * ls[j] as f32;
+        if d1 == 0.0 {
+            for ii in 0..32 {
+                l[j * 32 + ii] = 0;
+            }
+            continue;
+        }
+        let dm = dmin * lm[j] as f32;
+        for ii in 0..32 {
+            let q = ((x[j * 32 + ii] + dm) / d1).round().clamp(0.0, 15.0) as u8;
+            l[j * 32 + ii] = q;
+        }
+    }
+    out[0..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+    out[2..4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+    let mut scales_pack = [0u8; 12];
+    for j in 0..8 {
+        let sc = ls[j];
+        let m = lm[j];
+        if j < 4 {
+            scales_pack[j] = sc;
+            scales_pack[j + 4] = m;
+        } else {
+            scales_pack[j + 4] = (sc & 0xF) | ((m & 0xF) << 4);
+            scales_pack[j - 4] |= (sc >> 4) << 6;
+            scales_pack[j] |= (m >> 4) << 6;
+        }
+    }
+    out[4..16].copy_from_slice(&scales_pack);
+    for j in (0..QK_K).step_by(64) {
+        let base = j / 64 * 32;
+        for ii in 0..32 {
+            out[16 + base + ii] = l[j + ii] | (l[j + ii + 32] << 4);
+        }
+    }
+}
+
 /// Dequantize a contiguous Q4_K blob of `n` elements (n % 256 == 0) into FP32.
 pub fn dequant_q4_k(bytes: &[u8], n: usize) -> Result<Vec<f32>, GgufError> {
     if n % QK_K != 0 {
@@ -186,5 +303,50 @@ mod tests {
         let mut y = vec![0.0f32; QK_K];
         dequant_q4_k_block(&block, &mut y);
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn f16_roundtrip() {
+        for v in [0.0f32, 1.0, -1.0, 0.5, 123.45, 0.0001, -9876.5, 3.14159] {
+            let h = f32_to_f16(v);
+            let back = crate::gguf::f16_to_f32(h);
+            assert!(
+                (v - back).abs() < 0.01 * v.abs().max(1e-3),
+                "{v} -> {back}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4k_quantize_roundtrip_error_small() {
+        let mut x = vec![0.0f32; 1024];
+        for (i, v) in x.iter_mut().enumerate() {
+            let b = i / 256;
+            let j = i % 256;
+            *v = match b {
+                0 => (j as f32 - 128.0) * 0.01,
+                1 => ((j % 17) as f32) * 0.5 - 4.0,
+                2 => (j as f32).sin() * 3.0,
+                _ => {
+                    if j % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
+            };
+        }
+        let packed = quantize_q4_k(&x, x.len()).unwrap();
+        let back = dequant_q4_k(&packed, x.len()).unwrap();
+        // Error Q4_K es absoluto (~media unidad de paso); se mide relativo al
+        // rango del bloque, no relativo al valor (que explota cerca de 0).
+        let mut max_abs = 0.0f32;
+        let xmax = x.iter().cloned().fold(0.0f32, f32::max);
+        let xmin = x.iter().cloned().fold(0.0f32, f32::min);
+        for (a, b) in x.iter().zip(back.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        let range_rel = max_abs / (xmax - xmin).max(1e-6);
+        assert!(range_rel < 0.2, "range_rel_err={range_rel} max_abs={max_abs}");
     }
 }
