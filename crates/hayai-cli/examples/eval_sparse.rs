@@ -163,12 +163,314 @@ fn layer_coord(layer: usize, n_layers: usize) -> f32 {
     }
 }
 
+/// Guarda los logits del profesor en formato binario: `[u32 n_pos][u32 vocab]` +
+/// `n_pos*vocab` f32 (LE). Invariante a la generación (misma calibración).
+fn save_teacher_cache(path: &std::path::Path, logits: &[Vec<f32>]) -> std::io::Result<()> {
+    let n_pos = logits.len();
+    let vocab = if n_pos > 0 { logits[0].len() } else { 0 };
+    let mut buf = Vec::with_capacity(8 + n_pos * vocab * 4);
+    buf.extend_from_slice(&(n_pos as u32).to_le_bytes());
+    buf.extend_from_slice(&(vocab as u32).to_le_bytes());
+    for v in logits {
+        for x in v {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    std::fs::write(path, buf)
+}
+
+fn load_teacher_cache(path: &std::path::Path) -> std::io::Result<Vec<Vec<f32>>> {
+    let raw = std::fs::read(path)?;
+    if raw.len() < 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "teacher-cache: fichero demasiado corto",
+        ));
+    }
+    let n_pos = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    let vocab = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    if raw.len() != 8 + n_pos * vocab * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "teacher-cache: tamaño incoherente",
+        ));
+    }
+    let mut out = Vec::with_capacity(n_pos);
+    let mut off = 8usize;
+    for _ in 0..n_pos {
+        let mut v = Vec::with_capacity(vocab);
+        for _ in 0..vocab {
+            v.push(f32::from_le_bytes([
+                raw[off], raw[off + 1], raw[off + 2], raw[off + 3],
+            ]));
+            off += 4;
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Evalúa la KL de **toda la población** en una sola carga de modelo (Fase 2):
+/// decodifica la topología CPPN de N genomas (in-memory, rayon), precomputa los
+/// logits del profesor UNA vez (cache opcional en disco) y compara cada
+/// candidato contra ellos. Devuelve `(kl_global, d_arch_global)` por candidato.
+#[allow(clippy::too_many_arguments)]
+fn run_population(
+    orch: &mut EngineOrchestrator,
+    weights: &LlamaWeights,
+    tokenizer: &Tokenizer,
+    sampler: &SamplerConfig,
+    tokens: &[u32],
+    n_pos: usize,
+    genomes: &[Vec<f32>],
+    tau: f32,
+    teacher_cache: Option<&std::path::Path>,
+) -> Result<Vec<(f32, f32)>, Box<dyn std::error::Error>> {
+    let n_layers = weights.config.num_layers;
+    let n_cand = genomes.len();
+    let mut overrides: Vec<Vec<FfnOverride>> = vec![vec![FfnOverride::default(); n_layers]; n_cand];
+    let mut d_arch_num = vec![0.0f32; n_cand];
+    let mut d_arch_den = 0.0f32;
+
+    // 1) Decodifica la topología CPPN de cada candidato (el dequant del profesor
+    //    es compartido: una sola lectura por (capa, bloque)).
+    for layer_idx in 0..n_layers {
+        let y_layer = layer_coord(layer_idx, n_layers);
+        let trio: [(&str, &hayai_model::QuantMatrix); 3] = [
+            ("ffn_gate", &weights.layers[layer_idx].gate),
+            ("ffn_up", &weights.layers[layer_idx].up),
+            ("ffn_down", &weights.layers[layer_idx].down),
+        ];
+        for (block, m) in trio {
+            let params = (m.ncols * m.nrows) as f32;
+            d_arch_den += params;
+            let name = format!("blk.{layer_idx}.{block}.weight");
+            let w0 = weights.gguf.dequant_f32(&name)?;
+            for (c, genome) in genomes.iter().enumerate() {
+                let active = cppn_layer_active(genome, m.ncols, m.nrows, tau, y_layer);
+                let sp = 1.0 - active.iter().filter(|a| **a).count() as f32 / params;
+                d_arch_num[c] += sp * params;
+                let csr = topology_prune_csr(&w0, m.ncols, m.nrows, &active);
+                match block {
+                    "ffn_gate" => overrides[c][layer_idx].gate = Some(csr),
+                    "ffn_up" => overrides[c][layer_idx].up = Some(csr),
+                    _ => overrides[c][layer_idx].down = Some(csr),
+                }
+            }
+        }
+    }
+
+    // 2) Logits del profesor: una sola pasada (cache opcional en disco).
+    let teacher: Vec<Vec<f32>> = if let Some(p) = teacher_cache {
+        if p.exists() {
+            eprintln!("[eval_sparse] teacher-cache: {p:?} (cargado)");
+            load_teacher_cache(p)?
+        } else {
+            eprintln!("[eval_sparse] computando logits del profesor…");
+            let mut gen_t =
+                Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+            let mut logits = Vec::with_capacity(n_pos);
+            for &tok in tokens.iter().take(n_pos) {
+                logits.push(gen_t.forward(orch, tok)?);
+            }
+            save_teacher_cache(p, &logits)?;
+            logits
+        }
+    } else {
+        let mut gen_t =
+            Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+        let mut logits = Vec::with_capacity(n_pos);
+        for &tok in tokens.iter().take(n_pos) {
+            logits.push(gen_t.forward(orch, tok)?);
+        }
+        logits
+    };
+
+    // 3) KL por candidato contra el profesor cacheado.
+    let mut out = Vec::with_capacity(n_cand);
+    for (c, _genome) in genomes.iter().enumerate() {
+        let mut gen_cand =
+            Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+        let mut kl_sum = 0.0f32;
+        for (t, &tok) in tokens.iter().take(n_pos).enumerate() {
+            let lc = gen_cand.forward_with_override(orch, tok, &overrides[c])?;
+            kl_sum += softmax_kl(&teacher[t], &lc);
+        }
+        let kl_global = kl_sum / n_pos as f32;
+        let d_arch = d_arch_num[c] / d_arch_den;
+        out.push((kl_global, d_arch));
+    }
+    Ok(out)
+}
+
+
+/// CSR desde un bit-tensor de adyacencia pre-decodificado (decode-pop de saor).
+/// `conn = i*d_out+j` (LSB-first); filas = salidas `j`; pesos del profesor en las
+/// posiciones activas (j-mayor). Espejo de `sparse_dag_to_csr`.
+fn csr_from_adjacency(w0: &[f32], d_in: usize, d_out: usize, adj: &[u8]) -> CsrSparse {
+    let mut row_ptr = vec![0i32; d_out + 1];
+    let mut col_idx = Vec::new();
+    let mut vals = Vec::new();
+    for j in 0..d_out {
+        for i in 0..d_in {
+            let conn = i * d_out + j;
+            if adj[conn >> 3] & (1 << (conn & 7)) != 0 {
+                col_idx.push(i as i32);
+                vals.push(w0[j * d_in + i]);
+            }
+        }
+        row_ptr[j + 1] = col_idx.len() as i32;
+    }
+    CsrSparse {
+        row_ptr,
+        col_idx,
+        vals,
+        d_in,
+        d_out,
+    }
+}
+
+/// KL de N candidatos contra los logits del profesor (precomputados UNA vez por
+/// ejecución, con cache opcional en disco). Compartido por `--genomes-dir` y
+/// `--adj-dir`.
+#[allow(clippy::too_many_arguments)]
+fn kl_against_teacher(
+    orch: &mut EngineOrchestrator,
+    weights: &LlamaWeights,
+    tokenizer: &Tokenizer,
+    sampler: &SamplerConfig,
+    tokens: &[u32],
+    n_pos: usize,
+    overrides: &[Vec<FfnOverride>],
+    teacher_cache: Option<&std::path::Path>,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let teacher: Vec<Vec<f32>> = if let Some(p) = teacher_cache {
+        if p.exists() {
+            eprintln!("[eval_sparse] teacher-cache: {p:?} (cargado)");
+            load_teacher_cache(p)?
+        } else {
+            eprintln!("[eval_sparse] computando logits del profesor…");
+            let mut gen_t =
+                Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+            let mut logits = Vec::with_capacity(n_pos);
+            for &tok in tokens.iter().take(n_pos) {
+                logits.push(gen_t.forward(orch, tok)?);
+            }
+            save_teacher_cache(p, &logits)?;
+            logits
+        }
+    } else {
+        let mut gen_t =
+            Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+        let mut logits = Vec::with_capacity(n_pos);
+        for &tok in tokens.iter().take(n_pos) {
+            logits.push(gen_t.forward(orch, tok)?);
+        }
+        logits
+    };
+
+    let mut kls = Vec::with_capacity(overrides.len());
+    for ov in overrides {
+        let mut gen_cand =
+            Generator::new(weights.clone(), tokenizer.clone(), 4, 128, sampler.clone(), 42);
+        let mut kl_sum = 0.0f32;
+        for (t, &tok) in tokens.iter().take(n_pos).enumerate() {
+            let lc = gen_cand.forward_with_override(orch, tok, ov)?;
+            kl_sum += softmax_kl(&teacher[t], &lc);
+        }
+        kls.push(kl_sum / n_pos as f32);
+    }
+    Ok(kls)
+}
+
+/// Modo `--adj-dir` (Fase 2, decode-pop de saor): consume las adyacencias ya
+/// decodificadas en GPU y construye los CSR con los pesos del profesor. Sin
+/// decode CPU (inviable en 27B/40B) ni re-embed por candidato.
+#[allow(clippy::too_many_arguments)]
+fn run_population_adj(
+    orch: &mut EngineOrchestrator,
+    weights: &LlamaWeights,
+    tokenizer: &Tokenizer,
+    sampler: &SamplerConfig,
+    tokens: &[u32],
+    n_pos: usize,
+    adj_dir: &std::path::Path,
+    teacher_cache: Option<&std::path::Path>,
+) -> Result<Vec<(f32, f32)>, Box<dyn std::error::Error>> {
+    let meta_raw = std::fs::read_to_string(adj_dir.join("meta.json"))?;
+    let meta: serde_json::Value = serde_json::from_str(&meta_raw)?;
+    let n_layers = meta["n_layers"].as_u64().unwrap_or(0) as usize;
+    let n_cand = meta["n_candidates"].as_u64().unwrap_or(0) as usize;
+    let blocks: Vec<String> = meta["blocks"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if n_layers == 0 || n_cand == 0 || blocks.is_empty() {
+        return Err("adj-dir: meta.json incompleto (decode-pop de saor)".into());
+    }
+
+    let mut overrides: Vec<Vec<FfnOverride>> = vec![vec![FfnOverride::default(); n_layers]; n_cand];
+    let mut d_arch_num = vec![0.0f32; n_cand];
+    let mut d_arch_den = 0.0f32;
+    for layer_idx in 0..n_layers {
+        let trio: [(&str, &hayai_model::QuantMatrix); 3] = [
+            ("ffn_gate", &weights.layers[layer_idx].gate),
+            ("ffn_up", &weights.layers[layer_idx].up),
+            ("ffn_down", &weights.layers[layer_idx].down),
+        ];
+        for (block, m) in trio {
+            if !blocks.iter().any(|b| b == block) {
+                continue;
+            }
+            let params = (m.ncols * m.nrows) as f32;
+            d_arch_den += params;
+            let name = format!("blk.{layer_idx}.{block}.weight");
+            let w0 = weights.gguf.dequant_f32(&name)?;
+            for c in 0..n_cand {
+                let adj_path = adj_dir.join(format!("c{c:03}.l{layer_idx:02}.{block}.bin"));
+                let adj = std::fs::read(&adj_path)?;
+                let active: usize = adj.iter().map(|b| b.count_ones() as usize).sum();
+                d_arch_num[c] += (1.0 - active as f32 / params) * params;
+                let csr = csr_from_adjacency(&w0, m.ncols, m.nrows, &adj);
+                match block {
+                    "ffn_gate" => overrides[c][layer_idx].gate = Some(csr),
+                    "ffn_up" => overrides[c][layer_idx].up = Some(csr),
+                    _ => overrides[c][layer_idx].down = Some(csr),
+                }
+            }
+        }
+    }
+    let kls = kl_against_teacher(
+        orch,
+        weights,
+        tokenizer,
+        sampler,
+        tokens,
+        n_pos,
+        &overrides,
+        teacher_cache,
+    )?;
+    Ok(kls
+        .iter()
+        .enumerate()
+        .map(|(c, &kl)| (kl, d_arch_num[c] / d_arch_den))
+        .collect())
+}
+
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut prompts: Option<PathBuf> = None;
     let mut sparsities: Option<PathBuf> = None;
     let mut genome: Option<PathBuf> = None;
+    let mut genomes_dir: Option<PathBuf> = None;
+    let mut adj_dir: Option<PathBuf> = None;
+    let mut teacher_cache: Option<PathBuf> = None;
     let mut tau = 0.42f32;
     let mut device = "cpu".to_string();
     let mut n_positions = 128usize;
@@ -190,6 +492,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--genome" => {
                 i += 1;
                 genome = args.get(i).map(PathBuf::from);
+            }
+            "--genomes-dir" => {
+                i += 1;
+                genomes_dir = args.get(i).map(PathBuf::from);
+            }
+            "--adj-dir" => {
+                i += 1;
+                adj_dir = args.get(i).map(PathBuf::from);
+            }
+            "--teacher-cache" => {
+                i += 1;
+                teacher_cache = args.get(i).map(PathBuf::from);
             }
             "--tau" => {
                 i += 1;
@@ -240,7 +554,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sp_gate: Vec<f32>;
     let sp_up: Vec<f32>;
     let sp_down: Vec<f32>;
-    if genome_bin.is_some() {
+    if genome_bin.is_some() || genomes_dir.is_some() || adj_dir.is_some() {
         sp_gate = Vec::new();
         sp_up = Vec::new();
         sp_down = Vec::new();
@@ -290,7 +604,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokens = tokenizer.encode(&corpus, false);
     let n_pos = tokens.len().min(n_positions);
 
-    // Overrides: poda por magnitud del profesor por bloque y capa (sp>0), o
+    // ─── Modo población (Fase 2): N genomas en una carga de modelo + profesor
+    //     cacheado. `--genomes-dir <dir>` = directorio con N ficheros `.bin`
+    //     (466 f32 cada uno). Devuelve un array JSON con la KL de cada candidato.
+    if let Some(dir) = &genomes_dir {
+        let mut files: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
+            .collect();
+        files.sort_by_key(|e| e.file_name());
+        let mut genomes: Vec<Vec<f32>> = Vec::new();
+        const GENOME_BYTES: usize = 466 * 4;
+        for e in files {
+            let raw = std::fs::read(e.path())?;
+            if raw.len() != GENOME_BYTES {
+                eprintln!(
+                    "[eval_sparse] ignorando {} ({} B ≠ genoma {GENOME_BYTES} B)",
+                    e.path().display(),
+                    raw.len()
+                );
+                continue;
+            }
+            let mut g = Vec::with_capacity(466);
+            for c in raw.chunks_exact(4) {
+                g.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            genomes.push(g);
+        }
+        if genomes.is_empty() {
+            return Err(format!("--genomes-dir {dir:?} sin ficheros .bin").into());
+        }
+        let results = run_population(
+            &mut orch,
+            &weights,
+            &tokenizer,
+            &sampler,
+            &tokens,
+            n_pos,
+            &genomes,
+            tau,
+            teacher_cache.as_deref(),
+        )?;
+        let parts: Vec<String> = results
+            .iter()
+            .map(|(kl, da)| {
+                format!("{{\"kl_global\":{kl:.6},\"d_arch_global\":{da:.4},\"n_positions\":{n_pos}}}")
+            })
+            .collect();
+        println!("[{}]", parts.join(","));
+        return Ok(());
+    }
+
+    // ─── Modo `--adj-dir` (Fase 2): adyacencias ya decodificadas en GPU por
+    //     `saor-engine decode-pop`. Sin decode CPU (inviable en 27B/40B).
+    if let Some(dir) = &adj_dir {
+        let results = run_population_adj(
+            &mut orch,
+            &weights,
+            &tokenizer,
+            &sampler,
+            &tokens,
+            n_pos,
+            dir,
+            teacher_cache.as_deref(),
+        )?;
+        let parts: Vec<String> = results
+            .iter()
+            .map(|(kl, da)| {
+                format!("{{\"kl_global\":{kl:.6},\"d_arch_global\":{da:.4},\"n_positions\":{n_pos}}}")
+            })
+            .collect();
+        println!("[{}]", parts.join(","));
+        return Ok(());
+    }
+
     // topología CPPN global (Vía B, `--genome`).
     let mut overrides: Vec<FfnOverride> = vec![FfnOverride::default(); n_layers];
     // D_arch global: esparsidad ponderada por TODOS los parámetros FFN del modelo
