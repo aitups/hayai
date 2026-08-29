@@ -105,6 +105,127 @@ impl Generator {
         self.forward_inner(orch, token, None, override_ffn)
     }
 
+    /// Igual que [`Self::forward`], pero el override de cada capa se construye
+    /// **al vuelo** mediante `get_override(layer)` y se libera al terminar la
+    /// capa. Permite evaluar modelos grandes (27B/40B) sin retener los CSR de
+    /// todas las capas en RAM (Fase 2: `eval_pop --adj-dir`).
+    pub fn forward_with_layer_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        mut get_override: impl FnMut(usize) -> FfnOverride,
+    ) -> Result<Vec<f32>, InferError> {
+        let h = self.weights.config.hidden_size;
+        let mut x = self.weights.embed(token)?;
+        let pos = self.position;
+
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let ov = get_override(layer_idx);
+
+            let mut xn = x.clone();
+            rms_norm(&mut xn, &layer.attn_norm, self.weights.config.rms_norm_eps);
+
+            let q_dim = self.attn_cfg.hidden_size();
+            let kv_dim = self.attn_cfg.kv_dim();
+            let mut q = vec![0.0f32; q_dim];
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
+            layer.wq.gemv(&xn, &mut q)?;
+            layer.wk.gemv(&xn, &mut k)?;
+            layer.wv.gemv(&xn, &mut v)?;
+
+            let mut attn_out_heads = vec![0.0f32; q_dim];
+            attention_decode_step(
+                &self.attn_cfg,
+                &mut self.kv[layer_idx],
+                &mut q,
+                &mut k,
+                &v,
+                pos,
+                &mut attn_out_heads,
+            );
+
+            let mut attn_proj = vec![0.0f32; h];
+            layer.wo.gemv(&attn_out_heads, &mut attn_proj)?;
+            for i in 0..h {
+                x[i] += attn_proj[i];
+            }
+
+            let mut xn = x.clone();
+            rms_norm(&mut xn, &layer.ffn_norm, self.weights.config.rms_norm_eps);
+            let ff = self.weights.config.intermediate_size;
+            let mut gate = vec![0.0f32; ff];
+            let mut up = vec![0.0f32; ff];
+            let mut down = vec![0.0f32; h];
+
+            let gate_csr = ov.gate.as_ref().or(layer.gate_csr.as_ref());
+            if let Some(c) = gate_csr {
+                gate.copy_from_slice(&spmm_csr_cpu(
+                    &xn,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.gate, &xn, &mut gate)?;
+            }
+            let up_csr = ov.up.as_ref().or(layer.up_csr.as_ref());
+            if let Some(c) = up_csr {
+                up.copy_from_slice(&spmm_csr_cpu(
+                    &xn,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.up, &xn, &mut up)?;
+            }
+            for i in 0..ff {
+                let g = gate[i];
+                gate[i] = (g / (1.0 + (-g).exp())) * up[i];
+            }
+            let down_csr = ov.down.as_ref().or(layer.down_csr.as_ref());
+            if let Some(c) = down_csr {
+                down.copy_from_slice(&spmm_csr_cpu(
+                    &gate,
+                    &c.row_ptr,
+                    &c.col_idx,
+                    &c.vals,
+                    c.d_in,
+                    c.d_out,
+                ));
+            } else {
+                orch.execute_quant_gemv(&layer.down, &gate, &mut down)?;
+            }
+            for i in 0..h {
+                x[i] += down[i];
+            }
+            // `ov` (y sus CSR) se libera aquí — RAM acotada a una capa.
+        }
+
+        let mut xn = x;
+        rms_norm(
+            &mut xn,
+            &self.weights.output_norm,
+            self.weights.config.rms_norm_eps,
+        );
+
+        let vocab = self.weights.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        if let Some(ref ow) = self.weights.output {
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+        } else {
+            orch.execute_quant_gemv(&self.weights.tok_embd, &xn, &mut logits)?;
+        }
+
+        self.position += 1;
+        Ok(logits)
+    }
+
     fn forward_inner(
         &mut self,
         orch: &mut EngineOrchestrator,

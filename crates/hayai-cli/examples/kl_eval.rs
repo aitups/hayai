@@ -47,6 +47,50 @@ fn popcount(b: u8) -> u32 {
     b.count_ones()
 }
 
+/// Cache binario de los logits del profesor: `[u32 n_pos][u32 vocab]` + f32 LE.
+fn save_teacher_cache(path: &std::path::Path, logits: &[Vec<f32>]) -> std::io::Result<()> {
+    let n_pos = logits.len();
+    let vocab = if n_pos > 0 { logits[0].len() } else { 0 };
+    let mut buf = Vec::with_capacity(8 + n_pos * vocab * 4);
+    buf.extend_from_slice(&(n_pos as u32).to_le_bytes());
+    buf.extend_from_slice(&(vocab as u32).to_le_bytes());
+    for v in logits {
+        for x in v {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    std::fs::write(path, buf)
+}
+
+fn load_teacher_cache(path: &std::path::Path) -> std::io::Result<Vec<Vec<f32>>> {
+    let raw = std::fs::read(path)?;
+    if raw.len() < 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "teacher-cache: fichero demasiado corto",
+        ));
+    }
+    let n_pos = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    let vocab = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+    if raw.len() != 8 + n_pos * vocab * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "teacher-cache: tamaño incoherente",
+        ));
+    }
+    let mut out = Vec::with_capacity(n_pos);
+    let mut off = 8usize;
+    for _ in 0..n_pos {
+        let mut v = Vec::with_capacity(vocab);
+        for _ in 0..vocab {
+            v.push(f32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]));
+            off += 4;
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
 /// D_arch global estimado desde los bloques dispersos del modelo embebido:
 /// params FFN totales (denominador completo) vs. activos por bloque disperso.
 ///
@@ -110,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prompts: Option<PathBuf> = None;
     let mut device = "auto".to_string();
     let mut n_positions = 128usize;
+    let mut teacher_cache: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -124,6 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--prompts" => {
                 i += 1;
                 prompts = args.get(i).map(PathBuf::from);
+            }
+            "--teacher-cache" => {
+                i += 1;
+                teacher_cache = args.get(i).map(PathBuf::from);
             }
             "--device" => {
                 i += 1;
@@ -177,10 +226,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Secuencial (un scratch SVM a la vez): el forward de 40B en GPU no deja
     // espacio en VRAM para dos generadores simultáneos (RTX 4050: 6 GB).
     let mut so = gen_o.prepare_session(&mut orch)?;
-    let mut orig_logits: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
-    for &tok in tokens.iter().take(n_pos) {
-        orig_logits.push(gen_o.decode_step(&mut orch, tok, &mut so)?);
-    }
+    let orig_logits: Vec<Vec<f32>> = if let Some(cache) = &teacher_cache {
+        if cache.exists() {
+            eprintln!("[kl_eval] teacher-cache: {cache:?} (cargado)");
+            load_teacher_cache(cache)?
+        } else {
+            eprintln!("[kl_eval] computando logits del profesor…");
+            let mut logits: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
+            for &tok in tokens.iter().take(n_pos) {
+                logits.push(gen_o.decode_step(&mut orch, tok, &mut so)?);
+            }
+            save_teacher_cache(cache, &logits)?;
+            logits
+        }
+    } else {
+        let mut logits: Vec<Vec<f32>> = Vec::with_capacity(n_pos);
+        for &tok in tokens.iter().take(n_pos) {
+            logits.push(gen_o.decode_step(&mut orch, tok, &mut so)?);
+        }
+        logits
+    };
     drop(so);
 
     let mut ss = gen_s.prepare_session(&mut orch)?;
