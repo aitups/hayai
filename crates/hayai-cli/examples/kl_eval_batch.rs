@@ -264,6 +264,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .collect();
+    // Atajo exacto: si NINGÚN (cand, capa) tiene poda, todos los candidatos son
+    // idénticos al profesor → KL = 0 por definición (sin forward).
+    if sparse.iter().flatten().all(|&s| !s) {
+        let parts: Vec<String> = (0..n_cand)
+            .map(|c| {
+                let da = d_arch_num[c] / d_arch_den;
+                format!("{{\"kl_global\":0.000000,\"d_arch_global\":{da:.4},\"n_positions\":{n_pos}}}")
+            })
+            .collect();
+        println!("[{}]", parts.join(","));
+        return Ok(());
+    }
     let mut kl_sum = vec![0.0f32; n_cand];
     for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
         let lg = gen.forward_batched_any(
