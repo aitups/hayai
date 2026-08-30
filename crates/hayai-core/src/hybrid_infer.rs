@@ -11,6 +11,7 @@ use crate::stream_infer::{
     ffn_begin_gate_up_scratch, ffn_finish_scratch, StreamInferError, StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step, rms_norm, LayerKvCache};
+use hayai_model::{GgmlType, QuantMatrix};
 use hayai_opencl::StreamingScratch;
 use std::sync::Arc;
 use std::time::Instant;
@@ -920,22 +921,52 @@ pub(crate) fn forward_batched_hybrid_seq(
         if kind == HybridLayerKind::NextN {
             continue;
         }
-        // Dequant compartido por capa (Fase 2, C4): evita dequantizar por (cand, capa).
-        let gate_w = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.ffn_gate.weight"))
-            .ok()
-            .map(Arc::new);
-        let up_w = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.ffn_up.weight"))
-            .ok()
-            .map(Arc::new);
-        let down_w = gen
-            .catalog
-            .dequant_f32(&format!("blk.{layer}.ffn_down.weight"))
-            .ok()
-            .map(Arc::new);
+        // Pesos compartidos por capa (Fase 2, C1/C4): si hay GPU y Q4_K, el kernel
+        // dequantiza en GPU (sin 23 GB F32/gen); si no, dequant F32 una vez por capa.
+        let ffn = gen.catalog.load_ffn_matrices(layer)?;
+        let has_gpu = orch.opencl_engine().is_some();
+        // Q4-K en-kernel es opt-in (HAYAI_SPMM_Q4=1); F32 compartido es el default.
+        let can_q4 = std::env::var("HAYAI_SPMM_Q4").ok().as_deref() == Some("1")
+            && ffn.0.ggml_type == GgmlType::Q4_K;
+        let gate_w = if has_gpu && can_q4 {
+            None
+        } else {
+            gen.catalog
+                .dequant_f32(&format!("blk.{layer}.ffn_gate.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let up_w = if has_gpu && can_q4 {
+            None
+        } else {
+            gen.catalog
+                .dequant_f32(&format!("blk.{layer}.ffn_up.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let down_w = if has_gpu && can_q4 {
+            None
+        } else {
+            gen.catalog
+                .dequant_f32(&format!("blk.{layer}.ffn_down.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let gate_q4 = if has_gpu && can_q4 {
+            Some(ffn.0.raw_bytes())
+        } else {
+            None
+        };
+        let up_q4 = if has_gpu && can_q4 {
+            Some(ffn.1.raw_bytes())
+        } else {
+            None
+        };
+        let down_q4 = if has_gpu && can_q4 {
+            Some(ffn.2.raw_bytes())
+        } else {
+            None
+        };
 
         let ov: Vec<FfnOverride> = (0..n)
             .map(|c| get_override(c, layer, &gate_w, &up_w, &down_w))
@@ -1054,7 +1085,7 @@ pub(crate) fn forward_batched_hybrid_seq(
         // FFN batcheado sobre N×n_pos (override construido UNA vez por (cand, capa)).
         batch_ffn_hybrid_seq(
             gen, orch, layer, &ov, &mut x, n, n_pos, eps, gate_w.as_ref(), up_w.as_ref(),
-            down_w.as_ref(),
+            down_w.as_ref(), gate_q4.as_deref(), up_q4.as_deref(), down_q4.as_deref(), ffn,
         )?;
     }
 
@@ -1096,9 +1127,10 @@ pub(crate) fn forward_batched_hybrid_seq(
     Ok(out)
 }
 
-/// FFN batcheado por capa sobre N×n_pos (pesos cargados UNA vez, override CSR por
-/// candidato esparso construido UNA vez por (candidato, capa); SparseAdj batcheado
-/// en GPU desde el dequant compartido — Fase 2, C4).
+/// FFN batcheado por capa sobre N×n_pos (pesos cargados UNA vez por el caller;
+/// override CSR por candidato esparso construido UNA vez por (candidato, capa);
+/// SparseAdj batcheado en GPU desde Q4 con dequant en-kernel o F32 compartido —
+/// Fase 2, C1/C4).
 fn batch_ffn_hybrid_seq(
     gen: &mut StreamingGenerator,
     orch: &mut EngineOrchestrator,
@@ -1111,10 +1143,21 @@ fn batch_ffn_hybrid_seq(
     gate_w: Option<&Arc<Vec<f32>>>,
     up_w: Option<&Arc<Vec<f32>>>,
     down_w: Option<&Arc<Vec<f32>>>,
+    gate_q4: Option<&[u8]>,
+    up_q4: Option<&[u8]>,
+    down_q4: Option<&[u8]>,
+    ffn: (
+        QuantMatrix,
+        QuantMatrix,
+        QuantMatrix,
+        Option<hayai_model::CsrSparse>,
+        Option<hayai_model::CsrSparse>,
+        Option<hayai_model::CsrSparse>,
+    ),
 ) -> Result<(), StreamInferError> {
     let h = gen.config.hidden_size;
     let ff = gen.config.intermediate_size;
-    let (gate, up, down, gcsr, ucsr, dcsr) = gen.catalog.load_ffn_matrices(layer)?;
+    let (gate, up, down, gcsr, ucsr, dcsr) = ffn;
     let batch = n * n_pos;
     let mut x_flat = vec![0.0f32; batch * h];
     for c in 0..n {
@@ -1139,11 +1182,11 @@ fn batch_ffn_hybrid_seq(
     if has_any_adj {
         gen.apply_sparse_adj_block(
             orch, ov, |o| o.gate_adj.as_ref(), &x_flat, n, n_pos, h, ff,
-            gate_w, &mut gate_flat,
+            gate_w, gate_q4, &mut gate_flat,
         )?;
         gen.apply_sparse_adj_block(
             orch, ov, |o| o.up_adj.as_ref(), &x_flat, n, n_pos, h, ff,
-            up_w, &mut up_flat,
+            up_w, up_q4, &mut up_flat,
         )?;
     }
     for c in 0..n {
@@ -1166,7 +1209,7 @@ fn batch_ffn_hybrid_seq(
     if has_any_adj {
         gen.apply_sparse_adj_block(
             orch, ov, |o| o.down_adj.as_ref(), &gate_flat, n, n_pos, ff, h,
-            down_w, &mut down_flat,
+            down_w, down_q4, &mut down_flat,
         )?;
     }
     for c in 0..n {

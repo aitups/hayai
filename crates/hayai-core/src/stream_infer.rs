@@ -217,11 +217,11 @@ impl StreamingGenerator {
         Ok(())
     }
 
-    /// Aplica los overrides `SparseAdj` (bit-tensor + pesos F32 compartidos por capa)
-    /// de un bloque FFN (gate/up/down) de forma **batcheada en GPU** — Fase 2, C4:
-    /// `sel` candidatos en un único dispatch `spmm_adj_batched` sobre `[N×n_pos, d_in]`.
-    /// Evita el build/gather del CSR por (candidato, capa, token) que dominaba el
-    /// tiempo en 27B/40B; `w` es el dequant compartido (None → skip, el dense ya vale).
+    /// Aplica los overrides `SparseAdj` (bit-tensor + pesos compartidos por capa)
+    /// de un bloque FFN (gate/up/down) de forma **batcheada en GPU** — Fase 2, C1/C4:
+    /// `sel` candidatos en un único dispatch sobre `[N×n_pos, d_in]`. Prioriza el
+    /// kernel Q4 (dequant en GPU, `w_q4`); cae al F32 (`w`) o CPU `spmm_adj`.
+    /// Evita el build/gather del CSR por (candidato, capa, token).
     pub(crate) fn apply_sparse_adj_block(
         &self,
         orch: &EngineOrchestrator,
@@ -233,6 +233,7 @@ impl StreamingGenerator {
         d_in: usize,
         d_out: usize,
         w: Option<&Arc<Vec<f32>>>,
+        w_q4: Option<&[u8]>,
         out_flat: &mut [f32],
     ) -> Result<(), StreamInferError> {
         let mut sel: Vec<usize> = Vec::new();
@@ -248,11 +249,17 @@ impl StreamingGenerator {
         if sel.is_empty() {
             return Ok(());
         }
-        let Some(w0) = w else { return Ok(()) };
         let mut out_sub = vec![0.0f32; sel.len() * n_pos * d_out];
         if let Some(eng) = orch.opencl_engine() {
-            eng.spmm_adj_batched(&x_sub, &adjs, w0, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
+            if let Some(q4) = w_q4 {
+                eng.spmm_adj_batched_q4(&x_sub, &adjs, q4, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
+            } else if let Some(w0) = w {
+                eng.spmm_adj_batched(&x_sub, &adjs, w0, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
+            } else {
+                return Ok(());
+            }
         } else {
+            let Some(_) = w else { return Ok(()) };
             let mut off = 0usize;
             for (i, &c) in sel.iter().enumerate() {
                 let sa = pick(&ov[c]).expect("sel consistency");
@@ -1939,24 +1946,54 @@ pub fn forward_batched_seq(
     let mut down_flat = vec![0.0f32; batch * h];
     for layer_idx in 0..n_layers {
         let pack = self.load_pack(layer_idx)?;
-        // Dequant compartido por capa (UNA vez por (capa, generación), Fase 2 C4):
-        // los CSR/SparseAdj del FFN esparso se construyen desde estos F32; se evita
-        // dequantizar por (candidato, capa) (dominaba el tiempo en 27B/40B).
-        let gate_w = self
-            .catalog
-            .dequant_f32(&format!("blk.{layer_idx}.ffn_gate.weight"))
-            .ok()
-            .map(Arc::new);
-        let up_w = self
-            .catalog
-            .dequant_f32(&format!("blk.{layer_idx}.ffn_up.weight"))
-            .ok()
-            .map(Arc::new);
-        let down_w = self
-            .catalog
-            .dequant_f32(&format!("blk.{layer_idx}.ffn_down.weight"))
-            .ok()
-            .map(Arc::new);
+        // Pesos compartidos por capa (Fase 2, C1/C4): si hay GPU y el bloque es
+        // Q4_K, el kernel `spmm_adj_batched_q4` dequantiza en la GPU (sin
+        // materializar 23 GB F32/gen); si no, se dequantiza el F32 una vez por capa.
+        let has_gpu = orch.opencl_engine().is_some();
+        // Q4-K en-kernel es opt-in (HAYAI_SPMM_Q4=1): en la RTX 4050 el dequant
+        // en-kernel con lecturas de bloques aleatorias es memory-bound y más lento
+        // que el F32 compartido; el F32 es el default validado (C4).
+        let can_q4 = std::env::var("HAYAI_SPMM_Q4").ok().as_deref() == Some("1")
+            && pack.gate.ggml_type == GgmlType::Q4_K;
+        let gate_w = if has_gpu && can_q4 {
+            None
+        } else {
+            self.catalog
+                .dequant_f32(&format!("blk.{layer_idx}.ffn_gate.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let up_w = if has_gpu && can_q4 {
+            None
+        } else {
+            self.catalog
+                .dequant_f32(&format!("blk.{layer_idx}.ffn_up.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let down_w = if has_gpu && can_q4 {
+            None
+        } else {
+            self.catalog
+                .dequant_f32(&format!("blk.{layer_idx}.ffn_down.weight"))
+                .ok()
+                .map(Arc::new)
+        };
+        let gate_q4 = if has_gpu && can_q4 {
+            Some(pack.gate.raw_bytes())
+        } else {
+            None
+        };
+        let up_q4 = if has_gpu && can_q4 {
+            Some(pack.up.raw_bytes())
+        } else {
+            None
+        };
+        let down_q4 = if has_gpu && can_q4 {
+            Some(pack.down.raw_bytes())
+        } else {
+            None
+        };
         let ov: Vec<FfnOverride> = (0..n)
             .map(|c| get_override(c, layer_idx, &gate_w, &up_w, &down_w))
             .collect();
@@ -2027,11 +2064,11 @@ pub fn forward_batched_seq(
         if has_any_adj {
             self.apply_sparse_adj_block(
                 orch, &ov, |o| o.gate_adj.as_ref(), &x_flat, n, n_pos, h, ff,
-                gate_w.as_ref(), &mut gate_flat,
+                gate_w.as_ref(), gate_q4.as_deref(), &mut gate_flat,
             )?;
             self.apply_sparse_adj_block(
                 orch, &ov, |o| o.up_adj.as_ref(), &x_flat, n, n_pos, h, ff,
-                up_w.as_ref(), &mut up_flat,
+                up_w.as_ref(), up_q4.as_deref(), &mut up_flat,
             )?;
         }
         if has_any_csr {
@@ -2054,7 +2091,7 @@ pub fn forward_batched_seq(
         if has_any_adj {
             self.apply_sparse_adj_block(
                 orch, &ov, |o| o.down_adj.as_ref(), &gate_flat, n, n_pos, ff, h,
-                down_w.as_ref(), &mut down_flat,
+                down_w.as_ref(), down_q4.as_deref(), &mut down_flat,
             )?;
         }
         if has_any_csr {

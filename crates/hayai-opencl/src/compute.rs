@@ -512,6 +512,92 @@ impl OpenClEngine {
         );
         Ok(())
     }
+
+    /// SpMM esparso batcheado con dequant Q4_K en el kernel (Fase 2, criterio
+    /// C1/C4): mismo contrato que [`spmm_adj_batched`] pero `w4` son los bytes Q4_K
+    /// crudos del tensor (fila-mayor `[d_out, d_in]`, 144 B/bloque de 256) — se
+    /// elimina el dequant F32 + upload de ~23 GB/gen en 27B/40B y el trabajo de
+    /// dequant pasa a la GPU (C1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spmm_adj_batched_q4(
+        &self,
+        x: &[f32],
+        adjs: &[u8],
+        w4: &[u8],
+        n_cands: usize,
+        n_pos: usize,
+        d_in: usize,
+        d_out: usize,
+        output: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        let batch = n_cands * n_pos;
+        assert_eq!(output.len(), batch * d_out);
+        if adjs.is_empty() || w4.is_empty() {
+            output.fill(0.0);
+            return Ok(());
+        }
+
+        let mut x_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj_q4 x buffer: {e}")))?
+        };
+        let mut a_buf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, adjs.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj_q4 adj buffer: {e}")))?
+        };
+        let mut w4_buf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, w4.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj_q4 w4 buffer: {e}")))?
+        };
+        let output_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                output.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("spmm_adj_q4 output buffer: {e}")))?
+        };
+
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut x_buf, CL_BLOCKING, 0, x, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj_q4 x: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut a_buf, CL_BLOCKING, 0, adjs, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj_q4 adjs: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut w4_buf, CL_BLOCKING, 0, w4, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj_q4 w4: {e}")))?;
+        }
+
+        let global = batch * d_out;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.spmm_adj_batched_q4)
+                .set_arg(&x_buf)
+                .set_arg(&a_buf)
+                .set_arg(&w4_buf)
+                .set_arg(&(d_in as cl_int))
+                .set_arg(&(d_out as cl_int))
+                .set_arg(&(n_pos as cl_int))
+                .set_arg(&output_buf)
+                .set_global_work_size(global)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue spmm_adj_batched_q4: {e}")))?
+        };
+
+        let wait = [kernel_event.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, output, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read spmm_adj_batched_q4: {e}")))?;
+        }
+        debug!(
+            "OpenCL spmm_adj_batched_q4 [{batch}×{d_out}×{d_in}] on {}",
+            self.device_info.device_name
+        );
+        Ok(())
+    }
 }
 
 fn preferred_local_size(m: usize) -> usize {

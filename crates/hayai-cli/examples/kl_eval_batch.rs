@@ -279,10 +279,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "ffn_up" => up_w,
                     _ => down_w,
                 };
-                let Some(w) = w else { continue };
+                // F32 presente en el path CPU/dequant; vacío en el path GPU-Q4
+                // (el kernel dequantiza en GPU y `apply_sparse_adj_block` usa w_q4).
+                let weights = w.clone().unwrap_or_default();
                 let sa = SparseAdj {
                     adjacency: adj,
-                    weights: w.clone(),
+                    weights,
                     d_in: *din,
                     d_out: *dout,
                 };

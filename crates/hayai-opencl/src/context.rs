@@ -52,6 +52,8 @@ pub struct OpenClEngine {
     pub spmm_csr: Kernel,
     /// SpMM esparso batcheado desde bit-tensor + pesos F32 compartidos (Fase 2, C4).
     pub spmm_adj_batched: Kernel,
+    /// SpMM esparso batcheado con dequant Q4_K en el kernel (Fase 2, C1).
+    pub spmm_adj_batched_q4: Kernel,
 }
 
 impl OpenClEngine {
@@ -152,6 +154,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("spmm_csr kernel: {}", e)))?;
         let spmm_adj_batched = Kernel::create(&program, "spmm_adj_batched")
             .map_err(|e| OpenClError::ClError(format!("spmm_adj_batched kernel: {}", e)))?;
+        let spmm_adj_batched_q4 = Kernel::create(&program, "spmm_adj_batched_q4")
+            .map_err(|e| OpenClError::ClError(format!("spmm_adj_batched_q4 kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -185,6 +189,7 @@ impl OpenClEngine {
             gemv_f16,
             spmm_csr,
             spmm_adj_batched,
+            spmm_adj_batched_q4,
         })
     }
 

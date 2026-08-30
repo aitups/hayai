@@ -113,6 +113,22 @@ impl QuantMatrix {
         }
     }
 
+    /// Bytes Q4 crudos del tensor (copia) — SpMM esparso en GPU con dequant
+    /// en-kernel (Fase 2, C1): evita materializar el F32 (23 GB/gen en 27B).
+    pub fn raw_bytes(&self) -> Vec<u8> {
+        match &self.storage {
+            QuantStorage::Owned(d) => d.clone(),
+            QuantStorage::Mapped { file, start, len } => {
+                let m = file.mmap_bytes();
+                m[*start..*start + *len].to_vec()
+            }
+            QuantStorage::External { ptr, len } => {
+                let bytes = unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) };
+                bytes.to_vec()
+            }
+        }
+    }
+
     /// Metadata-only shell (nbytes known, no payload) — FFN GPU path uses scratch offsets.
     pub fn meta_only(
         name: impl Into<String>,
