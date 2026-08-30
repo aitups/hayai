@@ -1618,13 +1618,58 @@ impl StreamingGenerator {
                     }
                     dn.push(per_layer);
                 }
-                crate::hybrid_infer::forward_batched_hybrid(
+                crate::hybrid_infer::forward_batched_hybrid_gemm(
                     self, orch, token, pos, scratch, kv, &mut dn, n_candidates, get_override,
                 )
             }
             ModelKind::Dense => self.forward_batched(orch, token, pos, kv, n_candidates, get_override),
             other => Err(StreamInferError::Msg(format!(
                 "forward_batched_any: ModelKind {} sin batch (Dense/Hybrid soportados)",
+                format!("{other:?}")
+            ))),
+        }
+    }
+
+    /// Forward **por capas** agnóstico a arquitectura (layer-major): procesa TODA la
+    /// secuencia `tokens` en una sola llamada. El override se construye UNA vez por
+    /// (candidato, capa) y las proyecciones + FFN se batchean sobre `[N×n_pos]`.
+    pub fn forward_batched_any_seq(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        tokens: &[u32],
+        kv: &mut [Vec<LayerKvCache>],
+        n_candidates: usize,
+        mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+    ) -> Result<Vec<Vec<f32>>, StreamInferError> {
+        match self.model_kind() {
+            ModelKind::Hybrid => {
+                crate::hybrid_infer::ensure_deltanet_cache(self)?;
+                let mut dn: Vec<Vec<Option<crate::deltanet::DeltaNetState>>> = Vec::with_capacity(n_candidates);
+                for _ in 0..n_candidates {
+                    let mut per_layer: Vec<Option<crate::deltanet::DeltaNetState>> = Vec::with_capacity(self.config.num_layers);
+                    for layer in 0..self.config.num_layers {
+                        if crate::deltanet::is_deltanet_layer(&self.catalog, layer) {
+                            let w = self
+                                .deltanet_weights
+                                .as_ref()
+                                .and_then(|v| v[layer].as_ref())
+                                .ok_or_else(|| StreamInferError::Msg("deltanet weights ausentes".into()))?;
+                            per_layer.push(Some(crate::deltanet::DeltaNetState::new(
+                                w.conv_k, w.conv_dim, w.n_v_heads, w.head_k, w.head_v,
+                            )));
+                        } else {
+                            per_layer.push(None);
+                        }
+                    }
+                    dn.push(per_layer);
+                }
+                crate::hybrid_infer::forward_batched_hybrid_seq(
+                    self, orch, tokens, kv, &mut dn, n_candidates, get_override,
+                )
+            }
+            ModelKind::Dense => self.forward_batched_seq(orch, tokens, kv, n_candidates, get_override),
+            other => Err(StreamInferError::Msg(format!(
+                "forward_batched_any_seq: ModelKind {} sin seq (Dense/Hybrid soportados)",
                 format!("{other:?}")
             ))),
         }
@@ -1784,6 +1829,175 @@ impl StreamingGenerator {
         }
         Ok(out)
     }
+/// Forward **por capas** Dense (Fase 2, layer-major): procesa TODA la secuencia de
+/// tokens por capa en una sola llamada. Los pesos de cada capa se cargan UNA vez por
+/// generación, el override se construye UNA vez por (candidato, capa) y el FFN + las
+/// proyecciones de atención se batchean sobre `[N×n_pos]` (criterios C1/C4).
+pub fn forward_batched_seq(
+    &mut self,
+    orch: &mut EngineOrchestrator,
+    tokens: &[u32],
+    kv: &mut [Vec<LayerKvCache>],
+    n_candidates: usize,
+    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+) -> Result<Vec<Vec<f32>>, StreamInferError> {
+    let h = self.config.hidden_size;
+    let n_layers = self.config.num_layers;
+    let n_pos = tokens.len();
+    let n = n_candidates;
+    let eps = self.config.rms_norm_eps;
+    let q_dim = self.attn_cfg.hidden_size();
+    let kv_dim = self.attn_cfg.kv_dim();
+    let ff = self.config.intermediate_size;
+    if kv.len() < n || n_pos == 0 {
+        return Err(StreamInferError::Msg(format!(
+            "forward_batched_seq: kv tiene {} filas, se necesitan {n}",
+            kv.len()
+        )));
+    }
+    let mut x: Vec<Vec<f32>> = (0..n).map(|_| vec![0.0f32; n_pos * h]).collect();
+    for c in 0..n {
+        for t in 0..n_pos {
+            let mut emb = vec![0.0f32; h];
+            self.embed_row("token_embd.weight", tokens[t], h, &mut emb)?;
+            x[c][t * h..(t + 1) * h].copy_from_slice(&emb);
+        }
+    }
+    let batch = n * n_pos;
+    let mut x_flat = vec![0.0f32; batch * h];
+    let mut q_flat = vec![0.0f32; batch * q_dim];
+    let mut k_flat = vec![0.0f32; batch * kv_dim];
+    let mut v_flat = vec![0.0f32; batch * kv_dim];
+    let mut attn_out_flat = vec![0.0f32; batch * q_dim];
+    let mut attn_proj_flat = vec![0.0f32; batch * h];
+    let mut gate_flat = vec![0.0f32; batch * ff];
+    let mut up_flat = vec![0.0f32; batch * ff];
+    let mut down_flat = vec![0.0f32; batch * h];
+    for layer_idx in 0..n_layers {
+        let pack = self.load_pack(layer_idx)?;
+        let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer_idx)).collect();
+        // Atención: norm + proyecciones batcheadas sobre N×n_pos.
+        for c in 0..n {
+            for t in 0..n_pos {
+                x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                    .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+                rms_norm(
+                    &mut x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                    &self.layer_norms[layer_idx].attn_norm,
+                    eps,
+                );
+            }
+        }
+        orch.execute_quant_gemv_batched(&pack.wq, &x_flat, &mut q_flat, batch)?;
+        orch.execute_quant_gemv_batched(&pack.wk, &x_flat, &mut k_flat, batch)?;
+        orch.execute_quant_gemv_batched(&pack.wv, &x_flat, &mut v_flat, batch)?;
+        for c in 0..n {
+            for t in 0..n_pos {
+                let idx = c * n_pos + t;
+                attention_decode_step(
+                    &self.attn_cfg,
+                    &mut kv[c][layer_idx],
+                    &mut q_flat[idx * q_dim..(idx + 1) * q_dim],
+                    &mut k_flat[idx * kv_dim..(idx + 1) * kv_dim],
+                    &v_flat[idx * kv_dim..(idx + 1) * kv_dim],
+                    t,
+                    &mut attn_out_flat[idx * q_dim..(idx + 1) * q_dim],
+                );
+            }
+        }
+        if let Some(ref gate_w) = pack.attn_gate {
+            let mut ag = vec![0.0f32; batch * q_dim];
+            orch.execute_quant_gemv_batched(gate_w, &x_flat, &mut ag, batch)?;
+            for i in 0..batch * q_dim {
+                attn_out_flat[i] *= 1.0 / (1.0 + (-ag[i]).exp());
+            }
+        }
+        orch.execute_quant_gemv_batched(&pack.wo, &attn_out_flat, &mut attn_proj_flat, batch)?;
+        for c in 0..n {
+            for t in 0..n_pos {
+                for i in 0..h {
+                    x[c][t * h + i] += attn_proj_flat[(c * n_pos + t) * h + i];
+                }
+            }
+        }
+        // FFN: norm + gate/up denso batcheado + override CSR + down.
+        for c in 0..n {
+            for t in 0..n_pos {
+                x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                    .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+                rms_norm(
+                    &mut x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                    &self.layer_norms[layer_idx].ffn_norm,
+                    eps,
+                );
+            }
+        }
+        let has_any_ov = ov
+            .iter()
+            .any(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some());
+        orch.execute_quant_gemv_batched(&pack.gate, &x_flat, &mut gate_flat, batch)?;
+        orch.execute_quant_gemv_batched(&pack.up, &x_flat, &mut up_flat, batch)?;
+        if has_any_ov {
+            for c in 0..n {
+                if let Some(cs) = ov[c].gate.as_ref() {
+                    let out = self.spmm_csr(orch, &x_flat[c * n_pos * h..(c + 1) * n_pos * h], cs)?;
+                    gate_flat[c * n_pos * ff..(c + 1) * n_pos * ff].copy_from_slice(&out);
+                }
+                if let Some(cs) = ov[c].up.as_ref() {
+                    let out = self.spmm_csr(orch, &x_flat[c * n_pos * h..(c + 1) * n_pos * h], cs)?;
+                    up_flat[c * n_pos * ff..(c + 1) * n_pos * ff].copy_from_slice(&out);
+                }
+            }
+        }
+        for i in 0..batch * ff {
+            let g = gate_flat[i];
+            gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
+        }
+        orch.execute_quant_gemv_batched(&pack.down, &gate_flat, &mut down_flat, batch)?;
+        if has_any_ov {
+            for c in 0..n {
+                if let Some(cs) = ov[c].down.as_ref() {
+                    let out = self.spmm_csr(orch, &gate_flat[c * n_pos * ff..(c + 1) * n_pos * ff], cs)?;
+                    down_flat[c * n_pos * h..(c + 1) * n_pos * h].copy_from_slice(&out);
+                }
+            }
+        }
+        for c in 0..n {
+            for t in 0..n_pos {
+                for i in 0..h {
+                    x[c][t * h + i] += down_flat[(c * n_pos + t) * h + i];
+                }
+            }
+        }
+        // `ov` (y sus CSR) se libera aquí.
+    }
+    // lm_head batcheado sobre N×n_pos.
+    let vocab = self.config.vocab_size;
+    let ow = self
+        .catalog
+        .load_quant_matrix("output.weight")
+        .or_else(|_| self.catalog.load_quant_matrix("token_embd.weight"))?;
+    for c in 0..n {
+        for t in 0..n_pos {
+            x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+            rms_norm(
+                &mut x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                &self.output_norm,
+                eps,
+            );
+        }
+    }
+    let mut logits_flat = vec![0.0f32; batch * vocab];
+    orch.execute_quant_gemv_batched(&ow, &x_flat, &mut logits_flat, batch)?;
+    let mut out = Vec::with_capacity(n);
+    for c in 0..n {
+        out.push(logits_flat[c * n_pos * vocab..(c + 1) * n_pos * vocab].to_vec());
+    }
+    Ok(out)
+}
+
+
 }
 
 fn begin_gemv(

@@ -637,6 +637,231 @@ pub(crate) fn forward_batched_hybrid(
 }
 
 
+/// Forward **batcheado** híbrido (Fase 2, GEMM batcheado): N candidatos por capa,
+/// con los pesos de cada capa cargados UNA vez por (capa, token) y las proyecciones
+/// de atención + FFN **batcheadas** sobre N (criterios C1/C4). Estado recurrente
+/// (KV + DeltaNet) por candidato. Agnóstico a la arquitectura híbrida.
+pub(crate) fn forward_batched_hybrid_gemm(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    token: u32,
+    pos: usize,
+    _scratch: &mut StreamingScratch,
+    kv: &mut [Vec<LayerKvCache>],
+    dn: &mut [Vec<Option<DeltaNetState>>],
+    n_candidates: usize,
+    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+) -> Result<Vec<Vec<f32>>, StreamInferError> {
+    let h = gen.config.hidden_size;
+    let n_layers = gen.config.num_layers;
+    let eps = gen.config.rms_norm_eps;
+    let n = n_candidates;
+    if kv.len() < n || dn.len() < n {
+        return Err(StreamInferError::Msg(format!(
+            "forward_batched_hybrid_gemm: kv/dn tienen {} filas, se necesitan {n}",
+            kv.len().min(dn.len())
+        )));
+    }
+    ensure_deltanet_cache(gen)?;
+    let mut x: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut emb = vec![0.0f32; h];
+        gen.embed_row("token_embd.weight", token, h, &mut emb)?;
+        x.push(emb);
+    }
+    for layer in 0..n_layers {
+        let kind = hybrid_layer_kind(&gen.catalog, layer);
+        if kind == HybridLayerKind::NextN {
+            continue;
+        }
+        let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer)).collect();
+        match kind {
+            HybridLayerKind::DeltaNet => {
+                // SSM recurrente por (candidato, token) — estado propio.
+                for c in 0..n {
+                    let w = gen
+                        .deltanet_weights
+                        .as_ref()
+                        .and_then(|v| v[layer].as_ref())
+                        .ok_or_else(|| StreamInferError::Msg("deltanet weights ausentes".into()))?;
+                    let s = dn[c][layer]
+                        .as_mut()
+                        .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
+                    let xn = x[c].clone();
+                    w.decode_step(&xn, s, &mut x[c])?;
+                }
+            }
+            HybridLayerKind::FullAttn => {
+                // Atención batcheada: proyecciones GEMM sobre N + núcleo por candidato.
+                let pack = gen.load_pack(layer)?;
+                let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
+                let n_heads = layer_cfg.num_heads;
+                let n_kv = layer_cfg.num_kv_heads;
+                let head_dim = layer_cfg.head_dim;
+                let q_dim = n_heads * head_dim;
+                let kv_dim = n_kv * head_dim;
+                let wo_in = pack.wo.ncols;
+                let wq_rows = pack.wq.nrows;
+                let mut x_flat = vec![0.0f32; n * h];
+                for c in 0..n {
+                    x_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+                    rms_norm(&mut x_flat[c * h..(c + 1) * h], &gen.layer_norms[layer].attn_norm, eps);
+                }
+                let mut q_full = vec![0.0f32; n * wq_rows];
+                let mut k_flat = vec![0.0f32; n * kv_dim];
+                let mut v_flat = vec![0.0f32; n * kv_dim];
+                orch.execute_quant_gemv_batched(&pack.wq, &x_flat, &mut q_full, n)?;
+                orch.execute_quant_gemv_batched(&pack.wk, &x_flat, &mut k_flat, n)?;
+                orch.execute_quant_gemv_batched(&pack.wv, &x_flat, &mut v_flat, n)?;
+                let mut attn_out_flat = vec![0.0f32; n * wo_in];
+                for c in 0..n {
+                    let (mut q, fused_gate) = if wq_rows == n_heads * head_dim * 2 {
+                        deinterleave_qg(
+                            &q_full[c * (n_heads * head_dim * 2)..(c + 1) * (n_heads * head_dim * 2)],
+                            n_heads,
+                            head_dim,
+                        )
+                    } else if wq_rows == wo_in * 2 {
+                        let (qh, gh) =
+                            q_full[c * (wo_in * 2)..(c + 1) * (wo_in * 2)].split_at(wo_in);
+                        (qh.to_vec(), Some(gh.to_vec()))
+                    } else {
+                        (q_full[c * wq_rows..(c + 1) * wq_rows].to_vec(), None)
+                    };
+                    q.resize(q_dim, 0.0);
+                    if let Ok(qn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_q_norm.weight")) {
+                        apply_head_rmsnorm(&mut q, &qn, n_heads, head_dim, eps);
+                    }
+                    if let Ok(kn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_k_norm.weight")) {
+                        apply_head_rmsnorm(&mut k_flat[c * kv_dim..(c + 1) * kv_dim], &kn, n_kv, head_dim, eps);
+                    }
+                    let need_rebuild = kv[c][layer].heads.len() != n_kv
+                        || kv[c][layer].heads.first().map(|hd| hd.dim) != Some(head_dim);
+                    if need_rebuild {
+                        kv[c][layer] = LayerKvCache::new(n_kv, head_dim, 4, 128);
+                    }
+                    attention_decode_step(
+                        &layer_cfg,
+                        &mut kv[c][layer],
+                        &mut q,
+                        &mut k_flat[c * kv_dim..(c + 1) * kv_dim],
+                        &v_flat[c * kv_dim..(c + 1) * kv_dim],
+                        pos,
+                        &mut attn_out_flat[c * wo_in..(c + 1) * wo_in],
+                    );
+                    if let Some(g) = fused_gate {
+                        for i in 0..q_dim {
+                            attn_out_flat[c * wo_in + i] *= 1.0 / (1.0 + (-g[i]).exp());
+                        }
+                    } else if let Some(ref gate_w) = pack.attn_gate {
+                        let mut gate = vec![0.0f32; gate_w.nrows];
+                        gate_w.gemv(&x_flat[c * h..(c + 1) * h], &mut gate)?;
+                        for i in 0..q_dim.min(gate.len()) {
+                            attn_out_flat[c * wo_in + i] *= 1.0 / (1.0 + (-gate[i]).exp());
+                        }
+                    }
+                }
+                let mut attn_proj_flat = vec![0.0f32; n * h];
+                orch.execute_quant_gemv_batched(&pack.wo, &attn_out_flat, &mut attn_proj_flat, n)?;
+                for c in 0..n {
+                    for i in 0..h {
+                        x[c][i] += attn_proj_flat[c * h + i];
+                    }
+                }
+            }
+            HybridLayerKind::NextN => {}
+        }
+        // FFN batcheado (pesos cargados UNA vez por capa).
+        batch_ffn_hybrid(gen, orch, layer, &ov, &mut x, n, eps)?;
+    }
+
+    // lm_head batcheado.
+    let vocab = gen.config.vocab_size;
+    let mut xn_flat = vec![0.0f32; n * h];
+    for c in 0..n {
+        xn_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+        rms_norm(&mut xn_flat[c * h..(c + 1) * h], &gen.output_norm, eps);
+    }
+    let mut logits_flat = vec![0.0f32; n * vocab];
+    if gen.has_output_weight {
+        if let Some(ow) = &gen.resident_output {
+            orch.execute_quant_gemv_batched(ow, &xn_flat, &mut logits_flat, n)?;
+        } else {
+            let ow = gen.catalog.load_quant_matrix("output.weight")?;
+            orch.execute_quant_gemv_batched(&ow, &xn_flat, &mut logits_flat, n)?;
+        }
+    } else {
+        if let Some(emb) = &gen.resident_embed {
+            orch.execute_quant_gemv_batched(emb, &xn_flat, &mut logits_flat, n)?;
+        } else {
+            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+            orch.execute_quant_gemv_batched(&emb, &xn_flat, &mut logits_flat, n)?;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for c in 0..n {
+        out.push(logits_flat[c * vocab..(c + 1) * vocab].to_vec());
+    }
+    Ok(out)
+}
+
+/// FFN batcheado de la capa `layer` para N candidatos: carga gate/up/down UNA vez,
+/// GEMM `[N×M]` + override (CSR de Vía B) por candidato esparso.
+fn batch_ffn_hybrid(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    layer: usize,
+    ov: &[FfnOverride],
+    x: &mut [Vec<f32>],
+    n: usize,
+    eps: f32,
+) -> Result<(), StreamInferError> {
+    let h = gen.config.hidden_size;
+    let ff = gen.config.intermediate_size;
+    let (gate, up, down, gcsr, ucsr, dcsr) = gen.catalog.load_ffn_matrices(layer)?;
+    let mut x_flat = vec![0.0f32; n * h];
+    for c in 0..n {
+        x_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+        rms_norm(&mut x_flat[c * h..(c + 1) * h], &gen.layer_norms[layer].ffn_norm, eps);
+    }
+    let mut gate_flat = vec![0.0f32; n * ff];
+    let mut up_flat = vec![0.0f32; n * ff];
+    let mut down_flat = vec![0.0f32; n * h];
+    orch.execute_quant_gemv_batched(&gate, &x_flat, &mut gate_flat, n)?;
+    orch.execute_quant_gemv_batched(&up, &x_flat, &mut up_flat, n)?;
+    for c in 0..n {
+        let cs = ov[c].gate.as_ref().or(gcsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &x_flat[c * h..(c + 1) * h], cs)?;
+            gate_flat[c * ff..(c + 1) * ff].copy_from_slice(&out);
+        }
+        let cs = ov[c].up.as_ref().or(ucsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &x_flat[c * h..(c + 1) * h], cs)?;
+            up_flat[c * ff..(c + 1) * ff].copy_from_slice(&out);
+        }
+    }
+    for i in 0..n * ff {
+        let g = gate_flat[i];
+        gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
+    }
+    orch.execute_quant_gemv_batched(&down, &gate_flat, &mut down_flat, n)?;
+    for c in 0..n {
+        let cs = ov[c].down.as_ref().or(dcsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &gate_flat[c * ff..(c + 1) * ff], cs)?;
+            down_flat[c * h..(c + 1) * h].copy_from_slice(&out);
+        }
+        for i in 0..h {
+            x[c][i] += down_flat[c * h + i];
+        }
+    }
+    Ok(())
+}
+
+
+
+
 /// Split fused Qwen3.5 Q-projection: `[Q0|G0|Q1|G1|…]` → `(Q, gate)`.
 fn deinterleave_qg(q_full: &[f32], n_heads: usize, head_dim: usize) -> (Vec<f32>, Option<Vec<f32>>) {
     let mut q = vec![0.0f32; n_heads * head_dim];
@@ -649,3 +874,262 @@ fn deinterleave_qg(q_full: &[f32], n_heads: usize, head_dim: usize) -> (Vec<f32>
     }
     (q, Some(g))
 }
+
+/// Forward **por capas** híbrido (Fase 2, layer-major): procesa TODA la secuencia
+/// de tokens por capa en una sola llamada. Los pesos de cada capa se cargan UNA
+/// vez por generación, el override se construye UNA vez por (candidato, capa) y el
+/// FFN + las proyecciones de atención se batchean sobre `[N×n_pos]` (criterios
+/// C1/C4). Estado recurrente (KV + DeltaNet) por candidato.
+pub(crate) fn forward_batched_hybrid_seq(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    tokens: &[u32],
+    kv: &mut [Vec<LayerKvCache>],
+    dn: &mut [Vec<Option<DeltaNetState>>],
+    n_candidates: usize,
+    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+) -> Result<Vec<Vec<f32>>, StreamInferError> {
+    let h = gen.config.hidden_size;
+    let n_layers = gen.config.num_layers;
+    let n_pos = tokens.len();
+    let n = n_candidates;
+    let eps = gen.config.rms_norm_eps;
+    if kv.len() < n || dn.len() < n || n_pos == 0 {
+        return Err(StreamInferError::Msg(format!(
+            "forward_batched_hybrid_seq: kv/dn/n_pos inconsistentes (n={n}, n_pos={n_pos})"
+        )));
+    }
+    ensure_deltanet_cache(gen)?;
+    let mut x: Vec<Vec<f32>> = (0..n).map(|_| vec![0.0f32; n_pos * h]).collect();
+    for c in 0..n {
+        for t in 0..n_pos {
+            let mut emb = vec![0.0f32; h];
+            gen.embed_row("token_embd.weight", tokens[t], h, &mut emb)?;
+            x[c][t * h..(t + 1) * h].copy_from_slice(&emb);
+        }
+    }
+    for layer in 0..n_layers {
+        let kind = hybrid_layer_kind(&gen.catalog, layer);
+        if kind == HybridLayerKind::NextN {
+            continue;
+        }
+        let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer)).collect();
+        match kind {
+            HybridLayerKind::DeltaNet => {
+                // SSM recurrente por (candidato, token) — estado propio.
+                for c in 0..n {
+                    for t in 0..n_pos {
+                        let w = gen
+                            .deltanet_weights
+                            .as_ref()
+                            .and_then(|v| v[layer].as_ref())
+                            .ok_or_else(|| StreamInferError::Msg("deltanet weights ausentes".into()))?;
+                        let s = dn[c][layer]
+                            .as_mut()
+                            .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
+                        let xn = x[c][t * h..(t + 1) * h].to_vec();
+                        w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h])?;
+                    }
+                }
+            }
+            HybridLayerKind::FullAttn => {
+                // Atención batcheada sobre N×n_pos: proyecciones GEMM + núcleo por
+                // (candidato, token) con KV acumulada.
+                let pack = gen.load_pack(layer)?;
+                let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
+                let n_heads = layer_cfg.num_heads;
+                let n_kv = layer_cfg.num_kv_heads;
+                let head_dim = layer_cfg.head_dim;
+                let q_dim = n_heads * head_dim;
+                let kv_dim = n_kv * head_dim;
+                let wo_in = pack.wo.ncols;
+                let wq_rows = pack.wq.nrows;
+                let batch = n * n_pos;
+                let mut x_flat = vec![0.0f32; batch * h];
+                for c in 0..n {
+                    for t in 0..n_pos {
+                        x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                            .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+                        rms_norm(
+                            &mut x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                            &gen.layer_norms[layer].attn_norm,
+                            eps,
+                        );
+                    }
+                }
+                let mut q_full = vec![0.0f32; batch * wq_rows];
+                let mut k_flat = vec![0.0f32; batch * kv_dim];
+                let mut v_flat = vec![0.0f32; batch * kv_dim];
+                orch.execute_quant_gemv_batched(&pack.wq, &x_flat, &mut q_full, batch)?;
+                orch.execute_quant_gemv_batched(&pack.wk, &x_flat, &mut k_flat, batch)?;
+                orch.execute_quant_gemv_batched(&pack.wv, &x_flat, &mut v_flat, batch)?;
+                let mut attn_out_flat = vec![0.0f32; batch * wo_in];
+                for c in 0..n {
+                    for t in 0..n_pos {
+                        let idx = c * n_pos + t;
+                        let (mut q, fused_gate) = if wq_rows == n_heads * head_dim * 2 {
+                            deinterleave_qg(
+                                &q_full[idx * (n_heads * head_dim * 2)..(idx + 1) * (n_heads * head_dim * 2)],
+                                n_heads,
+                                head_dim,
+                            )
+                        } else if wq_rows == wo_in * 2 {
+                            let (qh, gh) = q_full[idx * (wo_in * 2)..(idx + 1) * (wo_in * 2)].split_at(wo_in);
+                            (qh.to_vec(), Some(gh.to_vec()))
+                        } else {
+                            (q_full[idx * wq_rows..(idx + 1) * wq_rows].to_vec(), None)
+                        };
+                        q.resize(q_dim, 0.0);
+                        if let Ok(qn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_q_norm.weight")) {
+                            apply_head_rmsnorm(&mut q, &qn, n_heads, head_dim, eps);
+                        }
+                        if let Ok(kn) = gen.catalog.dequant_f32(&format!("blk.{layer}.attn_k_norm.weight")) {
+                            apply_head_rmsnorm(&mut k_flat[idx * kv_dim..(idx + 1) * kv_dim], &kn, n_kv, head_dim, eps);
+                        }
+                        let need_rebuild = kv[c][layer].heads.len() != n_kv
+                            || kv[c][layer].heads.first().map(|hd| hd.dim) != Some(head_dim);
+                        if need_rebuild {
+                            kv[c][layer] = LayerKvCache::new(n_kv, head_dim, 4, 128);
+                        }
+                        attention_decode_step(
+                            &layer_cfg,
+                            &mut kv[c][layer],
+                            &mut q,
+                            &mut k_flat[idx * kv_dim..(idx + 1) * kv_dim],
+                            &v_flat[idx * kv_dim..(idx + 1) * kv_dim],
+                            t,
+                            &mut attn_out_flat[idx * wo_in..(idx + 1) * wo_in],
+                        );
+                        if let Some(g) = fused_gate {
+                            for i in 0..q_dim {
+                                attn_out_flat[idx * wo_in + i] *= 1.0 / (1.0 + (-g[i]).exp());
+                            }
+                        } else if let Some(ref gate_w) = pack.attn_gate {
+                            let mut gate = vec![0.0f32; gate_w.nrows];
+                            gate_w.gemv(&x_flat[idx * h..(idx + 1) * h], &mut gate)?;
+                            for i in 0..q_dim.min(gate.len()) {
+                                attn_out_flat[idx * wo_in + i] *= 1.0 / (1.0 + (-gate[i]).exp());
+                            }
+                        }
+                    }
+                }
+                let mut attn_proj_flat = vec![0.0f32; batch * h];
+                orch.execute_quant_gemv_batched(&pack.wo, &attn_out_flat, &mut attn_proj_flat, batch)?;
+                for c in 0..n {
+                    for t in 0..n_pos {
+                        for i in 0..h {
+                            x[c][t * h + i] += attn_proj_flat[(c * n_pos + t) * h + i];
+                        }
+                    }
+                }
+            }
+            HybridLayerKind::NextN => {}
+        }
+        // FFN batcheado sobre N×n_pos (override construido UNA vez por (cand, capa)).
+        batch_ffn_hybrid_seq(gen, orch, layer, &ov, &mut x, n, n_pos, eps)?;
+    }
+
+    // lm_head batcheado sobre N×n_pos.
+    let vocab = gen.config.vocab_size;
+    let batch = n * n_pos;
+    let mut xn_flat = vec![0.0f32; batch * h];
+    for c in 0..n {
+        for t in 0..n_pos {
+            xn_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+            rms_norm(
+                &mut xn_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                &gen.output_norm,
+                eps,
+            );
+        }
+    }
+    let mut logits_flat = vec![0.0f32; batch * vocab];
+    if gen.has_output_weight {
+        if let Some(ow) = &gen.resident_output {
+            orch.execute_quant_gemv_batched(ow, &xn_flat, &mut logits_flat, batch)?;
+        } else {
+            let ow = gen.catalog.load_quant_matrix("output.weight")?;
+            orch.execute_quant_gemv_batched(&ow, &xn_flat, &mut logits_flat, batch)?;
+        }
+    } else {
+        if let Some(emb) = &gen.resident_embed {
+            orch.execute_quant_gemv_batched(emb, &xn_flat, &mut logits_flat, batch)?;
+        } else {
+            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+            orch.execute_quant_gemv_batched(&emb, &xn_flat, &mut logits_flat, batch)?;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for c in 0..n {
+        out.push(logits_flat[c * n_pos * vocab..(c + 1) * n_pos * vocab].to_vec());
+    }
+    Ok(out)
+}
+
+/// FFN batcheado por capa sobre N×n_pos (pesos cargados UNA vez, override CSR por
+/// candidato esparso construido UNA vez por (candidato, capa)).
+fn batch_ffn_hybrid_seq(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    layer: usize,
+    ov: &[FfnOverride],
+    x: &mut [Vec<f32>],
+    n: usize,
+    n_pos: usize,
+    eps: f32,
+) -> Result<(), StreamInferError> {
+    let h = gen.config.hidden_size;
+    let ff = gen.config.intermediate_size;
+    let (gate, up, down, gcsr, ucsr, dcsr) = gen.catalog.load_ffn_matrices(layer)?;
+    let batch = n * n_pos;
+    let mut x_flat = vec![0.0f32; batch * h];
+    for c in 0..n {
+        for t in 0..n_pos {
+            x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h]
+                .copy_from_slice(&x[c][t * h..(t + 1) * h]);
+            rms_norm(
+                &mut x_flat[(c * n_pos + t) * h..(c * n_pos + t + 1) * h],
+                &gen.layer_norms[layer].ffn_norm,
+                eps,
+            );
+        }
+    }
+    let mut gate_flat = vec![0.0f32; batch * ff];
+    let mut up_flat = vec![0.0f32; batch * ff];
+    let mut down_flat = vec![0.0f32; batch * h];
+    orch.execute_quant_gemv_batched(&gate, &x_flat, &mut gate_flat, batch)?;
+    orch.execute_quant_gemv_batched(&up, &x_flat, &mut up_flat, batch)?;
+    for c in 0..n {
+        let cs = ov[c].gate.as_ref().or(gcsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &x_flat[c * n_pos * h..(c + 1) * n_pos * h], cs)?;
+            gate_flat[c * n_pos * ff..(c + 1) * n_pos * ff].copy_from_slice(&out);
+        }
+        let cs = ov[c].up.as_ref().or(ucsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &x_flat[c * n_pos * h..(c + 1) * n_pos * h], cs)?;
+            up_flat[c * n_pos * ff..(c + 1) * n_pos * ff].copy_from_slice(&out);
+        }
+    }
+    for i in 0..batch * ff {
+        let g = gate_flat[i];
+        gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
+    }
+    orch.execute_quant_gemv_batched(&down, &gate_flat, &mut down_flat, batch)?;
+    for c in 0..n {
+        let cs = ov[c].down.as_ref().or(dcsr.as_ref());
+        if let Some(cs) = cs {
+            let out = gen.spmm_csr(orch, &gate_flat[c * n_pos * ff..(c + 1) * n_pos * ff], cs)?;
+            down_flat[c * n_pos * h..(c + 1) * n_pos * h].copy_from_slice(&out);
+        }
+        for t in 0..n_pos {
+            for i in 0..h {
+                x[c][t * h + i] += down_flat[(c * n_pos + t) * h + i];
+            }
+        }
+    }
+    Ok(())
+}
+
+

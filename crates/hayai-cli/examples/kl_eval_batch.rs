@@ -277,36 +277,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mut kl_sum = vec![0.0f32; n_cand];
-    for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-        let lg = gen.forward_batched_any(
-            &mut orch,
-            tok,
-            pos,
-            &mut cand_kv,
-            n_cand,
-            |c, l| {
-                let mut ov = FfnOverride::default();
-                if !sparse[c][l] {
-                    return ov;
+    // Forward por capas: UNA llamada con toda la secuencia. El override se construye
+    // UNA vez por (candidato, capa); las proyecciones + FFN se batchean sobre N×n_pos.
+    let all_logits = gen.forward_batched_any_seq(
+        &mut orch,
+        &tokens[..n_pos],
+        &mut cand_kv,
+        n_cand,
+        |c, l| {
+            let mut ov = FfnOverride::default();
+            if !sparse[c][l] {
+                return ov;
+            }
+            for (block, din, dout) in &dims {
+                let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
+                let Ok(adj) = std::fs::read(&adj_path) else { continue };
+                let name = format!("blk.{l}.{block}.weight");
+                let Ok(w0) = cat.dequant_f32(&name) else { continue };
+                let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
+                match block.as_str() {
+                    "ffn_gate" => ov.gate = Some(csr),
+                    "ffn_up" => ov.up = Some(csr),
+                    _ => ov.down = Some(csr),
                 }
-                for (block, din, dout) in &dims {
-                    let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
-                    let Ok(adj) = std::fs::read(&adj_path) else { continue };
-                    let name = format!("blk.{l}.{block}.weight");
-                    let Ok(w0) = cat.dequant_f32(&name) else { continue };
-                    let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
-                    match block.as_str() {
-                        "ffn_gate" => ov.gate = Some(csr),
-                        "ffn_up" => ov.up = Some(csr),
-                        _ => ov.down = Some(csr),
-                    }
-                }
-                ov
-            },
-            &mut scratch,
-        )?;
+            }
+            ov
+        },
+    )?;
+    let vocab = gen.config.vocab_size;
+    for pos in 0..n_pos {
         for c in 0..n_cand {
-            kl_sum[c] += softmax_kl(&teacher[pos], &lg[c]);
+            kl_sum[c] += softmax_kl(
+                &teacher[pos],
+                &all_logits[c][pos * vocab..(pos + 1) * vocab],
+            );
         }
         eprintln!("[kl_eval_batch] token {pos}/{n_pos} ok");
     }
