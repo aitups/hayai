@@ -1,6 +1,6 @@
 use crate::context::{OpenClEngine, OpenClError};
 use opencl3::kernel::ExecuteKernel;
-use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
+use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl3::types::{cl_float, cl_int, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
 use std::ptr;
 use tracing::debug;
@@ -594,6 +594,112 @@ impl OpenClEngine {
         }
         debug!(
             "OpenCL spmm_adj_batched_q4 [{batch}×{d_out}×{d_in}] on {}",
+            self.device_info.device_name
+        );
+        Ok(())
+    }
+
+    /// SpMM esparso batcheado con **dequant Q4_K en la GPU** (Fase 2, criterio
+    /// C1/C4): sube el Q4 (8× menos PCIe que el F32) y encadena `dequant_q4_k_to_f32`
+    /// → `spmm_adj_batched` en la MISMA cola (un único wait). Elimina el dequant CPU
+    /// de 23 GB/gen y el upload F32; el trabajo de dequant pasa a la GPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spmm_adj_batched_q4gpu(
+        &self,
+        x: &[f32],
+        adjs: &[u8],
+        w4: &[u8],
+        n_cands: usize,
+        n_pos: usize,
+        d_in: usize,
+        d_out: usize,
+        output: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        let batch = n_cands * n_pos;
+        let n = d_out * d_in;
+        assert_eq!(output.len(), batch * d_out);
+        if adjs.is_empty() || w4.is_empty() {
+            output.fill(0.0);
+            return Ok(());
+        }
+
+        let mut x_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_q4gpu x buffer: {e}")))?
+        };
+        let mut a_buf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, adjs.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_q4gpu adj buffer: {e}")))?
+        };
+        let mut w4_buf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, w4.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_q4gpu w4 buffer: {e}")))?
+        };
+        let f32_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                n,
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("spmm_q4gpu f32 buffer: {e}")))?
+        };
+        let output_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                output.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("spmm_q4gpu output buffer: {e}")))?
+        };
+
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut x_buf, CL_NON_BLOCKING, 0, x, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_q4gpu x: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut a_buf, CL_NON_BLOCKING, 0, adjs, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_q4gpu adjs: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut w4_buf, CL_NON_BLOCKING, 0, w4, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_q4gpu w4: {e}")))?;
+        }
+
+        let n_blocks = n / 256;
+        let deq_event = unsafe {
+            ExecuteKernel::new(&self.dequant_q4_k_to_f32)
+                .set_arg(&w4_buf)
+                .set_arg(&(n as cl_int))
+                .set_arg(&f32_buf)
+                .set_global_work_size(n_blocks)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue dequant_q4_k_to_f32: {e}")))?
+        };
+
+        let global = batch * d_out;
+        let spmm_event = unsafe {
+            ExecuteKernel::new(&self.spmm_adj_batched)
+                .set_arg(&x_buf)
+                .set_arg(&a_buf)
+                .set_arg(&f32_buf)
+                .set_arg(&(d_in as cl_int))
+                .set_arg(&(d_out as cl_int))
+                .set_arg(&(n_pos as cl_int))
+                .set_arg(&output_buf)
+                .set_global_work_size(global)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue spmm_adj_batched: {e}")))?
+        };
+
+        let wait = [deq_event.get(), spmm_event.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, output, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read spmm_adj_batched_q4gpu: {e}")))?;
+        }
+        debug!(
+            "OpenCL spmm_adj_batched_q4gpu [{batch}×{d_out}×{d_in}] on {}",
             self.device_info.device_name
         );
         Ok(())

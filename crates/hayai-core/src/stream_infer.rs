@@ -252,7 +252,7 @@ impl StreamingGenerator {
         let mut out_sub = vec![0.0f32; sel.len() * n_pos * d_out];
         if let Some(eng) = orch.opencl_engine() {
             if let Some(q4) = w_q4 {
-                eng.spmm_adj_batched_q4(&x_sub, &adjs, q4, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
+                eng.spmm_adj_batched_q4gpu(&x_sub, &adjs, q4, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
             } else if let Some(w0) = w {
                 eng.spmm_adj_batched(&x_sub, &adjs, w0, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
             } else {
@@ -1950,9 +1950,9 @@ pub fn forward_batched_seq(
         // Q4_K, el kernel `spmm_adj_batched_q4` dequantiza en la GPU (sin
         // materializar 23 GB F32/gen); si no, se dequantiza el F32 una vez por capa.
         let has_gpu = orch.opencl_engine().is_some();
-        // Q4-K en-kernel es opt-in (HAYAI_SPMM_Q4=1): en la RTX 4050 el dequant
-        // en-kernel con lecturas de bloques aleatorias es memory-bound y más lento
-        // que el F32 compartido; el F32 es el default validado (C4).
+        // Dequant Q4_K en GPU es opt-in (HAYAI_SPMM_Q4=1): bit-exacto y VRAM en
+        // rango C2 (2.0 GB) pero ~2x mas lento en la RTX 4050 (686s vs 360s del
+        // F32 compartido, buffer F32 de 356 MB por capa). F32 es el default (C4).
         let can_q4 = std::env::var("HAYAI_SPMM_Q4").ok().as_deref() == Some("1")
             && pack.gate.ggml_type == GgmlType::Q4_K;
         let gate_w = if has_gpu && can_q4 {

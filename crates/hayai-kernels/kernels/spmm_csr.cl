@@ -127,3 +127,40 @@ __kernel void spmm_adj_batched_q4(
     }
     y[b * d_out + j] = acc;
 }
+
+// Dequant Q4_K -> F32 batcheado (un work-item por bloque de 256): rellena el
+// buffer F32 que consume `spmm_adj_batched` — se encadena en la MISMA cola tras el
+// upload del Q4 (8× menos PCIe que el F32) y antes del SpMM (Fase 2, C1/C4).
+__kernel void dequant_q4_k_to_f32(
+    __global const uchar* w4,      // Q4_K [n] packed (144 B/256 val)
+    const int n,                   // total de elementos (múltiplo de 256)
+    __global float* out)           // n floats
+{
+    const int gid = get_global_id(0);
+    const long block = (long)gid * 144;
+    const __global uchar* b = w4 + block;
+    const float d = f16_to_f32((unsigned short)(b[0] | (b[1] << 8)));
+    const float minv = f16_to_f32((unsigned short)(b[2] | (b[3] << 8)));
+    const __global uchar* scales = b + 4;
+    const __global uchar* q = b + 16;
+    long yo = (long)gid * 256;
+    for (int g = 0; g < 4; g++) {
+        const int sub0 = 2 * g;
+        const int sub1 = sub0 + 1;
+        int sc0, m0, sc1, m1;
+        if (sub0 < 4) { sc0 = scales[sub0] & 63; m0 = scales[sub0 + 4] & 63; }
+        else { sc0 = (scales[sub0 + 4] & 0x0Fu) | ((scales[sub0 - 4] >> 6) << 4); m0 = (scales[sub0 + 4] >> 4) | ((scales[sub0] >> 6) << 4); }
+        if (sub1 < 4) { sc1 = scales[sub1] & 63; m1 = scales[sub1 + 4] & 63; }
+        else { sc1 = (scales[sub1 + 4] & 0x0Fu) | ((scales[sub1 - 4] >> 6) << 4); m1 = (scales[sub1 + 4] >> 4) | ((scales[sub1] >> 6) << 4); }
+        const float d1 = d * (float)sc0;
+        const float m1v = minv * (float)m0;
+        const float d2 = d * (float)sc1;
+        const float m2v = minv * (float)m1;
+        for (int l = 0; l < 32; l++) {
+            out[yo + l] = d1 * (float)(q[l] & 0x0Fu) - m1v;
+            out[yo + 32 + l] = d2 * (float)(q[l] >> 4) - m2v;
+        }
+        q += 32;
+        yo += 64;
+    }
+}

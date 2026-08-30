@@ -925,7 +925,7 @@ pub(crate) fn forward_batched_hybrid_seq(
         // dequantiza en GPU (sin 23 GB F32/gen); si no, dequant F32 una vez por capa.
         let ffn = gen.catalog.load_ffn_matrices(layer)?;
         let has_gpu = orch.opencl_engine().is_some();
-        // Q4-K en-kernel es opt-in (HAYAI_SPMM_Q4=1); F32 compartido es el default.
+        // Dequant Q4_K en GPU opt-in (HAYAI_SPMM_Q4=1); F32 compartido por defecto.
         let can_q4 = std::env::var("HAYAI_SPMM_Q4").ok().as_deref() == Some("1")
             && ffn.0.ggml_type == GgmlType::Q4_K;
         let gate_w = if has_gpu && can_q4 {
