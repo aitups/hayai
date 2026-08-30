@@ -141,6 +141,89 @@ impl OpenClEngine {
         self.ggml_gemv_dispatch(&self.gemv_q4_k, "q4_k", m, n, weights, input, output)
     }
 
+    /// GEMV Q4_K **batcheado** (Fase 2, criterios C1/C4): `batch` candidatos en un
+    /// único dispatch `[batch*m]`; los pesos se leen una vez por work-item y el
+    /// L2/L1 los reutiliza entre candidatos. `inputs` = `batch*n`, `outputs` = `batch*m`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ggml_gemv_batched_q4_k(
+        &self,
+        m: usize,
+        n: usize,
+        weights: &[u8],
+        inputs: &[f32],
+        outputs: &mut [f32],
+        batch: usize,
+    ) -> Result<(), OpenClError> {
+        assert_eq!(inputs.len(), batch * n);
+        assert_eq!(outputs.len(), batch * m);
+        let m_i = m as cl_int;
+        let n_i = n as cl_int;
+        let batch_i = batch as cl_int;
+        let off_i = 0i64;
+
+        let mut weights_buf = unsafe {
+            Buffer::<cl_uchar>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                weights.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("weights buffer: {e}")))?
+        };
+        let mut input_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, batch * n, ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("input buffer: {e}")))?
+        };
+        let output_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                batch * m,
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("output buffer: {e}")))?
+        };
+
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut weights_buf, CL_BLOCKING, 0, weights, &[])
+                .map_err(|e| OpenClError::ClError(format!("write weights: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, inputs, &[])
+                .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
+        }
+
+        let local = preferred_local_size(m);
+        let global = (((batch * m) + local - 1) / local) * local;
+
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.gemv_batched_q4_k)
+                .set_arg(&m_i)
+                .set_arg(&n_i)
+                .set_arg(&off_i)
+                .set_arg(&batch_i)
+                .set_arg(&weights_buf)
+                .set_arg(&input_buf)
+                .set_arg(&output_buf)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue batched q4_k: {e}")))?
+        };
+
+        let wait = [kernel_event.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, outputs, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read output: {e}")))?;
+        }
+        debug!(
+            "OpenCL ggml_gemv_batched_q4_k [{batch}×{m}×{n}] on {}",
+            self.device_info.device_name
+        );
+        Ok(())
+    }
+
     pub fn ggml_gemv_q6_k(
         &self,
         m: usize,

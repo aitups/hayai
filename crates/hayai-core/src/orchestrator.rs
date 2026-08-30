@@ -169,6 +169,38 @@ impl EngineOrchestrator {
             .map_err(|e| OrchestratorError::Msg(e.to_string()))
     }
 
+    /// GEMV **batcheado** de `batch` candidatos (Fase 2, criterios C1/C4): un único
+    /// dispatch `[batch×M]` para Q4_K (los pesos se leen una vez); para otros
+    /// tipos o sin GPU, N gemvs secuenciales. `inputs` = `batch*ncols`,
+    /// `outputs` = `batch*nrows`.
+    pub fn execute_quant_gemv_batched(
+        &mut self,
+        matrix: &QuantMatrix,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        batch: usize,
+    ) -> Result<(), OrchestratorError> {
+        let m = matrix.nrows;
+        let n = matrix.ncols;
+        if let Some(cl) = self.opencl_engine() {
+            if matrix.ggml_type == GgmlType::Q4_K {
+                return cl
+                    .ggml_gemv_batched_q4_k(m, n, matrix.data(), inputs, outputs, batch)
+                    .map_err(OrchestratorError::OpenCl);
+            }
+            for b in 0..batch {
+                self.execute_quant_gemv(matrix, &inputs[b * n..(b + 1) * n], &mut outputs[b * m..(b + 1) * m])?;
+            }
+            return Ok(());
+        }
+        for b in 0..batch {
+            matrix
+                .gemv(&inputs[b * n..(b + 1) * n], &mut outputs[b * m..(b + 1) * m])
+                .map_err(|e| OrchestratorError::Msg(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Execute a GEMV honoring the **plan's per-op binding** (Track L2): ops bound
     /// to `Cpu`/`HostRowRead` (attention, router, norms) stay on CPU even when a
     /// GPU pool exists; `GpuAsync` ops (FFN/experts/output) use the pool. Passive

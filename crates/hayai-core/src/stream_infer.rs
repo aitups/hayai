@@ -1583,17 +1583,13 @@ impl StreamingGenerator {
     }
 
     /// Forward **batcheado** de N candidatos (Fase 2, path Dense — llama/ALIA):
-    /// procesa los N candidatos en un único paso por capa con override de FFN por
-    /// (candidato, capa) construido al vuelo por `get_override(cand, layer)` y
-    /// liberado al terminar la capa (RAM acotada). El modelo (pesos de capa) se
-    /// carga UNA vez por token.
+    /// un único paso por capa con override de FFN por (candidato, capa). Las
+    /// proyecciones de atención y el FFN denso usan **GEMM batcheado** (un
+    /// dispatch `[N×M]`, pesos leídos una vez — criterios C1/C4). `get_override`
+    /// construye el CSR al vuelo y se libera al terminar la capa (RAM acotada).
     ///
     /// `pos` y `kv` (por candidato, por capa) son **persistentes**: en
-    /// teacher-forcing el token `t` debe atender a su historia (KV acumulada).
-    /// El llamador crea el KV una vez y avanza `pos` por token.
-    ///
-    /// Híbridos/gemma/MoE despachan por `ModelKind` (ver `decode_step`); la
-    /// extensión batcheada para cada familia vive en su módulo.
+    /// teacher-forcing el token `t` atiende a su historia (KV acumulada).
     pub fn forward_batched(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -1615,100 +1611,128 @@ impl StreamingGenerator {
                 kv.len()
             )));
         }
+        let n = n_candidates;
 
         // Activaciones por candidato (mismo token).
-        let mut x: Vec<Vec<f32>> = Vec::with_capacity(n_candidates);
-        for _ in 0..n_candidates {
+        let mut x: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for _ in 0..n {
             let mut emb = vec![0.0f32; h];
             self.embed_row("token_embd.weight", token, h, &mut emb)?;
             x.push(emb);
         }
+        let mut x_flat = vec![0.0f32; n * h];
+        let mut q_flat = vec![0.0f32; n * q_dim];
+        let mut k_flat = vec![0.0f32; n * kv_dim];
+        let mut v_flat = vec![0.0f32; n * kv_dim];
+        let mut attn_out_flat = vec![0.0f32; n * q_dim];
+        let mut attn_proj_flat = vec![0.0f32; n * h];
+        let mut gate_flat = vec![0.0f32; n * ff];
+        let mut up_flat = vec![0.0f32; n * ff];
+        let mut down_flat = vec![0.0f32; n * h];
 
         for layer_idx in 0..n_layers {
             let pack = self.load_pack(layer_idx)?;
-            for c in 0..n_candidates {
-                let ov = get_override(c, layer_idx);
+            let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer_idx)).collect();
 
-                // Atención (CPU) — como forward_inner.
-                let mut xn = x[c].clone();
-                rms_norm(&mut xn, &self.layer_norms[layer_idx].attn_norm, eps);
-                let mut q = vec![0.0f32; q_dim];
-                let mut k = vec![0.0f32; kv_dim];
-                let mut v = vec![0.0f32; kv_dim];
-                pack.wq.gemv(&xn, &mut q)?;
-                pack.wk.gemv(&xn, &mut k)?;
-                pack.wv.gemv(&xn, &mut v)?;
-                let mut attn_out = vec![0.0f32; q_dim];
+            // ── Atención: norm + proyecciones batcheadas + núcleo por candidato.
+            for c in 0..n {
+                x_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+                rms_norm(
+                    &mut x_flat[c * h..(c + 1) * h],
+                    &self.layer_norms[layer_idx].attn_norm,
+                    eps,
+                );
+            }
+            orch.execute_quant_gemv_batched(&pack.wq, &x_flat, &mut q_flat, n)?;
+            orch.execute_quant_gemv_batched(&pack.wk, &x_flat, &mut k_flat, n)?;
+            orch.execute_quant_gemv_batched(&pack.wv, &x_flat, &mut v_flat, n)?;
+            for c in 0..n {
                 attention_decode_step(
                     &self.attn_cfg,
                     &mut kv[c][layer_idx],
-                    &mut q,
-                    &mut k,
-                    &v,
+                    &mut q_flat[c * q_dim..(c + 1) * q_dim],
+                    &mut k_flat[c * kv_dim..(c + 1) * kv_dim],
+                    &v_flat[c * kv_dim..(c + 1) * kv_dim],
                     pos,
-                    &mut attn_out,
+                    &mut attn_out_flat[c * q_dim..(c + 1) * q_dim],
                 );
-                if let Some(ref gate_w) = pack.attn_gate {
-                    let mut gate = vec![0.0f32; q_dim];
-                    gate_w.gemv(&xn, &mut gate)?;
-                    for i in 0..q_dim {
-                        attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+            }
+            if let Some(ref gate_w) = pack.attn_gate {
+                let mut ag = vec![0.0f32; n * q_dim];
+                orch.execute_quant_gemv_batched(gate_w, &x_flat, &mut ag, n)?;
+                for i in 0..n * q_dim {
+                    attn_out_flat[i] *= 1.0 / (1.0 + (-ag[i]).exp());
+                }
+            }
+            orch.execute_quant_gemv_batched(&pack.wo, &attn_out_flat, &mut attn_proj_flat, n)?;
+            for c in 0..n {
+                for i in 0..h {
+                    x[c][i] += attn_proj_flat[c * h + i];
+                }
+            }
+
+            // ── FFN: norm + gate/up denso batcheado + override CSR + down.
+            for c in 0..n {
+                x_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+                rms_norm(
+                    &mut x_flat[c * h..(c + 1) * h],
+                    &self.layer_norms[layer_idx].ffn_norm,
+                    eps,
+                );
+            }
+            let has_any_ov = ov
+                .iter()
+                .any(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some());
+            orch.execute_quant_gemv_batched(&pack.gate, &x_flat, &mut gate_flat, n)?;
+            orch.execute_quant_gemv_batched(&pack.up, &x_flat, &mut up_flat, n)?;
+            if has_any_ov {
+                for c in 0..n {
+                    if let Some(cs) = ov[c].gate.as_ref() {
+                        let out = self.spmm_csr(orch, &x_flat[c * h..(c + 1) * h], cs)?;
+                        gate_flat[c * ff..(c + 1) * ff].copy_from_slice(&out);
+                    }
+                    if let Some(cs) = ov[c].up.as_ref() {
+                        let out = self.spmm_csr(orch, &x_flat[c * h..(c + 1) * h], cs)?;
+                        up_flat[c * ff..(c + 1) * ff].copy_from_slice(&out);
                     }
                 }
-                let mut attn_proj = vec![0.0f32; h];
-                pack.wo.gemv(&attn_out, &mut attn_proj)?;
-                for i in 0..h {
-                    x[c][i] += attn_proj[i];
-                }
-
-                // FFN: override (Vía B) > CSR embebido > denso.
-                let mut xn = x[c].clone();
-                rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
-                let gate_csr = ov.gate.as_ref().or(pack.gate_csr.as_ref());
-                let mut gate = vec![0.0f32; ff];
-                let mut up = vec![0.0f32; ff];
-                let mut down = vec![0.0f32; h];
-                if let Some(cs) = gate_csr {
-                    gate.copy_from_slice(&self.spmm_csr(orch, &xn, cs)?);
-                } else {
-                    orch.execute_quant_gemv(&pack.gate, &xn, &mut gate)?;
-                }
-                let up_csr = ov.up.as_ref().or(pack.up_csr.as_ref());
-                if let Some(cs) = up_csr {
-                    up.copy_from_slice(&self.spmm_csr(orch, &xn, cs)?);
-                } else {
-                    orch.execute_quant_gemv(&pack.up, &xn, &mut up)?;
-                }
-                for i in 0..ff {
-                    let g = gate[i];
-                    gate[i] = (g / (1.0 + (-g).exp())) * up[i];
-                }
-                let down_csr = ov.down.as_ref().or(pack.down_csr.as_ref());
-                if let Some(cs) = down_csr {
-                    down.copy_from_slice(&self.spmm_csr(orch, &gate, cs)?);
-                } else {
-                    orch.execute_quant_gemv(&pack.down, &gate, &mut down)?;
-                }
-                for i in 0..h {
-                    x[c][i] += down[i];
-                }
-                // `ov` (y sus CSR) se libera aquí.
             }
+            for i in 0..n * ff {
+                let g = gate_flat[i];
+                gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
+            }
+            orch.execute_quant_gemv_batched(&pack.down, &gate_flat, &mut down_flat, n)?;
+            if has_any_ov {
+                for c in 0..n {
+                    if let Some(cs) = ov[c].down.as_ref() {
+                        let out = self.spmm_csr(orch, &gate_flat[c * ff..(c + 1) * ff], cs)?;
+                        down_flat[c * h..(c + 1) * h].copy_from_slice(&out);
+                    }
+                }
+            }
+            for c in 0..n {
+                for i in 0..h {
+                    x[c][i] += down_flat[c * h + i];
+                }
+            }
+            // `ov` (y sus CSR) se libera aquí.
         }
 
-        // lm_head por candidato.
+        // ── lm_head batcheado.
         let vocab = self.config.vocab_size;
         let ow = self
             .catalog
             .load_quant_matrix("output.weight")
             .or_else(|_| self.catalog.load_quant_matrix("token_embd.weight"))?;
-        let mut out = Vec::with_capacity(n_candidates);
-        for c in 0..n_candidates {
-            let mut xn = x[c].clone();
-            rms_norm(&mut xn, &self.output_norm, eps);
-            let mut logits = vec![0.0f32; vocab];
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            out.push(logits);
+        for c in 0..n {
+            x_flat[c * h..(c + 1) * h].copy_from_slice(&x[c]);
+            rms_norm(&mut x_flat[c * h..(c + 1) * h], &self.output_norm, eps);
+        }
+        let mut logits_flat = vec![0.0f32; n * vocab];
+        orch.execute_quant_gemv_batched(&ow, &x_flat, &mut logits_flat, n)?;
+        let mut out = Vec::with_capacity(n);
+        for c in 0..n {
+            out.push(logits_flat[c * vocab..(c + 1) * vocab].to_vec());
         }
         Ok(out)
     }

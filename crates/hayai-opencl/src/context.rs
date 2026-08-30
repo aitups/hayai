@@ -35,6 +35,8 @@ pub struct OpenClEngine {
     pub gemv_q2_k: Kernel,
     pub gemv_q3_k: Kernel,
     pub gemv_q4_k: Kernel,
+    /// Batcheado Q4_K: N candidatos en un dispatch (Fase 2, criterios C1/C4).
+    pub gemv_batched_q4_k: Kernel,
     pub gemv_q5_k: Kernel,
     pub gemv_q6_k: Kernel,
     pub gemv_iq4_nl: Kernel,
@@ -120,6 +122,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("q3_k kernel: {}", e)))?;
         let gemv_q4_k = Kernel::create(&program, "ggml_gemv_q4_k")
             .map_err(|e| OpenClError::ClError(format!("q4_k kernel: {}", e)))?;
+        let gemv_batched_q4_k = Kernel::create(&program, "ggml_gemv_batched_q4_k")
+            .map_err(|e| OpenClError::ClError(format!("batched q4_k kernel: {}", e)))?;
         let gemv_q5_k = Kernel::create(&program, "ggml_gemv_q5_k")
             .map_err(|e| OpenClError::ClError(format!("q5_k kernel: {}", e)))?;
         let gemv_q6_k = Kernel::create(&program, "ggml_gemv_q6_k")
@@ -163,6 +167,7 @@ impl OpenClEngine {
             gemv_q2_k,
             gemv_q3_k,
             gemv_q4_k,
+            gemv_batched_q4_k,
             gemv_q5_k,
             gemv_q6_k,
             gemv_iq4_nl,
