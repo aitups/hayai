@@ -64,3 +64,4 @@ Thumbs.db
 *.pem
 *.key
 propuesta_de_optimización.md
+target_q4gpu/
