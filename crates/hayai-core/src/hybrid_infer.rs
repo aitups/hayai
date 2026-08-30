@@ -10,7 +10,7 @@ use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
     ffn_begin_gate_up_scratch, ffn_finish_scratch, StreamInferError, StreamingGenerator,
 };
-use hayai_cpu::{attention_decode_step, rms_norm};
+use hayai_cpu::{attention_decode_step, rms_norm, LayerKvCache};
 use hayai_opencl::StreamingScratch;
 use std::time::Instant;
 
@@ -154,7 +154,7 @@ fn dump_top_logits(logits: &[f32], k: usize) {
     eprintln!();
 }
 
-fn ensure_deltanet_cache(gen: &mut StreamingGenerator) -> Result<(), StreamInferError> {
+pub(crate) fn ensure_deltanet_cache(gen: &mut StreamingGenerator) -> Result<(), StreamInferError> {
     if gen.deltanet_weights.is_some() {
         return Ok(());
     }
@@ -524,15 +524,118 @@ fn apply_head_rmsnorm(
         let base = h * head_dim;
         let mut ms = 0.0f32;
         for i in 0..head_dim {
-            ms += x[base + i] * x[base + i];
+            let v = x[base + i];
+            ms += v * v;
         }
         let inv = 1.0 / (ms / head_dim as f32 + eps).sqrt();
         for i in 0..head_dim {
-            let w = weight.get(i).copied().unwrap_or(1.0);
-            x[base + i] *= inv * w;
+            x[base + i] *= weight[i] * inv;
         }
     }
 }
+
+/// Forward **batcheado** híbrido (Fase 2): procesa N candidatos por capa con
+/// override de FFN por (candidato, capa) y estado recurrente (KV + DeltaNet) por
+/// candidato — agnóstico a la arquitectura híbrida (qwen35/qwen27). Reutiliza
+/// `run_deltanet_block` / `run_full_attn_block` intercambiando el estado del
+/// generador por el del candidato (el bloque validado se ejecuta sin cambios).
+pub(crate) fn forward_batched_hybrid(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    token: u32,
+    pos: usize,
+    scratch: &mut StreamingScratch,
+    kv: &mut [Vec<LayerKvCache>],
+    dn: &mut [Vec<Option<DeltaNetState>>],
+    n_candidates: usize,
+    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+) -> Result<Vec<Vec<f32>>, StreamInferError> {
+    let h = gen.config.hidden_size;
+    let eps = gen.config.rms_norm_eps;
+    let n_layers = gen.config.num_layers;
+    let n = n_candidates;
+    if kv.len() < n || dn.len() < n {
+        return Err(StreamInferError::Msg(format!(
+            "forward_batched_hybrid: kv/dn tienen {} filas, se necesitan {n}",
+            kv.len().min(dn.len())
+        )));
+    }
+    ensure_deltanet_cache(gen)?;
+
+    let mut x: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut emb = vec![0.0f32; h];
+        gen.embed_row("token_embd.weight", token, h, &mut emb)?;
+        x.push(emb);
+    }
+
+    for layer in 0..n_layers {
+        for c in 0..n {
+            let ov = get_override(c, layer);
+            // Mueve el estado DeltaNet del candidato al generador (y el del
+            // generador a dn[c]); idem para el KV.
+            std::mem::swap(&mut gen.kv, &mut kv[c]);
+            let mut moved: Option<Vec<Option<DeltaNetState>>> = None;
+            if let Some(v) = gen.deltanet_states.as_mut() {
+                moved = Some(std::mem::take(v));
+            }
+            if let (Some(m), Some(cand)) = (moved.as_mut(), dn.get_mut(c)) {
+                std::mem::swap(m, cand);
+            }
+            if let Some(v) = gen.deltanet_states.as_mut() {
+                *v = moved.take().unwrap();
+            }
+            match hybrid_layer_kind(&gen.catalog, layer) {
+                HybridLayerKind::DeltaNet => {
+                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x[c], Some(&ov))?;
+                }
+                HybridLayerKind::FullAttn => {
+                    run_full_attn_block(gen, orch, scratch, layer, pos, eps, &mut x[c], Some(&ov))?;
+                }
+                HybridLayerKind::NextN => {}
+            }
+            // Restaura el estado del generador (swap inverso).
+            let mut moved: Option<Vec<Option<DeltaNetState>>> = None;
+            if let Some(v) = gen.deltanet_states.as_mut() {
+                moved = Some(std::mem::take(v));
+            }
+            if let (Some(m), Some(cand)) = (moved.as_mut(), dn.get_mut(c)) {
+                std::mem::swap(m, cand);
+            }
+            if let Some(v) = gen.deltanet_states.as_mut() {
+                *v = moved.take().unwrap();
+            }
+            std::mem::swap(&mut gen.kv, &mut kv[c]);
+        }
+    }
+
+    // lm_head por candidato.
+    let vocab = gen.config.vocab_size;
+    let mut out = Vec::with_capacity(n);
+    for c in 0..n {
+        let mut xn = x[c].clone();
+        rms_norm(&mut xn, &gen.output_norm, eps);
+        let mut logits = vec![0.0f32; vocab];
+        if gen.has_output_weight {
+            if let Some(ow) = &gen.resident_output {
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let ow = gen.catalog.load_quant_matrix("output.weight")?;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
+        } else {
+            if let Some(emb) = &gen.resident_embed {
+                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            } else {
+                let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
+            }
+        }
+        out.push(logits);
+    }
+    Ok(out)
+}
+
 
 /// Split fused Qwen3.5 Q-projection: `[Q0|G0|Q1|G1|…]` → `(Q, gate)`.
 fn deinterleave_qg(q_full: &[f32], n_heads: usize, head_dim: usize) -> (Vec<f32>, Option<Vec<f32>>) {

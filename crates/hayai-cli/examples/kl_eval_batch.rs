@@ -170,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::default(), 42)?;
     gen.set_memory_strategy(MemoryStrategy::Minimal);
     let mut orch = EngineOrchestrator::new(ExecutionMode::parse(&device), gen.config.clone());
+    let mut scratch = gen.prepare_session(&mut orch)?;
 
     let tokens = gen.tokenizer.encode(&corpus, false);
     let n_pos = tokens.len().min(n_positions);
@@ -220,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut tkv = kv_cfg();
             let mut t = Vec::with_capacity(n_pos);
             for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-                let lg = gen.forward_batched(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default())?;
+                let lg = gen.forward_batched_any(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default(), &mut scratch)?;
                 t.push(lg[0].clone());
             }
             save_teacher_cache(p, &t)?;
@@ -230,40 +231,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tkv = kv_cfg();
         let mut t = Vec::with_capacity(n_pos);
         for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-            let lg = gen.forward_batched(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default())?;
+            let lg = gen.forward_batched_any(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default(), &mut scratch)?;
             t.push(lg[0].clone());
         }
         t
     };
 
-    // Construye los CSR de cada (candidato, capa) desde las adyacencias.
-    eprintln!("[kl_eval_batch] construyendo overrides ({n_cand}×{n_layers})…");
-    let mut overrides: Vec<Vec<FfnOverride>> = Vec::with_capacity(n_cand);
+    // KL por token: forward batcheado agnóstico (Dense/Hybrid). El override se
+    // construye al vuelo por (candidato, capa) con cache por capa — RAM acotada
+    // (viable para 27B/40B, donde retener todos los CSR exigiría cientos de GB).
     let mut d_arch_num = vec![0.0f64; n_cand];
-    for c in 0..n_cand {
-        let mut per_layer = Vec::with_capacity(n_layers);
-        for layer in 0..n_layers {
-            let mut ov = FfnOverride::default();
-            for (block, din, dout) in &dims {
-                let adj_path = adj_dir.join(format!("c{c:03}.l{layer:02}.{block}.bin"));
-                let adj = std::fs::read(&adj_path)?;
-                let name = format!("blk.{layer}.{block}.weight");
-                let w0 = cat.dequant_f32(&name)?;
-                let active: usize = adj.iter().map(|b| b.count_ones() as usize).sum();
-                d_arch_num[c] += (1.0 - active as f64 / (din * dout) as f64) * (din * dout) as f64;
-                let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
-                match block.as_str() {
-                    "ffn_gate" => ov.gate = Some(csr),
-                    "ffn_up" => ov.up = Some(csr),
-                    _ => ov.down = Some(csr),
-                }
-            }
-            per_layer.push(ov);
-        }
-        overrides.push(per_layer);
-    }
-
-    // KL por token: forward batcheado de los N candidatos (KV persistente por candidato).
     let mut cand_kv: Vec<Vec<LayerKvCache>> = (0..n_cand)
         .map(|_| {
             (0..gen.config.num_layers)
@@ -273,7 +250,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut kl_sum = vec![0.0f32; n_cand];
     for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-        let lg = gen.forward_batched(&mut orch, tok, pos, &mut cand_kv, n_cand, |c, l| overrides[c][l].clone())?;
+        let lg = gen.forward_batched_any(
+            &mut orch,
+            tok,
+            pos,
+            &mut cand_kv,
+            n_cand,
+            |c, l| {
+                let mut ov = FfnOverride::default();
+                for (block, din, dout) in &dims {
+                    let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
+                    let Ok(adj) = std::fs::read(&adj_path) else { continue };
+                    let name = format!("blk.{l}.{block}.weight");
+                    let Ok(w0) = cat.dequant_f32(&name) else { continue };
+                    let active: usize = adj.iter().map(|b| b.count_ones() as usize).sum();
+                    if pos == 0 {
+                        d_arch_num[c] +=
+                            (1.0 - active as f64 / (din * dout) as f64) * (din * dout) as f64;
+                    }
+                    let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
+                    match block.as_str() {
+                        "ffn_gate" => ov.gate = Some(csr),
+                        "ffn_up" => ov.up = Some(csr),
+                        _ => ov.down = Some(csr),
+                    }
+                }
+                ov
+            },
+            &mut scratch,
+        )?;
         for c in 0..n_cand {
             kl_sum[c] += softmax_kl(&teacher[pos], &lg[c]);
         }
@@ -290,3 +295,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[{}]", parts.join(","));
     Ok(())
 }
+

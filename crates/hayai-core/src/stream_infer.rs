@@ -1582,6 +1582,54 @@ impl StreamingGenerator {
         self.forward_inner(orch, token, None, Some(override_ffn))
     }
 
+    /// Forward batcheado **agnóstico a arquitectura**: despacha Dense → [`Self::forward_batched`]
+    /// y Hybrid → `hybrid_infer::forward_batched_hybrid` (estado KV + DeltaNet por
+    /// candidato). `scratch` se requiere solo para el path Hybrid.
+    pub fn forward_batched_any(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        token: u32,
+        pos: usize,
+        kv: &mut [Vec<LayerKvCache>],
+        n_candidates: usize,
+        mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Vec<Vec<f32>>, StreamInferError> {
+        match self.model_kind() {
+            ModelKind::Hybrid => {
+                // Crea un estado DeltaNet fresco por candidato (solo capas deltanet).
+                crate::hybrid_infer::ensure_deltanet_cache(self)?;
+                let mut dn: Vec<Vec<Option<crate::deltanet::DeltaNetState>>> = Vec::with_capacity(n_candidates);
+                for _ in 0..n_candidates {
+                    let mut per_layer: Vec<Option<crate::deltanet::DeltaNetState>> = Vec::with_capacity(self.config.num_layers);
+                    for layer in 0..self.config.num_layers {
+                        if crate::deltanet::is_deltanet_layer(&self.catalog, layer) {
+                            let w = self
+                                .deltanet_weights
+                                .as_ref()
+                                .and_then(|v| v[layer].as_ref())
+                                .ok_or_else(|| StreamInferError::Msg("deltanet weights ausentes".into()))?;
+                            per_layer.push(Some(crate::deltanet::DeltaNetState::new(
+                                w.conv_k, w.conv_dim, w.n_v_heads, w.head_k, w.head_v,
+                            )));
+                        } else {
+                            per_layer.push(None);
+                        }
+                    }
+                    dn.push(per_layer);
+                }
+                crate::hybrid_infer::forward_batched_hybrid(
+                    self, orch, token, pos, scratch, kv, &mut dn, n_candidates, get_override,
+                )
+            }
+            ModelKind::Dense => self.forward_batched(orch, token, pos, kv, n_candidates, get_override),
+            other => Err(StreamInferError::Msg(format!(
+                "forward_batched_any: ModelKind {} sin batch (Dense/Hybrid soportados)",
+                format!("{other:?}")
+            ))),
+        }
+    }
+
     /// Forward **batcheado** de N candidatos (Fase 2, path Dense — llama/ALIA):
     /// un único paso por capa con override de FFN por (candidato, capa). Las
     /// proyecciones de atención y el FFN denso usan **GEMM batcheado** (un
