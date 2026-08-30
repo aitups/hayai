@@ -26,7 +26,62 @@ pub struct FfnOverride {
     pub up: Option<CsrSparse>,
     /// CSR del down (None = path por defecto).
     pub down: Option<CsrSparse>,
+    /// Adyacencia directa + pesos F32 del profesor (sin CSR) — Fase 2, C4.
+    /// Evita el gather del CSR por (candidato, capa, token).
+    pub gate_adj: Option<SparseAdj>,
+    pub up_adj: Option<SparseAdj>,
+    pub down_adj: Option<SparseAdj>,
 }
+
+impl FfnOverride {
+    pub fn is_empty(&self) -> bool {
+        self.gate.is_none()
+            && self.up.is_none()
+            && self.down.is_none()
+            && self.gate_adj.is_none()
+            && self.up_adj.is_none()
+            && self.down_adj.is_none()
+    }
+}
+
+/// SpMM directo desde bit-tensor (sin materializar CSR): `Y[j] = sum_i activo(i,j)
+/// x[i]*w[j*d_in+i]`. El bit-tensor y los pesos F32 del profesor se comparten por
+/// capa (dequant una vez por generación); evita el build de CSR por (candidato,
+/// capa, token) que dominaba el tiempo en 27B/40B (Fase 2, criterio C4).
+#[derive(Clone)]
+pub struct SparseAdj {
+    /// Bit-tensor `ffn_dag_adjacency` (conn = i*d_out+j, LSB-first).
+    pub adjacency: Vec<u8>,
+    /// Pesos F32 del profesor en filas j-mayor `[d_out, d_in]`.
+    pub weights: std::sync::Arc<Vec<f32>>,
+    pub d_in: usize,
+    pub d_out: usize,
+}
+
+/// SpMM CPU directo desde `SparseAdj` (batch de n_pos tokens en una pasada).
+pub fn spmm_adj(
+    x: &[f32],
+    adj: &SparseAdj,
+) -> Vec<f32> {
+    let batch = if adj.d_in > 0 { x.len() / adj.d_in } else { 0 };
+    let mut y = vec![0.0f32; batch * adj.d_out];
+    for b in 0..batch {
+        let xb = &x[b * adj.d_in..(b + 1) * adj.d_in];
+        let yb = &mut y[b * adj.d_out..(b + 1) * adj.d_out];
+        for j in 0..adj.d_out {
+            let mut acc = 0.0f32;
+            for i in 0..adj.d_in {
+                let conn = i * adj.d_out + j;
+                if adj.adjacency[conn >> 3] & (1 << (conn & 7)) != 0 {
+                    acc += xb[i] * adj.weights[j * adj.d_in + i];
+                }
+            }
+            yb[j] = acc;
+        }
+    }
+    y
+}
+
 
 pub struct Generator {
     pub weights: LlamaWeights,

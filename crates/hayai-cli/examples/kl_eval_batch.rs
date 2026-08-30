@@ -237,10 +237,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t
     };
 
-    // KL por token: forward batcheado agnóstico (Dense/Hybrid). El override se
-    // construye al vuelo por (candidato, capa) con cache por capa — RAM acotada
-    // (viable para 27B/40B, donde retener todos los CSR exigiría cientos de GB).
+    // Pre-paso: lee cada adyacencia UNA vez por (cand, capa) → d_arch_num + flag
+    // de esparsidad. Las capas densas (>95%) usan el GEMM denso batcheado (sin CSR).
+    let mut sparse: Vec<Vec<bool>> = vec![vec![false; gen.config.num_layers]; n_cand];
     let mut d_arch_num = vec![0.0f64; n_cand];
+    for c in 0..n_cand {
+        for l in 0..gen.config.num_layers {
+            for (block, din, dout) in &dims {
+                let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
+                let Ok(adj) = std::fs::read(&adj_path) else { continue };
+                let total = din * dout;
+                let active: usize = adj.iter().map(|b| b.count_ones() as usize).sum();
+                d_arch_num[c] += (1.0 - active as f64 / total as f64) * total as f64;
+                // Skip SOLO si la capa está exactamente densa (CSR == GEMM denso,
+                // resultado idéntico). Cualquier poda (>0%) requiere el CSR.
+                if active != total {
+                    sparse[c][l] = true;
+                }
+            }
+        }
+    }
     let mut cand_kv: Vec<Vec<LayerKvCache>> = (0..n_cand)
         .map(|_| {
             (0..gen.config.num_layers)
@@ -258,16 +274,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n_cand,
             |c, l| {
                 let mut ov = FfnOverride::default();
+                if !sparse[c][l] {
+                    return ov;
+                }
                 for (block, din, dout) in &dims {
                     let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
                     let Ok(adj) = std::fs::read(&adj_path) else { continue };
                     let name = format!("blk.{l}.{block}.weight");
                     let Ok(w0) = cat.dequant_f32(&name) else { continue };
-                    let active: usize = adj.iter().map(|b| b.count_ones() as usize).sum();
-                    if pos == 0 {
-                        d_arch_num[c] +=
-                            (1.0 - active as f64 / (din * dout) as f64) * (din * dout) as f64;
-                    }
                     let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
                     match block.as_str() {
                         "ffn_gate" => ov.gate = Some(csr),
