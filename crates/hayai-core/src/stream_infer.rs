@@ -15,12 +15,13 @@ use hayai_model::{
 };
 use hayai_opencl::PendingGemv;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
-use crate::infer::{FfnOverride, GenerateStats};
+use crate::infer::{spmm_adj, FfnOverride, GenerateStats, SparseAdj};
 use crate::orchestrator::EngineOrchestrator;
 
 /// Raw host-slot pointer for prefetch threads (other ping-pong slot only).
@@ -212,6 +213,57 @@ impl StreamingGenerator {
             self.ws_down.copy_from_slice(&out);
         } else {
             orch.execute_quant_gemv(&pack.down, &self.ws_gate, &mut self.ws_down)?;
+        }
+        Ok(())
+    }
+
+    /// Aplica los overrides `SparseAdj` (bit-tensor + pesos F32 compartidos por capa)
+    /// de un bloque FFN (gate/up/down) de forma **batcheada en GPU** — Fase 2, C4:
+    /// `sel` candidatos en un único dispatch `spmm_adj_batched` sobre `[N×n_pos, d_in]`.
+    /// Evita el build/gather del CSR por (candidato, capa, token) que dominaba el
+    /// tiempo en 27B/40B; `w` es el dequant compartido (None → skip, el dense ya vale).
+    pub(crate) fn apply_sparse_adj_block(
+        &self,
+        orch: &EngineOrchestrator,
+        ov: &[FfnOverride],
+        pick: impl Fn(&FfnOverride) -> Option<&SparseAdj>,
+        x_flat: &[f32],
+        n: usize,
+        n_pos: usize,
+        d_in: usize,
+        d_out: usize,
+        w: Option<&Arc<Vec<f32>>>,
+        out_flat: &mut [f32],
+    ) -> Result<(), StreamInferError> {
+        let mut sel: Vec<usize> = Vec::new();
+        let mut x_sub: Vec<f32> = Vec::new();
+        let mut adjs: Vec<u8> = Vec::new();
+        for c in 0..n {
+            if let Some(sa) = pick(&ov[c]) {
+                sel.push(c);
+                x_sub.extend_from_slice(&x_flat[c * n_pos * d_in..(c + 1) * n_pos * d_in]);
+                adjs.extend_from_slice(&sa.adjacency);
+            }
+        }
+        if sel.is_empty() {
+            return Ok(());
+        }
+        let Some(w0) = w else { return Ok(()) };
+        let mut out_sub = vec![0.0f32; sel.len() * n_pos * d_out];
+        if let Some(eng) = orch.opencl_engine() {
+            eng.spmm_adj_batched(&x_sub, &adjs, w0, sel.len(), n_pos, d_in, d_out, &mut out_sub)?;
+        } else {
+            let mut off = 0usize;
+            for (i, &c) in sel.iter().enumerate() {
+                let sa = pick(&ov[c]).expect("sel consistency");
+                let out = spmm_adj(&x_sub[i * n_pos * d_in..(i + 1) * n_pos * d_in], sa);
+                out_sub[off..off + n_pos * d_out].copy_from_slice(&out);
+                off += n_pos * d_out;
+            }
+        }
+        for (i, &c) in sel.iter().enumerate() {
+            out_flat[c * n_pos * d_out..(c + 1) * n_pos * d_out]
+                .copy_from_slice(&out_sub[i * n_pos * d_out..(i + 1) * n_pos * d_out]);
         }
         Ok(())
     }
@@ -1639,7 +1691,13 @@ impl StreamingGenerator {
         tokens: &[u32],
         kv: &mut [Vec<LayerKvCache>],
         n_candidates: usize,
-        mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+        mut get_override: impl FnMut(
+            usize,
+            usize,
+            &Option<Arc<Vec<f32>>>,
+            &Option<Arc<Vec<f32>>>,
+            &Option<Arc<Vec<f32>>>,
+        ) -> FfnOverride,
     ) -> Result<Vec<Vec<f32>>, StreamInferError> {
         match self.model_kind() {
             ModelKind::Hybrid => {
@@ -1839,7 +1897,13 @@ pub fn forward_batched_seq(
     tokens: &[u32],
     kv: &mut [Vec<LayerKvCache>],
     n_candidates: usize,
-    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+    mut get_override: impl FnMut(
+        usize,
+        usize,
+        &Option<Arc<Vec<f32>>>,
+        &Option<Arc<Vec<f32>>>,
+        &Option<Arc<Vec<f32>>>,
+    ) -> FfnOverride,
 ) -> Result<Vec<Vec<f32>>, StreamInferError> {
     let h = self.config.hidden_size;
     let n_layers = self.config.num_layers;
@@ -1875,7 +1939,27 @@ pub fn forward_batched_seq(
     let mut down_flat = vec![0.0f32; batch * h];
     for layer_idx in 0..n_layers {
         let pack = self.load_pack(layer_idx)?;
-        let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer_idx)).collect();
+        // Dequant compartido por capa (UNA vez por (capa, generación), Fase 2 C4):
+        // los CSR/SparseAdj del FFN esparso se construyen desde estos F32; se evita
+        // dequantizar por (candidato, capa) (dominaba el tiempo en 27B/40B).
+        let gate_w = self
+            .catalog
+            .dequant_f32(&format!("blk.{layer_idx}.ffn_gate.weight"))
+            .ok()
+            .map(Arc::new);
+        let up_w = self
+            .catalog
+            .dequant_f32(&format!("blk.{layer_idx}.ffn_up.weight"))
+            .ok()
+            .map(Arc::new);
+        let down_w = self
+            .catalog
+            .dequant_f32(&format!("blk.{layer_idx}.ffn_down.weight"))
+            .ok()
+            .map(Arc::new);
+        let ov: Vec<FfnOverride> = (0..n)
+            .map(|c| get_override(c, layer_idx, &gate_w, &up_w, &down_w))
+            .collect();
         // Atención: norm + proyecciones batcheadas sobre N×n_pos.
         for c in 0..n {
             for t in 0..n_pos {
@@ -1932,12 +2016,25 @@ pub fn forward_batched_seq(
                 );
             }
         }
-        let has_any_ov = ov
+        let has_any_csr = ov
             .iter()
             .any(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some());
+        let has_any_adj = ov
+            .iter()
+            .any(|o| o.gate_adj.is_some() || o.up_adj.is_some() || o.down_adj.is_some());
         orch.execute_quant_gemv_batched(&pack.gate, &x_flat, &mut gate_flat, batch)?;
         orch.execute_quant_gemv_batched(&pack.up, &x_flat, &mut up_flat, batch)?;
-        if has_any_ov {
+        if has_any_adj {
+            self.apply_sparse_adj_block(
+                orch, &ov, |o| o.gate_adj.as_ref(), &x_flat, n, n_pos, h, ff,
+                gate_w.as_ref(), &mut gate_flat,
+            )?;
+            self.apply_sparse_adj_block(
+                orch, &ov, |o| o.up_adj.as_ref(), &x_flat, n, n_pos, h, ff,
+                up_w.as_ref(), &mut up_flat,
+            )?;
+        }
+        if has_any_csr {
             for c in 0..n {
                 if let Some(cs) = ov[c].gate.as_ref() {
                     let out = self.spmm_csr(orch, &x_flat[c * n_pos * h..(c + 1) * n_pos * h], cs)?;
@@ -1954,7 +2051,13 @@ pub fn forward_batched_seq(
             gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
         }
         orch.execute_quant_gemv_batched(&pack.down, &gate_flat, &mut down_flat, batch)?;
-        if has_any_ov {
+        if has_any_adj {
+            self.apply_sparse_adj_block(
+                orch, &ov, |o| o.down_adj.as_ref(), &gate_flat, n, n_pos, ff, h,
+                down_w.as_ref(), &mut down_flat,
+            )?;
+        }
+        if has_any_csr {
             for c in 0..n {
                 if let Some(cs) = ov[c].down.as_ref() {
                     let out = self.spmm_csr(orch, &gate_flat[c * n_pos * ff..(c + 1) * n_pos * ff], cs)?;

@@ -12,6 +12,7 @@ use crate::stream_infer::{
 };
 use hayai_cpu::{attention_decode_step, rms_norm, LayerKvCache};
 use hayai_opencl::StreamingScratch;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) fn prefill_hybrid(
@@ -887,7 +888,13 @@ pub(crate) fn forward_batched_hybrid_seq(
     kv: &mut [Vec<LayerKvCache>],
     dn: &mut [Vec<Option<DeltaNetState>>],
     n_candidates: usize,
-    mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+    mut get_override: impl FnMut(
+        usize,
+        usize,
+        &Option<Arc<Vec<f32>>>,
+        &Option<Arc<Vec<f32>>>,
+        &Option<Arc<Vec<f32>>>,
+    ) -> FfnOverride,
 ) -> Result<Vec<Vec<f32>>, StreamInferError> {
     let h = gen.config.hidden_size;
     let n_layers = gen.config.num_layers;
@@ -913,7 +920,26 @@ pub(crate) fn forward_batched_hybrid_seq(
         if kind == HybridLayerKind::NextN {
             continue;
         }
-        let ov: Vec<FfnOverride> = (0..n).map(|c| get_override(c, layer)).collect();
+        // Dequant compartido por capa (Fase 2, C4): evita dequantizar por (cand, capa).
+        let gate_w = gen
+            .catalog
+            .dequant_f32(&format!("blk.{layer}.ffn_gate.weight"))
+            .ok()
+            .map(Arc::new);
+        let up_w = gen
+            .catalog
+            .dequant_f32(&format!("blk.{layer}.ffn_up.weight"))
+            .ok()
+            .map(Arc::new);
+        let down_w = gen
+            .catalog
+            .dequant_f32(&format!("blk.{layer}.ffn_down.weight"))
+            .ok()
+            .map(Arc::new);
+
+        let ov: Vec<FfnOverride> = (0..n)
+            .map(|c| get_override(c, layer, &gate_w, &up_w, &down_w))
+            .collect();
         match kind {
             HybridLayerKind::DeltaNet => {
                 // SSM recurrente por (candidato, token) — estado propio.
@@ -1026,7 +1052,10 @@ pub(crate) fn forward_batched_hybrid_seq(
             HybridLayerKind::NextN => {}
         }
         // FFN batcheado sobre N×n_pos (override construido UNA vez por (cand, capa)).
-        batch_ffn_hybrid_seq(gen, orch, layer, &ov, &mut x, n, n_pos, eps)?;
+        batch_ffn_hybrid_seq(
+            gen, orch, layer, &ov, &mut x, n, n_pos, eps, gate_w.as_ref(), up_w.as_ref(),
+            down_w.as_ref(),
+        )?;
     }
 
     // lm_head batcheado sobre N×n_pos.
@@ -1068,7 +1097,8 @@ pub(crate) fn forward_batched_hybrid_seq(
 }
 
 /// FFN batcheado por capa sobre N×n_pos (pesos cargados UNA vez, override CSR por
-/// candidato esparso construido UNA vez por (candidato, capa)).
+/// candidato esparso construido UNA vez por (candidato, capa); SparseAdj batcheado
+/// en GPU desde el dequant compartido — Fase 2, C4).
 fn batch_ffn_hybrid_seq(
     gen: &mut StreamingGenerator,
     orch: &mut EngineOrchestrator,
@@ -1078,6 +1108,9 @@ fn batch_ffn_hybrid_seq(
     n: usize,
     n_pos: usize,
     eps: f32,
+    gate_w: Option<&Arc<Vec<f32>>>,
+    up_w: Option<&Arc<Vec<f32>>>,
+    down_w: Option<&Arc<Vec<f32>>>,
 ) -> Result<(), StreamInferError> {
     let h = gen.config.hidden_size;
     let ff = gen.config.intermediate_size;
@@ -1098,8 +1131,21 @@ fn batch_ffn_hybrid_seq(
     let mut gate_flat = vec![0.0f32; batch * ff];
     let mut up_flat = vec![0.0f32; batch * ff];
     let mut down_flat = vec![0.0f32; batch * h];
+    let has_any_adj = ov
+        .iter()
+        .any(|o| o.gate_adj.is_some() || o.up_adj.is_some() || o.down_adj.is_some());
     orch.execute_quant_gemv_batched(&gate, &x_flat, &mut gate_flat, batch)?;
     orch.execute_quant_gemv_batched(&up, &x_flat, &mut up_flat, batch)?;
+    if has_any_adj {
+        gen.apply_sparse_adj_block(
+            orch, ov, |o| o.gate_adj.as_ref(), &x_flat, n, n_pos, h, ff,
+            gate_w, &mut gate_flat,
+        )?;
+        gen.apply_sparse_adj_block(
+            orch, ov, |o| o.up_adj.as_ref(), &x_flat, n, n_pos, h, ff,
+            up_w, &mut up_flat,
+        )?;
+    }
     for c in 0..n {
         let cs = ov[c].gate.as_ref().or(gcsr.as_ref());
         if let Some(cs) = cs {
@@ -1117,6 +1163,12 @@ fn batch_ffn_hybrid_seq(
         gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
     }
     orch.execute_quant_gemv_batched(&down, &gate_flat, &mut down_flat, batch)?;
+    if has_any_adj {
+        gen.apply_sparse_adj_block(
+            orch, ov, |o| o.down_adj.as_ref(), &gate_flat, n, n_pos, ff, h,
+            down_w, &mut down_flat,
+        )?;
+    }
     for c in 0..n {
         let cs = ov[c].down.as_ref().or(dcsr.as_ref());
         if let Some(cs) = cs {

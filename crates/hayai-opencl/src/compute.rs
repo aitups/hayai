@@ -426,6 +426,92 @@ impl OpenClEngine {
         );
         Ok(())
     }
+
+    /// SpMM esparso batcheado desde bit-tensor + pesos F32 compartidos por capa
+    /// (SparseAdj — Fase 2, criterio C4): `N` candidatos × `n_pos` tokens en un
+    /// único dispatch. `adjs` es la concatenación de los bit-tensores
+    /// (candidato-major, `conn = i*d_out+j`, LSB-first), `w` el F32 compartido
+    /// `[d_out, d_in]`. Evita el gather del CSR por (candidato, capa, token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spmm_adj_batched(
+        &self,
+        x: &[f32],
+        adjs: &[u8],
+        w: &[f32],
+        n_cands: usize,
+        n_pos: usize,
+        d_in: usize,
+        d_out: usize,
+        output: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        let batch = n_cands * n_pos;
+        assert_eq!(output.len(), batch * d_out);
+        if adjs.is_empty() || w.is_empty() {
+            output.fill(0.0);
+            return Ok(());
+        }
+
+        let mut x_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj x buffer: {e}")))? 
+        };
+        let mut a_buf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, adjs.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj adj buffer: {e}")))?
+        };
+        let mut w_buf = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, w.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("spmm_adj w buffer: {e}")))?
+        };
+        let output_buf = unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                output.len(),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("spmm_adj output buffer: {e}")))?
+        };
+
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut x_buf, CL_BLOCKING, 0, x, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj x: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut a_buf, CL_BLOCKING, 0, adjs, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj adjs: {e}")))?;
+            self.queue
+                .enqueue_write_buffer(&mut w_buf, CL_BLOCKING, 0, w, &[])
+                .map_err(|e| OpenClError::ClError(format!("write spmm_adj w: {e}")))?;
+        }
+
+        let global = batch * d_out;
+        let kernel_event = unsafe {
+            ExecuteKernel::new(&self.spmm_adj_batched)
+                .set_arg(&x_buf)
+                .set_arg(&a_buf)
+                .set_arg(&w_buf)
+                .set_arg(&(d_in as cl_int))
+                .set_arg(&(d_out as cl_int))
+                .set_arg(&(n_pos as cl_int))
+                .set_arg(&output_buf)
+                .set_global_work_size(global)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue spmm_adj_batched: {e}")))?
+        };
+
+        let wait = [kernel_event.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, output, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read spmm_adj_batched: {e}")))?;
+        }
+        debug!(
+            "OpenCL spmm_adj_batched [{batch}×{d_out}×{d_in}] on {}",
+            self.device_info.device_name
+        );
+        Ok(())
+    }
 }
 
 fn preferred_local_size(m: usize) -> usize {

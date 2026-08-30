@@ -11,9 +11,12 @@
 
 use std::path::PathBuf;
 
-use hayai_core::{EngineOrchestrator, ExecutionMode, FfnOverride, MemoryStrategy, StreamingGenerator};
+use hayai_core::{
+    EngineOrchestrator, ExecutionMode, FfnOverride, MemoryStrategy, SparseAdj,
+    StreamingGenerator,
+};
 use hayai_cpu::LayerKvCache;
-use hayai_model::{CsrSparse, GgufCatalog, SamplerConfig, Tokenizer};
+use hayai_model::{GgufCatalog, SamplerConfig, Tokenizer};
 
 fn softmax_kl(lo: &[f32], lc: &[f32]) -> f32 {
     let max0 = lo.iter().fold(f32::MIN, |a, b| a.max(*b));
@@ -40,29 +43,6 @@ fn softmax_kl(lo: &[f32], lc: &[f32]) -> f32 {
         kl1 += q1 * ((q1 + eps) / (q0 + eps)).ln();
     }
     0.5 * (kl0 + kl1)
-}
-
-fn csr_from_adjacency(w0: &[f32], d_in: usize, d_out: usize, adj: &[u8]) -> CsrSparse {
-    let mut row_ptr = vec![0i32; d_out + 1];
-    let mut col_idx = Vec::new();
-    let mut vals = Vec::new();
-    for j in 0..d_out {
-        for i in 0..d_in {
-            let conn = i * d_out + j;
-            if adj[conn >> 3] & (1 << (conn & 7)) != 0 {
-                col_idx.push(i as i32);
-                vals.push(w0[j * d_in + i]);
-            }
-        }
-        row_ptr[j + 1] = col_idx.len() as i32;
-    }
-    CsrSparse {
-        row_ptr,
-        col_idx,
-        vals,
-        d_in,
-        d_out,
-    }
 }
 
 fn save_teacher_cache(path: &std::path::Path, logits: &[Vec<f32>]) -> std::io::Result<()> {
@@ -165,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let corpus = texts.join("\n");
 
-    let mut cat = GgufCatalog::open(&model)?;
+    let cat = GgufCatalog::open(&model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::default(), 42)?;
     gen.set_memory_strategy(MemoryStrategy::Minimal);
@@ -279,12 +259,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kl_sum = vec![0.0f32; n_cand];
     // Forward por capas: UNA llamada con toda la secuencia. El override se construye
     // UNA vez por (candidato, capa); las proyecciones + FFN se batchean sobre N×n_pos.
+    // El SparseAdj (bit-tensor + Arc<F32> compartido por capa) evita el gather del
+    // CSR por (candidato, capa, token) — Fase 2, C4.
     let all_logits = gen.forward_batched_any_seq(
         &mut orch,
         &tokens[..n_pos],
         &mut cand_kv,
         n_cand,
-        |c, l| {
+        |c, l, gate_w, up_w, down_w| {
             let mut ov = FfnOverride::default();
             if !sparse[c][l] {
                 return ov;
@@ -292,13 +274,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (block, din, dout) in &dims {
                 let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
                 let Ok(adj) = std::fs::read(&adj_path) else { continue };
-                let name = format!("blk.{l}.{block}.weight");
-                let Ok(w0) = cat.dequant_f32(&name) else { continue };
-                let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
+                let w = match block.as_str() {
+                    "ffn_gate" => gate_w,
+                    "ffn_up" => up_w,
+                    _ => down_w,
+                };
+                let Some(w) = w else { continue };
+                let sa = SparseAdj {
+                    adjacency: adj,
+                    weights: w.clone(),
+                    d_in: *din,
+                    d_out: *dout,
+                };
                 match block.as_str() {
-                    "ffn_gate" => ov.gate = Some(csr),
-                    "ffn_up" => ov.up = Some(csr),
-                    _ => ov.down = Some(csr),
+                    "ffn_gate" => ov.gate_adj = Some(sa),
+                    "ffn_up" => ov.up_adj = Some(sa),
+                    _ => ov.down_adj = Some(sa),
                 }
             }
             ov

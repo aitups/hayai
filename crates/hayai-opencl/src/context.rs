@@ -50,6 +50,8 @@ pub struct OpenClEngine {
     pub gemv_f16: Kernel,
     /// SpMM CSR del FFN disperso (DAG irregular, GGUF de `saor`).
     pub spmm_csr: Kernel,
+    /// SpMM esparso batcheado desde bit-tensor + pesos F32 compartidos (Fase 2, C4).
+    pub spmm_adj_batched: Kernel,
 }
 
 impl OpenClEngine {
@@ -148,6 +150,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("f16 kernel: {}", e)))?;
         let spmm_csr = Kernel::create(&program, "spmm_csr")
             .map_err(|e| OpenClError::ClError(format!("spmm_csr kernel: {}", e)))?;
+        let spmm_adj_batched = Kernel::create(&program, "spmm_adj_batched")
+            .map_err(|e| OpenClError::ClError(format!("spmm_adj_batched kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -180,6 +184,7 @@ impl OpenClEngine {
             gemv_f32,
             gemv_f16,
             spmm_csr,
+            spmm_adj_batched,
         })
     }
 
