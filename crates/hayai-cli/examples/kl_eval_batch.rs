@@ -16,7 +16,32 @@ use hayai_core::{
     StreamingGenerator,
 };
 use hayai_cpu::LayerKvCache;
-use hayai_model::{GgufCatalog, SamplerConfig, Tokenizer};
+use hayai_model::{CsrSparse, GgufCatalog, SamplerConfig, Tokenizer};
+
+/// Build del CSR desde la adyacencia + pesos F32 del profesor (path per-token —
+/// verificación de paridad contra el forward seq; en producción se usa SparseAdj).
+fn csr_from_adjacency(w0: &[f32], d_in: usize, d_out: usize, adj: &[u8]) -> CsrSparse {
+    let mut row_ptr = vec![0i32; d_out + 1];
+    let mut col_idx = Vec::new();
+    let mut vals = Vec::new();
+    for j in 0..d_out {
+        for i in 0..d_in {
+            let conn = i * d_out + j;
+            if adj[conn >> 3] & (1 << (conn & 7)) != 0 {
+                col_idx.push(i as i32);
+                vals.push(w0[j * d_in + i]);
+            }
+        }
+        row_ptr[j + 1] = col_idx.len() as i32;
+    }
+    CsrSparse {
+        row_ptr,
+        col_idx,
+        vals,
+        d_in,
+        d_out,
+    }
+}
 
 fn softmax_kl(lo: &[f32], lc: &[f32]) -> f32 {
     let max0 = lo.iter().fold(f32::MIN, |a, b| a.max(*b));
@@ -96,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut teacher_cache: Option<PathBuf> = None;
     let mut device = "auto".to_string();
     let mut n_positions = 128usize;
+    let mut per_token = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -127,6 +153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     n_positions = v;
                 }
             }
+            "--per-token" => {
+                per_token = true;
+            }
             other => {
                 eprintln!("kl_eval_batch: argumento desconocido '{other}'");
                 std::process::exit(2);
@@ -145,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let corpus = texts.join("\n");
 
-    let cat = GgufCatalog::open(&model)?;
+    let mut cat = GgufCatalog::open(&model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::default(), 42)?;
     gen.set_memory_strategy(MemoryStrategy::Minimal);
@@ -257,11 +286,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mut kl_sum = vec![0.0f32; n_cand];
+    let vocab = gen.config.vocab_size;
+    let all_logits = if per_token {
+        // Verificación de paridad: forward por token (path original Fase 2) con CSR.
+        let mut out: Vec<Vec<f32>> = (0..n_cand).map(|_| Vec::new()).collect();
+        for pos in 0..n_pos {
+            let logits = gen.forward_batched_any(
+                &mut orch,
+                tokens[pos],
+                pos,
+                &mut cand_kv,
+                n_cand,
+                |c, l| {
+                    let mut ov = FfnOverride::default();
+                    if !sparse[c][l] {
+                        return ov;
+                    }
+                    for (block, din, dout) in &dims {
+                        let adj_path = adj_dir.join(format!("c{c:03}.l{l:02}.{block}.bin"));
+                        let Ok(adj) = std::fs::read(&adj_path) else { continue };
+                        let name = format!("blk.{l}.{block}.weight");
+                        let Ok(w0) = cat.dequant_f32(&name) else { continue };
+                        let csr = csr_from_adjacency(&w0, *din, *dout, &adj);
+                        match block.as_str() {
+                            "ffn_gate" => ov.gate = Some(csr),
+                            "ffn_up" => ov.up = Some(csr),
+                            _ => ov.down = Some(csr),
+                        }
+                    }
+                    ov
+                },
+                &mut scratch,
+            )?;
+            for c in 0..n_cand {
+                out[c].extend_from_slice(&logits[c]);
+            }
+        }
+        out
+    } else {
     // Forward por capas: UNA llamada con toda la secuencia. El override se construye
     // UNA vez por (candidato, capa); las proyecciones + FFN se batchean sobre N×n_pos.
     // El SparseAdj (bit-tensor + Arc<F32> compartido por capa) evita el gather del
     // CSR por (candidato, capa, token) — Fase 2, C4.
-    let all_logits = gen.forward_batched_any_seq(
+    gen.forward_batched_any_seq(
         &mut orch,
         &tokens[..n_pos],
         &mut cand_kv,
@@ -296,8 +363,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ov
         },
-    )?;
-    let vocab = gen.config.vocab_size;
+    )?
+    };
     for pos in 0..n_pos {
         for c in 0..n_cand {
             kl_sum[c] += softmax_kl(
