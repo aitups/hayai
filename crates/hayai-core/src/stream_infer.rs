@@ -2278,6 +2278,11 @@ pub(crate) fn ffn_finish_scratch(
         }
         GateUpInflight::Done => {}
     }
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("PROD_GATE_PRE L0: {:?}", &gate_out[0..8]);
+        eprintln!("PROD_UP_PRE L0: {:?}", &up_out[0..8]);
+    }
+
 
     // Default: SiLU(gate) * up (LLaMA / Qwen). Gemma4 overrides via `ffn_finish_gelu`.
     for i in 0..gate_out.len() {

@@ -319,6 +319,10 @@ fn run_deltanet_block(
 
     let mut xn = x.to_vec();
     rms_norm(&mut xn, &gen.layer_norms[layer].ffn_norm, eps);
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("PROD_XN L0: {:?}", &xn[0..8]);
+    }
+
     gen.ws_gate.fill(0.0);
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
@@ -367,6 +371,10 @@ fn run_deltanet_block(
             0,
             None,
         )?;
+        if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+            eprintln!("PROD_GATE_ACT L0: {:?}", &gen.ws_gate[0..8]);
+            eprintln!("PROD_DOWN L0: {:?}", &gen.ws_down[0..8]);
+        }
     }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
@@ -689,7 +697,8 @@ pub(crate) fn forward_batched_hybrid_gemm(
                     let s = dn[c][layer]
                         .as_mut()
                         .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
-                    let xn = x[c].clone();
+                    let mut xn = x[c].clone();
+                    rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
                     w.decode_step(&xn, s, &mut x[c])?;
                 }
             }
@@ -984,9 +993,20 @@ pub(crate) fn forward_batched_hybrid_seq(
                         let s = dn[c][layer]
                             .as_mut()
                             .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
-                        let xn = x[c][t * h..(t + 1) * h].to_vec();
+                        let mut xn = x[c][t * h..(t + 1) * h].to_vec();
+                        rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
                         w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h])?;
                     }
+                }
+                if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") {
+                    let mut ms = 0.0f32;
+                    for i in 0..h {
+                        ms += x[0][i] * x[0][i];
+                    }
+                    eprintln!(
+                        "BATCH_LAYER_RMS tok0 L{layer} afterDN: {:.4}",
+                        (ms / h as f32).sqrt()
+                    );
                 }
             }
             HybridLayerKind::FullAttn => {
@@ -1087,6 +1107,21 @@ pub(crate) fn forward_batched_hybrid_seq(
             gen, orch, layer, &ov, &mut x, n, n_pos, eps, gate_w.as_ref(), up_w.as_ref(),
             down_w.as_ref(), gate_q4.as_deref(), up_q4.as_deref(), down_q4.as_deref(), ffn,
         )?;
+        if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") {
+            let kind = match kind {
+                HybridLayerKind::DeltaNet => "DN",
+                HybridLayerKind::FullAttn => "FA",
+                HybridLayerKind::NextN => "N",
+            };
+            let mut ms = 0.0f32;
+            for i in 0..h {
+                ms += x[0][i] * x[0][i];
+            }
+            eprintln!(
+                "BATCH_LAYER_RMS tok0 L{layer}({kind}): {:.4}",
+                (ms / h as f32).sqrt()
+            );
+        }
     }
 
     // lm_head batcheado sobre N×n_pos.
@@ -1171,6 +1206,9 @@ fn batch_ffn_hybrid_seq(
             );
         }
     }
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("BATCH_XN L0: {:?}", &x_flat[0..8]);
+    }
     let mut gate_flat = vec![0.0f32; batch * ff];
     let mut up_flat = vec![0.0f32; batch * ff];
     let mut down_flat = vec![0.0f32; batch * h];
@@ -1178,12 +1216,18 @@ fn batch_ffn_hybrid_seq(
         .iter()
         .any(|o| o.gate_adj.is_some() || o.up_adj.is_some() || o.down_adj.is_some());
     orch.execute_quant_gemv_batched(&gate, &x_flat, &mut gate_flat, batch)?;
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("BATCH_GATE L0 pre: {:?}", &gate_flat[0..8]);
+    }
     let dense_gate = if std::env::var("HAYAI_DEBUG_OVERRIDE").ok().as_deref() == Some("1") {
         Some(gate_flat.clone())
     } else {
         None
     };
     orch.execute_quant_gemv_batched(&up, &x_flat, &mut up_flat, batch)?;
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("BATCH_UP L0 pre: {:?}", &up_flat[0..8]);
+    }
     if has_any_adj {
         gen.apply_sparse_adj_block(
             orch, ov, |o| o.gate_adj.as_ref(), &x_flat, n, n_pos, h, ff,
@@ -1227,7 +1271,13 @@ fn batch_ffn_hybrid_seq(
         let g = gate_flat[i];
         gate_flat[i] = (g / (1.0 + (-g).exp())) * up_flat[i];
     }
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("BATCH_GATE_ACT L0: {:?}", &gate_flat[0..8]);
+    }
     orch.execute_quant_gemv_batched(&down, &gate_flat, &mut down_flat, batch)?;
+    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!("BATCH_DOWN L0: {:?}", &down_flat[0..8]);
+    }
     if has_any_adj {
         gen.apply_sparse_adj_block(
             orch, ov, |o| o.down_adj.as_ref(), &gate_flat, n, n_pos, ff, h,

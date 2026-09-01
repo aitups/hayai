@@ -84,6 +84,39 @@ fn save_teacher_cache(path: &std::path::Path, logits: &[Vec<f32>]) -> std::io::R
     std::fs::write(path, buf)
 }
 
+/// Logits del profesor. Para el hybrid (qwen27) el per-token recrea el estado
+/// DeltaNet en cada llamada → logits incorrectos; la referencia es el **seq**
+/// (una llamada con toda la secuencia, estado persistente). El per-token solo
+/// se usa en el modo `--per-token` (paridad Dense).
+fn compute_teacher(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    scratch: &mut hayai_opencl::StreamingScratch,
+    tokens: &[u32],
+    n_pos: usize,
+    vocab: usize,
+    per_token: bool,
+) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+    let mut tkv: Vec<Vec<LayerKvCache>> = vec![(0..gen.config.num_layers)
+        .map(|_| LayerKvCache::new(gen.attn_cfg.num_kv_heads, gen.attn_cfg.head_dim, 4, 128))
+        .collect::<Vec<_>>()];
+    if per_token {
+        let mut t = Vec::with_capacity(n_pos);
+        for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
+            let lg = gen.forward_batched_any(orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default(), scratch)?;
+            t.push(lg[0].clone());
+        }
+        Ok(t)
+    } else {
+        let lg = gen.forward_batched_any_seq(orch, &tokens[..n_pos], &mut tkv, 1, |_, _, _, _, _| FfnOverride::default())?;
+        Ok(lg[0]
+            .chunks_exact(vocab)
+            .take(n_pos)
+            .map(|c| c.to_vec())
+            .collect())
+    }
+}
+
 fn load_teacher_cache(path: &std::path::Path) -> std::io::Result<Vec<Vec<f32>>> {
     let raw = std::fs::read(path)?;
     if raw.len() < 8 {
@@ -183,6 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tokens = gen.tokenizer.encode(&corpus, false);
     let n_pos = tokens.len().min(n_positions);
+    let vocab = gen.config.vocab_size;
 
     let meta_raw = std::fs::read_to_string(adj_dir.join("meta.json"))?;
     let meta: serde_json::Value = serde_json::from_str(&meta_raw)?;
@@ -219,7 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv_cfg = || {
         vec![(0..gen.config.num_layers)
             .map(|_| LayerKvCache::new(gen.attn_cfg.num_kv_heads, gen.attn_cfg.head_dim, 4, 128))
-            .collect()]
+            .collect::<Vec<_>>()]
     };
     let teacher: Vec<Vec<f32>> = if let Some(p) = &teacher_cache {
         if p.exists() {
@@ -227,23 +261,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             load_teacher_cache(p)?
         } else {
             eprintln!("[kl_eval_batch] computando logits del profesor…");
-            let mut tkv = kv_cfg();
-            let mut t = Vec::with_capacity(n_pos);
-            for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-                let lg = gen.forward_batched_any(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default(), &mut scratch)?;
-                t.push(lg[0].clone());
-            }
+            let t = compute_teacher(&mut gen, &mut orch, &mut scratch, &tokens, n_pos, vocab, per_token)?;
             save_teacher_cache(p, &t)?;
             t
         }
     } else {
-        let mut tkv = kv_cfg();
-        let mut t = Vec::with_capacity(n_pos);
-        for (pos, &tok) in tokens.iter().take(n_pos).enumerate() {
-            let lg = gen.forward_batched_any(&mut orch, tok, pos, &mut tkv, 1, |_, _| FfnOverride::default(), &mut scratch)?;
-            t.push(lg[0].clone());
-        }
-        t
+        compute_teacher(&mut gen, &mut orch, &mut scratch, &tokens, n_pos, vocab, per_token)?
     };
 
     // Pre-paso: lee cada adyacencia UNA vez por (cand, capa) → d_arch_num + flag
@@ -286,7 +309,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let mut kl_sum = vec![0.0f32; n_cand];
-    let vocab = gen.config.vocab_size;
     let all_logits = if per_token {
         // Verificación de paridad: forward por token (path original Fase 2) con CSR.
         let mut out: Vec<Vec<f32>> = (0..n_cand).map(|_| Vec::new()).collect();

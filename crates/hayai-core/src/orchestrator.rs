@@ -184,6 +184,9 @@ impl EngineOrchestrator {
         let n = matrix.ncols;
         if let Some(cl) = self.opencl_engine() {
             if matrix.ggml_type == GgmlType::Q4_K {
+                if std::env::var("HAYAI_DEBUG_KERNEL").ok().as_deref() == Some("1") {
+                    eprintln!("[gemv_batched] kernel Q4_K {m}×{n} batch={batch}");
+                }
                 return cl
                     .ggml_gemv_batched_q4_k(m, n, matrix.data(), inputs, outputs, batch)
                     .map_err(OrchestratorError::OpenCl);

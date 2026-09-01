@@ -407,14 +407,14 @@ __kernel void ggml_gemv_batched_q4_k(
                     int c6 = qv3u.a[l] & 0x0F;
                     int c7 = qv3u.a[l] >> 4;
                     int xb = x_base + sub * 64;
-                    sum += (d1 * (float)c0 - m1v) * xrow[xb + l];
-                    sum += (d2 * (float)c1 - m2v) * xrow[xb + 32 + l];
-                    sum += (d1 * (float)c2 - m1v) * xrow[xb + 8 + l];
-                    sum += (d2 * (float)c3 - m2v) * xrow[xb + 40 + l];
-                    sum += (d1 * (float)c4 - m1v) * xrow[xb + 16 + l];
-                    sum += (d2 * (float)c5 - m2v) * xrow[xb + 48 + l];
-                    sum += (d1 * (float)c6 - m1v) * xrow[xb + 24 + l];
-                    sum += (d2 * (float)c7 - m2v) * xrow[xb + 56 + l];
+                    sum += (d1 * (float)c0 - m1v) * xrow[t0 + xb + l];
+                    sum += (d2 * (float)c1 - m2v) * xrow[t0 + xb + 32 + l];
+                    sum += (d1 * (float)c2 - m1v) * xrow[t0 + xb + 8 + l];
+                    sum += (d2 * (float)c3 - m2v) * xrow[t0 + xb + 40 + l];
+                    sum += (d1 * (float)c4 - m1v) * xrow[t0 + xb + 16 + l];
+                    sum += (d2 * (float)c5 - m2v) * xrow[t0 + xb + 48 + l];
+                    sum += (d1 * (float)c6 - m1v) * xrow[t0 + xb + 24 + l];
+                    sum += (d2 * (float)c7 - m2v) * xrow[t0 + xb + 56 + l];
                 }
                 qo += 32;
                 is += 2;
