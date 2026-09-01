@@ -1178,6 +1178,11 @@ fn batch_ffn_hybrid_seq(
         .iter()
         .any(|o| o.gate_adj.is_some() || o.up_adj.is_some() || o.down_adj.is_some());
     orch.execute_quant_gemv_batched(&gate, &x_flat, &mut gate_flat, batch)?;
+    let dense_gate = if std::env::var("HAYAI_DEBUG_OVERRIDE").ok().as_deref() == Some("1") {
+        Some(gate_flat.clone())
+    } else {
+        None
+    };
     orch.execute_quant_gemv_batched(&up, &x_flat, &mut up_flat, batch)?;
     if has_any_adj {
         gen.apply_sparse_adj_block(
@@ -1188,6 +1193,23 @@ fn batch_ffn_hybrid_seq(
             orch, ov, |o| o.up_adj.as_ref(), &x_flat, n, n_pos, h, ff,
             up_w, up_q4, &mut up_flat,
         )?;
+        if let Some(dg) = dense_gate {
+            let mut max = 0.0f32;
+            let mut mean = 0.0f32;
+            let mut mnorm = 0.0f32;
+            for i in 0..gate_flat.len() {
+                let d = (gate_flat[i] - dg[i]).abs();
+                max = max.max(d);
+                mean += d;
+                mnorm += dg[i].abs();
+            }
+            let cnt = gate_flat.len() as f32;
+            eprintln!(
+                "[override dbg] layer {layer} gate: max|ov-dense|={max:.4} mean|ov-dense|={:.4} mean|dense|={:.4}",
+                mean / cnt,
+                mnorm / cnt
+            );
+        }
     }
     for c in 0..n {
         let cs = ov[c].gate.as_ref().or(gcsr.as_ref());
