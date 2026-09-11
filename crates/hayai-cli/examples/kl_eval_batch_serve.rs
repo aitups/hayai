@@ -156,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n_positions = 128usize;
     let mut per_token = false;
     let mut serve: Option<PathBuf> = None;
+    let mut memory = "auto".to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -194,6 +195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 serve = args.get(i).map(PathBuf::from);
             }
+            "--memory-strategy" => {
+                i += 1;
+                if let Some(m) = args.get(i) {
+                    memory = m.clone();
+                }
+            }
             other => {
                 eprintln!("kl_eval_batch: argumento desconocido '{other}'");
                 std::process::exit(2);
@@ -222,7 +229,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cat = GgufCatalog::open(&model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::default(), 42)?;
-    gen.set_memory_strategy(MemoryStrategy::Minimal);
+    let strat = match memory.as_str() {
+        "minimal" => MemoryStrategy::Minimal,
+        m if m.chars().all(|c| c.is_ascii_digit()) && !m.is_empty() => {
+            MemoryStrategy::CapBytes(m.parse::<u64>().unwrap_or(0) * 1024 * 1024)
+        }
+        _ => MemoryStrategy::AutoFit,
+    };
+    gen.set_memory_strategy(strat);
     let mut orch = EngineOrchestrator::new(ExecutionMode::parse(&device), gen.config.clone());
     let mut scratch = gen.prepare_session(&mut orch)?;
 
