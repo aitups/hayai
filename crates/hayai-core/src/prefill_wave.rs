@@ -7,8 +7,8 @@
 
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
-    ffn_begin_gate_up_scratch, ffn_finish_scratch, GateUpInflight, StreamInferError,
-    StreamingGenerator,
+    add_bias, add_qkv_bias, ffn_begin_gate_up_scratch, ffn_finish_scratch, GateUpInflight,
+    StreamInferError, StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step, rms_norm};
 use hayai_model::{LayerPackLayout, LayerWeightPack, QuantMatrix};
@@ -112,14 +112,18 @@ impl StreamingGenerator {
             if !scratch.resident && scratch.block_k <= 1 && layer_idx + 1 < n_layers {
                 let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
+                let next_fused = self.fused_qkv_dims(next);
                 let next_slot = (layer_idx + 1) % 2;
-                let slot_ptr = self.prepare_prefetch_slot(orch, scratch, next_slot)?;
+                let mut slot_ptr = self.prepare_prefetch_slot(orch, scratch, next_slot)?;
                 if let Some(m) = self.owned_mem.as_mut() {
                     m.note_prefetch_staging(0);
                 }
                 prefetch = Some(thread::spawn(move || {
                     let dst = unsafe { slot_ptr.as_mut_slice() };
-                    cat.load_layer_pack_into(next, dst)
+                    match next_fused {
+                        Some((q, kv)) => cat.load_layer_pack_into_fused(next, dst, q, kv),
+                        None => cat.load_layer_pack_into(next, dst),
+                    }
                 }));
             }
 
@@ -129,9 +133,8 @@ impl StreamingGenerator {
             // DMA FFN once per layer (overlaps first Attn); unmap before first FFN enqueue.
             if scratch.resident || scratch.block_k > 1 {
                 scratch.ensure_host_readable(&orch.pool, layer_idx)?;
-                (current, layout) = self
-                    .catalog
-                    .layer_pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
+                (current, layout) =
+                    self.pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
             } else {
                 scratch.ensure_host_readable(&orch.pool, slot)?;
                 current = current.rebind_views(scratch.host_slot(slot), &layout);
@@ -150,9 +153,8 @@ impl StreamingGenerator {
                     if !dma_committed {
                         if scratch.resident || scratch.block_k > 1 {
                             scratch.ensure_host_readable(&orch.pool, layer_idx)?;
-                            (current, layout) = self
-                                .catalog
-                                .layer_pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
+                            (current, layout) =
+                                self.pack_views_from_base(layer_idx, scratch.host_slot(layer_idx))?;
                         } else {
                             scratch.ensure_host_readable(&orch.pool, slot)?;
                             current = current.rebind_views(scratch.host_slot(slot), &layout);
@@ -170,6 +172,9 @@ impl StreamingGenerator {
                     current.wq.gemv(&xn, &mut q)?;
                     current.wk.gemv(&xn, &mut k)?;
                     current.wv.gemv(&xn, &mut v)?;
+                    if let Some(b) = self.attn_bias.get(layer_idx) {
+                        add_qkv_bias(b, &mut q, &mut k, &mut v);
+                    }
                     let mut attn_out = vec![0.0f32; q_dim];
                     attention_decode_step(
                         &self.attn_cfg,
@@ -182,9 +187,14 @@ impl StreamingGenerator {
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
+                    if let Some(b) = self.attn_bias.get(layer_idx) {
+                        add_bias(&mut attn_proj, &b.o);
+                    }
                     for i in 0..h {
                         xs[t][i] += attn_proj[i];
                     }
+                    // Depthwise causal short-conv residual (generic `Conv` op).
+                    self.apply_conv(layer_idx, &mut xs[t])?;
                     let attn_dt = t_attn.elapsed().as_secs_f64();
                     self.attn_secs += attn_dt;
                     if pending.is_some() {
@@ -330,6 +340,9 @@ impl StreamingGenerator {
                     current.wq.gemv(&xn, &mut q)?;
                     current.wk.gemv(&xn, &mut k)?;
                     current.wv.gemv(&xn, &mut v)?;
+                    if let Some(b) = self.attn_bias.get(next_layer) {
+                        add_qkv_bias(b, &mut q, &mut k, &mut v);
+                    }
                     let mut attn_out = vec![0.0f32; q_dim];
                     attention_decode_step(
                         &self.attn_cfg,
@@ -342,6 +355,9 @@ impl StreamingGenerator {
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
+                    if let Some(b) = self.attn_bias.get(next_layer) {
+                        add_bias(&mut attn_proj, &b.o);
+                    }
                     for i in 0..h {
                         xs[0][i] += attn_proj[i];
                     }
@@ -427,6 +443,143 @@ impl StreamingGenerator {
                 self.io_bytes += emb.nbytes() as u64;
                 orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
             }
+        }
+        Ok(logits)
+    }
+
+    /// Batched prefill (opt-in `HAYAI_PREFILL_BATCH=1`): for each layer, run
+    /// attention for every prompt token, then compute the FFN as **one batched
+    /// GEMV per matrix** (`EngineOrchestrator::execute_quant_gemv_batched`), so
+    /// the weight is read once per layer instead of once per token. Numerically
+    /// identical to [`Self::prefill_wavefront`] for the dense FFN; embedded-sparse
+    /// (CSR) blocks fall back to per-token CPU SpMM.
+    pub(crate) fn prefill_batched(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        tokens: &[u32],
+        scratch: &mut StreamingScratch,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        let h = self.config.hidden_size;
+        let ff = self.config.intermediate_size;
+        let eps = self.config.rms_norm_eps;
+        let n_layers = self.config.num_layers;
+        let t_count = tokens.len();
+        if t_count == 0 {
+            return Err(StreamInferError::Msg("empty prefill".into()));
+        }
+        let base_pos = self.position;
+
+        let mut xs: Vec<Vec<f32>> = Vec::with_capacity(t_count);
+        for &tok in tokens {
+            let mut x = vec![0.0f32; h];
+            self.embed_row("token_embd.weight", tok, h, &mut x)?;
+            xs.push(x);
+        }
+
+        for layer_idx in 0..n_layers {
+            let slot = layer_idx % 2;
+            let (pack, _layout) = self.stage_pack(orch, scratch, slot, layer_idx)?;
+
+            // ── Attention for every prompt token (writes the layer KV in order) ──
+            let t_attn = Instant::now();
+            for t in 0..t_count {
+                let mut xn = xs[t].clone();
+                rms_norm(&mut xn, &self.layer_norms[layer_idx].attn_norm, eps);
+                let q_dim = self.attn_cfg.hidden_size();
+                let kv_dim = self.attn_cfg.kv_dim();
+                let mut q = vec![0.0f32; q_dim];
+                let mut k = vec![0.0f32; kv_dim];
+                let mut v = vec![0.0f32; kv_dim];
+                pack.wq.gemv(&xn, &mut q)?;
+                pack.wk.gemv(&xn, &mut k)?;
+                pack.wv.gemv(&xn, &mut v)?;
+                if let Some(b) = self.attn_bias.get(layer_idx) {
+                    add_qkv_bias(b, &mut q, &mut k, &mut v);
+                }
+                let mut attn_out = vec![0.0f32; q_dim];
+                attention_decode_step(
+                    &self.attn_cfg,
+                    &mut self.kv[layer_idx],
+                    &mut q,
+                    &mut k,
+                    &v,
+                    base_pos + t,
+                    &mut attn_out,
+                );
+                let mut attn_proj = vec![0.0f32; h];
+                pack.wo.gemv(&attn_out, &mut attn_proj)?;
+                if let Some(b) = self.attn_bias.get(layer_idx) {
+                    add_bias(&mut attn_proj, &b.o);
+                }
+                for i in 0..h {
+                    xs[t][i] += attn_proj[i];
+                }
+            }
+            self.attn_secs += t_attn.elapsed().as_secs_f64();
+
+            // ── FFN for every token: one batched GEMV per matrix ────────────────
+            let t_ffn = Instant::now();
+            let sparse =
+                pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
+            if sparse {
+                for t in 0..t_count {
+                    let mut xn = xs[t].clone();
+                    rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
+                    self.run_ffn_block(orch, &pack, &xn, None)?;
+                    for i in 0..h {
+                        xs[t][i] += self.ws_down[i];
+                    }
+                }
+            } else {
+                let mut xn_all = vec![0.0f32; t_count * h];
+                for t in 0..t_count {
+                    let mut xn = xs[t].clone();
+                    rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
+                    xn_all[t * h..(t + 1) * h].copy_from_slice(&xn);
+                }
+                let mut gate_all = vec![0.0f32; t_count * ff];
+                let mut up_all = vec![0.0f32; t_count * ff];
+                orch.execute_quant_gemv_batched(&pack.gate, &xn_all, &mut gate_all, t_count)?;
+                orch.execute_quant_gemv_batched(&pack.up, &xn_all, &mut up_all, t_count)?;
+                for i in 0..(t_count * ff) {
+                    let g = gate_all[i];
+                    gate_all[i] = (g / (1.0 + (-g).exp())) * up_all[i];
+                }
+                let mut down_all = vec![0.0f32; t_count * h];
+                orch.execute_quant_gemv_batched(&pack.down, &gate_all, &mut down_all, t_count)?;
+                for t in 0..t_count {
+                    for i in 0..h {
+                        xs[t][i] += down_all[t * h + i];
+                    }
+                }
+            }
+            self.ffn_secs += t_ffn.elapsed().as_secs_f64();
+        }
+
+        self.position = base_pos + t_count;
+
+        let mut xn = xs[t_count - 1].clone();
+        rms_norm(&mut xn, &self.output_norm, eps);
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        if self.has_output_weight {
+            if let Some(ow) = &self.resident_output {
+                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            } else {
+                let t0 = Instant::now();
+                let ow = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += ow.nbytes() as u64;
+                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
+            }
+        } else if let Some(emb) = &self.resident_embed {
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+        } else {
+            let t0 = Instant::now();
+            let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
+            self.io_secs += t0.elapsed().as_secs_f64();
+            self.io_bytes += emb.nbytes() as u64;
+            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
         }
         Ok(logits)
     }

@@ -10,8 +10,8 @@
 
 use hayai_cpu::{attention_decode_step, rms_norm, AttentionConfig, LayerKvCache};
 use hayai_model::{
-    sample, GgmlType, GgufCatalog, GgufError, LayerPackLayout, LayerWeightPack, ModelConfig,
-    QuantMatrix, SamplerConfig, Tokenizer,
+    sample_with, GgmlType, GgufCatalog, GgufError, LayerPackLayout, LayerWeightPack, ModelConfig,
+    Penalties, QuantMatrix, SamplerConfig, Tokenizer,
 };
 use hayai_opencl::PendingGemv;
 use std::path::PathBuf;
@@ -41,8 +41,73 @@ impl PrefetchSlotPtr {
 
     /// # Safety
     /// Caller guarantees the slot remains mapped/alive for the duration of the borrow.
-    pub(crate) unsafe fn as_mut_slice(&self) -> &mut [u8] {
+    pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.addr as *mut u8, self.len) }
+    }
+}
+
+/// Activation applied by the generic causal depthwise conv.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConvActivation {
+    Silu,
+    Gelu,
+    None,
+}
+
+impl ConvActivation {
+    fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "identity" | "linear" => Self::None,
+            "gelu" => Self::Gelu,
+            _ => Self::Silu,
+        }
+    }
+
+    fn apply(self, a: f32) -> f32 {
+        match self {
+            Self::None => a,
+            Self::Gelu => {
+                // tanh approximation (ggml `GELU`).
+                0.5 * a * (1.0 + (0.797_884_6 * (a + 0.044_715 * a * a * a)).tanh())
+            }
+            Self::Silu => a / (1.0 + (-a).exp()),
+        }
+    }
+}
+
+/// Depthwise causal conv1d + activation, added as a residual to `x`:
+/// `x[c] += act(sum_t w[c*k + t] * (history ++ x)[t])`, with `t=0` the oldest
+/// tap (PyTorch / HF / ggml convention). `state` holds the last `k-1` inputs,
+/// oldest→newest, in `[(k-1) * channels]`. `channels` may differ from `hidden`
+/// (a conv over a projected subspace); the caller passes the matching buffer.
+fn apply_depthwise_conv(
+    x: &mut [f32],
+    state: &mut [f32],
+    k: usize,
+    w: &[f32],
+    act: ConvActivation,
+) {
+    let ch = x.len();
+    let hist = k.saturating_sub(1);
+    debug_assert!(state.len() >= hist * ch);
+    let mut acc = vec![0.0f32; ch];
+    for c in 0..ch {
+        let row = c * k;
+        let mut a = 0.0f32;
+        for t in 0..hist {
+            a += w[row + t] * state[t * ch + c];
+        }
+        a += w[row + hist] * x[c];
+        acc[c] = a;
+    }
+    if hist > 0 {
+        if hist > 1 {
+            state.copy_within(ch..hist * ch, 0);
+        }
+        state[(hist - 1) * ch..hist * ch].copy_from_slice(x);
+    }
+    for c in 0..ch {
+        x[c] += act.apply(acc[c]);
     }
 }
 
@@ -70,6 +135,38 @@ pub(crate) struct LayerNorms {
     pub(crate) layer_output_scale: Option<f32>,
 }
 
+/// Attention projection biases (`attn_q/k/v/o.bias`), preloaded once per model.
+/// Qwen2/Qwen2.5 (`attention_bias=true`) need these or the attention is wrong.
+#[derive(Clone, Default)]
+pub(crate) struct LayerAttnBias {
+    pub(crate) q: Option<Vec<f32>>,
+    pub(crate) k: Option<Vec<f32>>,
+    pub(crate) v: Option<Vec<f32>>,
+    pub(crate) o: Option<Vec<f32>>,
+}
+
+impl LayerAttnBias {
+    fn is_empty(&self) -> bool {
+        self.q.is_none() && self.k.is_none() && self.v.is_none() && self.o.is_none()
+    }
+}
+
+/// Add an optional bias vector element-wise (no-op when absent).
+pub(crate) fn add_bias(buf: &mut [f32], bias: &Option<Vec<f32>>) {
+    if let Some(b) = bias {
+        for (x, y) in buf.iter_mut().zip(b.iter()) {
+            *x += y;
+        }
+    }
+}
+
+/// Add q/k/v biases from a layer's bias record.
+pub(crate) fn add_qkv_bias(b: &LayerAttnBias, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
+    add_bias(q, &b.q);
+    add_bias(k, &b.k);
+    add_bias(v, &b.v);
+}
+
 /// Layer-role based model family, derived from **ops/tensors** — never from
 /// `general.architecture`. This is what routes each model to its forward path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,23 +179,49 @@ pub enum ModelKind {
     Hybrid,
     /// Router + per-expert FFN units (MoE).
     MoE,
+    /// Mamba-1 selective-scan SSM blocks (no attention / no KV cache).
+    Mamba,
+}
+
+/// One item of a multimodal prompt: a text token, or a media embedding row
+/// (image/audio) injected in place of a placeholder token.
+#[derive(Clone)]
+pub enum MediaInput {
+    Token(u32),
+    Emb(Vec<f32>),
 }
 
 impl ModelKind {
     /// Detect from catalog tensor presence (runs before the ExecPlan exists).
+    ///
+    /// Scans **every** block (not just `blk.0`): a hybrid Qwen3.5 whose first
+    /// layer is full-attention must still be detected as `Hybrid`, otherwise
+    /// `open()` would build dense KV caches while `decode_step` dispatches to the
+    /// hybrid path.
     pub fn from_catalog(cat: &GgufCatalog) -> Self {
-        let has = |suffix: &str| cat.tensor(&format!("blk.0.{suffix}")).is_ok();
-        if has("ssm_out.weight") || has("ssm_a") {
+        let arch = cat.meta_str("general.architecture").unwrap_or("");
+        let block_count = cat
+            .meta_u32(&format!("{arch}.block_count"))
+            .or_else(|| cat.meta_u32("llama.block_count"))
+            .unwrap_or(1)
+            .max(1) as usize;
+        let has_any = |suffix: &str| {
+            (0..block_count).any(|i| cat.tensor(&format!("blk.{i}.{suffix}")).is_ok())
+        };
+        if has_any("ssm_x.weight") || has_any("ssm_d") {
+            // Mamba-1 selective scan: x_proj (`ssm_x`) + skip (`ssm_d`) are unique.
+            ModelKind::Mamba
+        } else if has_any("ssm_out.weight") || has_any("ssm_a") {
             ModelKind::Hybrid
-        } else if has("ffn_gate_inp.weight")
-            || has("ffn_exp.0.ffn_gate.weight")
-            || has("ffn_shexp.ffn_gate.weight")
+        } else if has_any("ffn_gate_inp.weight")
+            || has_any("ffn_exp.0.ffn_gate.weight")
+            || has_any("ffn_shexp.ffn_gate.weight")
         {
             ModelKind::MoE
-        } else if has("post_ffw_norm.weight")
-            || has("layer_output_scale.weight")
-            || has("attn_q_norm.weight")
-            || has("attn_k_norm.weight")
+        } else if has_any("post_ffw_norm.weight")
+            || has_any("layer_output_scale.weight")
+            || has_any("attn_q_norm.weight")
+            || has_any("attn_k_norm.weight")
         {
             ModelKind::Gemma
         } else {
@@ -115,9 +238,28 @@ pub struct StreamingGenerator {
     pub attn_cfg: AttentionConfig,
     pub kv: Vec<LayerKvCache>,
     pub(crate) layer_norms: Vec<LayerNorms>,
+    /// Per-layer attention biases (empty vectors when absent — the common case).
+    pub(crate) attn_bias: Vec<LayerAttnBias>,
+    /// Index of the trailing NextN/MTP draft block (one past the main trunk), if any.
+    pub(crate) mtp_slot: Option<usize>,
+    /// Post-final-norm hidden of the last processed token (`t_h_nextn`). Saved by
+    /// every forward path so the MTP draft head can consume it.
+    pub(crate) last_hidden_nextn: Vec<f32>,
+    /// Cached MTP/NextN block weights (loaded on first draft).
+    pub(crate) mtp_cache: Option<crate::mtp::MtpCache>,
+    /// Cached Mamba selective-scan weights + recurrent state (op-driven SSM).
+    pub(crate) mamba_cache: Option<crate::mamba_infer::MambaCache>,
     pub(crate) output_norm: Vec<f32>,
     pub(crate) has_output_weight: bool,
     pub sampler: SamplerConfig,
+    /// Repetition/presence/frequency/logit-bias adjustments applied at sampling time.
+    pub penalties: Penalties,
+    /// Optional GBNF grammar for constrained decoding.
+    pub grammar: Option<hayai_model::Grammar>,
+    /// Live grammar state (reset at the start of each [`Self::generate`]).
+    pub grammar_state: Option<hayai_model::GrammarState>,
+    /// Cached per-token text for the grammar mask (built by [`Self::set_grammar`]).
+    pub grammar_token_texts: Vec<Option<String>>,
     pub rng: u64,
     pub position: usize,
     pub io_bytes: u64,
@@ -150,12 +292,23 @@ pub struct StreamingGenerator {
     pub(crate) ws_gate: Vec<f32>,
     pub(crate) ws_up: Vec<f32>,
     pub(crate) ws_down: Vec<f32>,
-    /// Host/SVM slot capacity used by prefetch threads.
-    pub(crate) layer_scratch_cap: usize,
+    /// Reusable per-token scratch buffers (avoid per-layer heap allocs in decode).
+    pub(crate) scratch_xn: Vec<f32>,
+    pub(crate) scratch_q: Vec<f32>,
+    pub(crate) scratch_k: Vec<f32>,
+    pub(crate) scratch_v: Vec<f32>,
+    pub(crate) scratch_attn: Vec<f32>,
+    pub(crate) scratch_gate: Vec<f32>,
+    pub(crate) scratch_proj: Vec<f32>,
     /// HRM frozen low-cycle init state (`hrm.z_l_init`), length = hidden.
     pub(crate) z_l_init: Option<Vec<f32>>,
     /// Gemma4 proportional RoPE factors (`rope_freqs.weight`), cached once.
     pub(crate) gemma_rope_freqs: Option<Vec<f32>>,
+    /// Gemma4 per-layer-embedding projection (`per_layer_model_proj.weight`): a
+    /// single global tensor, loaded once on first use instead of once per token.
+    pub(crate) ple_model_proj: Option<QuantMatrix>,
+    /// Gemma4 PLE projection norm (`per_layer_proj_norm.weight`), loaded once.
+    pub(crate) ple_proj_norm: Option<Vec<f32>>,
     /// Adaptive memory strategy for the resident/macro-chunk window.
     pub memory_strategy: MemoryStrategy,
     /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
@@ -166,8 +319,24 @@ pub struct StreamingGenerator {
     /// Resident mode: cached embedding matrix (`token_embd.weight`) for zero-I/O
     /// decode. `None` in streaming mode.
     pub(crate) resident_embed: Option<QuantMatrix>,
-    /// Stored ExecPlan used to drive the forward graph (Ola 2).
-    pub exec_plan: Option<crate::exec_plan::ExecPlan>,
+    /// MoE resident non-expert (attn + router + shared expert) bytes per layer,
+    /// cached after the first read so subsequent tokens skip the disk. Bounded by
+    /// `moe_non_expert_cap`. Experts are streamed sparsely (never cached here).
+    pub(crate) moe_non_expert: Option<Vec<Option<Box<[u8]>>>>,
+    pub(crate) moe_non_expert_bytes: usize,
+    pub(crate) moe_non_expert_cap: usize,
+    /// Per-layer depthwise causal short-conv weights (`Conv` op):
+    /// `(kernel, channels, w[c*kernel + t])`; `None` for layers without a conv.
+    pub(crate) conv_weights: Option<Vec<Option<(usize, usize, Vec<f32>)>>>,
+    /// Per-layer conv history `[(kernel-1) * channels]`, oldest→newest.
+    pub(crate) conv_states: Option<Vec<Option<Vec<f32>>>>,
+    /// Per-layer `Conv` tensor name, resolved once from the ExecPlan.
+    pub(crate) conv_names: Option<Vec<Option<String>>>,
+    /// Activation for the generic causal conv (`hayai.conv_activation`, default SiLU).
+    pub(crate) conv_activation: ConvActivation,
+    /// Stored ExecPlan used to drive the forward graph (Ola 2). Shared via `Arc`
+    /// so the per-token forward paths can borrow it while mutating the generator.
+    pub exec_plan: Option<std::sync::Arc<crate::exec_plan::ExecPlan>>,
     /// Dedicated background I/O worker (Phase H1) for block prefetches.
     pub(crate) io_worker: hayai_io::IoWorker,
     /// Qwen3.5 DeltaNet weights (None entries for full-attn layers).
@@ -315,8 +484,16 @@ impl StreamingGenerator {
         // HRM / some hybrids use parameterless RMSNorm (no weight tensors).
         let ones = |n: usize| vec![1.0f32; n];
         let h = config.hidden_size;
-        let mut layer_norms = Vec::with_capacity(config.num_layers);
-        for i in 0..config.num_layers {
+        // One extra slot for the trailing NextN/MTP draft block (index `num_layers`),
+        // which the main trunk skips but the MTP head executes.
+        let mtp_slot = if crate::deltanet::is_nextn_layer(&catalog, config.num_layers) {
+            Some(config.num_layers)
+        } else {
+            None
+        };
+        let n_slots = config.num_layers + usize::from(mtp_slot.is_some());
+        let mut layer_norms = Vec::with_capacity(n_slots);
+        for i in 0..n_slots {
             let attn_norm = catalog
                 .dequant_f32(&format!("blk.{i}.attn_norm.weight"))
                 .or_else(|_| catalog.dequant_f32(&format!("blk.{i}.attention_norm.weight")))
@@ -371,6 +548,10 @@ impl StreamingGenerator {
                 // Per full-attn layer dims from tensors (not a single 4B-shaped AttentionConfig).
                 crate::layer_cfg::build_hybrid_kv_caches(&catalog, &config, sink, window)?
             }
+            ModelKind::Mamba => {
+                // Selective-scan SSM: recurrent state only, no KV cache.
+                Vec::new()
+            }
             _ => (0..kv_slots)
                 .map(|_| LayerKvCache::new(attn_cfg.num_kv_heads, attn_cfg.head_dim, sink, window))
                 .collect(),
@@ -387,6 +568,24 @@ impl StreamingGenerator {
         };
         // Gemma4 proportional RoPE factors — loaded once, not per token.
         let gemma_rope_freqs = catalog.dequant_f32("rope_freqs.weight").ok();
+        // Attention biases (Qwen2/2.5 `attention_bias=true`, some Phi): small
+        // F32 vectors, loaded once for all layers so the hot path only adds them.
+        let attn_bias: Vec<LayerAttnBias> = (0..n_slots)
+            .map(|l| LayerAttnBias {
+                q: catalog.dequant_f32(&format!("blk.{l}.attn_q.bias")).ok(),
+                k: catalog.dequant_f32(&format!("blk.{l}.attn_k.bias")).ok(),
+                v: catalog.dequant_f32(&format!("blk.{l}.attn_v.bias")).ok(),
+                o: catalog.dequant_f32(&format!("blk.{l}.attn_output.bias")).ok(),
+            })
+            .collect();
+        let n_attn_bias = attn_bias.iter().filter(|b| !b.is_empty()).count();
+        if n_attn_bias > 0 {
+            info!("Attention biases: {n_attn_bias} layer(s) with q/k/v/o bias");
+        }
+        let conv_activation = catalog
+            .meta_str("hayai.conv_activation")
+            .map(ConvActivation::parse)
+            .unwrap_or(ConvActivation::Silu);
 
         info!(
             "StreamingGenerator: arch={} physical_layers={} kv_slots={} — WeightIo={} ping-pong + async FFN (no weight mmap)",
@@ -417,9 +616,18 @@ impl StreamingGenerator {
             attn_cfg,
             kv,
             layer_norms,
+            attn_bias,
+            mtp_slot,
+            last_hidden_nextn: Vec::new(),
+            mtp_cache: None,
+            mamba_cache: None,
             output_norm,
             has_output_weight,
             sampler,
+            penalties: Penalties::default(),
+            grammar: None,
+            grammar_state: None,
+            grammar_token_texts: Vec::new(),
             rng: seed,
             position: 0,
             io_bytes: 0,
@@ -445,9 +653,28 @@ impl StreamingGenerator {
             ws_gate: vec![0.0; intermediate],
             ws_up: vec![0.0; intermediate],
             ws_down: vec![0.0; hidden],
-            layer_scratch_cap: 0,
+            scratch_xn: vec![0.0; hidden],
+            scratch_q: vec![0.0; hidden],
+            scratch_k: vec![0.0; hidden],
+            scratch_v: vec![0.0; hidden],
+            scratch_attn: vec![0.0; hidden],
+            scratch_gate: vec![0.0; hidden],
+            scratch_proj: vec![0.0; hidden],
             z_l_init,
             gemma_rope_freqs,
+            ple_model_proj: None,
+            ple_proj_norm: None,
+            moe_non_expert: None,
+            moe_non_expert_bytes: 0,
+            moe_non_expert_cap: std::env::var("HAYAI_MOE_NONEXPERT_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1024)
+                .saturating_mul(1024 * 1024),
+            conv_weights: None,
+            conv_states: None,
+            conv_names: None,
+            conv_activation,
             exec_plan: None,
             io_worker: hayai_io::IoWorker::new("hayai-io-worker"),
             deltanet_weights: None,
@@ -470,7 +697,7 @@ impl StreamingGenerator {
         (self.moe_cache.hits, self.moe_cache.misses)
     }
 
-    fn act(&self) -> &[f32] {
+    pub(crate) fn act(&self) -> &[f32] {
         &self.act_pp[self.act_sel]
     }
 
@@ -495,10 +722,142 @@ impl StreamingGenerator {
 
     pub(crate) fn load_pack(&mut self, layer: usize) -> Result<LayerWeightPack, StreamInferError> {
         let t0 = Instant::now();
-        let pack = self.catalog.load_layer_pack(layer)?;
+        let pack = match self.fused_qkv_dims(layer) {
+            Some((q, kv)) => self.catalog.load_layer_pack_fused(layer, q, kv)?.0,
+            None => self.catalog.load_layer_pack(layer)?,
+        };
         self.io_secs += t0.elapsed().as_secs_f64();
         self.io_bytes += pack.nbytes() as u64;
         Ok(pack)
+    }
+
+    /// Fused `attn_qkv` split dims `(q_dim, kv_dim)` for this layer, or `None` when
+    /// the model uses separate `attn_q/k/v` tensors. Fused QKV is split by output
+    /// rows assuming the concat `[q | k | v]` layout.
+    pub(crate) fn fused_qkv_dims(&self, layer: usize) -> Option<(usize, usize)> {
+        if self
+            .catalog
+            .tensor(&format!("blk.{layer}.attn_q.weight"))
+            .is_ok()
+        {
+            return None;
+        }
+        if self
+            .catalog
+            .tensor(&format!("blk.{layer}.attn_qkv.weight"))
+            .is_err()
+        {
+            return None;
+        }
+        let q = self.attn_cfg.num_heads * self.attn_cfg.head_dim;
+        let kv = self.attn_cfg.num_kv_heads * self.attn_cfg.head_dim;
+        Some((q, kv))
+    }
+
+    /// Load one layer pack into `dst`, using the fused-QKV split when needed.
+    pub(crate) fn load_pack_into(
+        &self,
+        cat: &mut hayai_model::GgufCatalog,
+        layer: usize,
+        dst: &mut [u8],
+    ) -> Result<(LayerWeightPack, LayerPackLayout), GgufError> {
+        match self.fused_qkv_dims(layer) {
+            Some((q, kv)) => cat.load_layer_pack_into_fused(layer, dst, q, kv),
+            None => cat.load_layer_pack_into(layer, dst),
+        }
+    }
+
+    /// Re-derive pack views over an already-resident/staged base, splitting fused
+    /// QKV when needed.
+    pub(crate) fn pack_views_from_base(
+        &mut self,
+        layer: usize,
+        base: &[u8],
+    ) -> Result<(LayerWeightPack, LayerPackLayout), StreamInferError> {
+        match self.fused_qkv_dims(layer) {
+            Some((q, kv)) => {
+                Ok(self
+                    .catalog
+                    .layer_pack_views_from_base_fused(layer, base, q, kv)?)
+            }
+            None => Ok(self.catalog.layer_pack_views_from_base(layer, base)?),
+        }
+    }
+
+    /// Load (once) the depthwise causal short-conv weights of `layer`, if present.
+    fn ensure_conv_layer(&mut self, layer: usize) -> Result<(), StreamInferError> {
+        let n = self.config.num_layers + usize::from(self.mtp_slot.is_some());
+        if self.conv_names.is_none() {
+            // Resolve every `Conv` tensor name once (no plan scan per token).
+            let mut names: Vec<Option<String>> = vec![None; n];
+            if let Some(plan) = self.exec_plan.as_ref() {
+                for u in &plan.units {
+                    let Some(b) = u.block_id else { continue };
+                    if b >= n {
+                        continue;
+                    }
+                    for t in &u.tensors {
+                        if t.op == crate::LayerOpKind::Conv && names[b].is_none() {
+                            names[b] = Some(t.name.clone());
+                        }
+                    }
+                }
+            }
+            self.conv_names = Some(names);
+            self.conv_weights = Some((0..n).map(|_| None).collect());
+            self.conv_states = Some((0..n).map(|_| None).collect());
+        }
+        if self.conv_names.as_ref().unwrap()[layer].is_none() {
+            return Ok(());
+        }
+        if self.conv_weights.as_ref().unwrap()[layer].is_some() {
+            return Ok(());
+        }
+        let name = self.conv_names.as_ref().unwrap()[layer]
+            .clone()
+            .expect("checked above");
+        let info = self.catalog.tensor(&name)?.clone();
+        let data = self.catalog.dequant_f32(&name)?;
+        // GGUF layout `[ne0=kernel, ne1=channels]`: linear index `c*kernel + t`.
+        // `channels` may differ from `hidden` (a conv over a projected subspace);
+        // the caller must pass the matching buffer to `apply_conv`.
+        let k = info.ncols().max(1);
+        let ch = info.nrows().max(1);
+        if data.len() < k * ch {
+            return Err(StreamInferError::Msg(format!(
+                "conv tensor {name}: {} values < kernel({k})*channels({ch})",
+                data.len()
+            )));
+        }
+        self.io_bytes += (data.len() * 4) as u64;
+        self.conv_weights.as_mut().unwrap()[layer] = Some((k, ch, data[..k * ch].to_vec()));
+        self.conv_states.as_mut().unwrap()[layer] = Some(vec![0.0f32; (k - 1) * ch]);
+        Ok(())
+    }
+
+    /// Apply the optional short-conv residual to an explicit activation buffer
+    /// (`x = x + silu(depthwise_causal_conv(x))`).
+    pub(crate) fn apply_conv(
+        &mut self,
+        layer: usize,
+        x: &mut [f32],
+    ) -> Result<(), StreamInferError> {
+        self.ensure_conv_layer(layer)?;
+        let Some(Some((k, ch, w))) = self.conv_weights.as_ref().and_then(|v| v.get(layer)) else {
+            return Ok(());
+        };
+        let (k, ch) = (*k, *ch);
+        if x.len() != ch {
+            return Err(StreamInferError::Msg(format!(
+                "conv layer {layer}: activation len {} != channels {ch}",
+                x.len()
+            )));
+        }
+        let state = self.conv_states.as_mut().unwrap()[layer]
+            .as_mut()
+            .unwrap();
+        apply_depthwise_conv(x, state, k, w.as_slice(), self.conv_activation);
+        Ok(())
     }
 
     /// Embedding row read. Resident mode serves it from the cached embedding matrix
@@ -513,7 +872,7 @@ impl StreamingGenerator {
         if embd_name == "token_embd.weight" {
             if let Some(emb) = &self.resident_embed {
                 emb.embed_row(token, dst)?;
-                self.io_bytes += (h * 2) as u64;
+                // No disk I/O: resident embedding. Do not inflate `io_bytes`.
                 return Ok(());
             }
         }
@@ -543,9 +902,9 @@ impl StreamingGenerator {
             self.map_secs += t_map.elapsed().as_secs_f64();
             let t0 = Instant::now();
             let base = scratch.host_slot(layer);
-            let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
+            let (pack, layout) = self.pack_views_from_base(layer, base)?;
             self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += layout.total as u64;
+            // Views over resident memory: no disk read, so no `io_bytes`.
             return Ok((pack, layout));
         }
         if scratch.block_k > 1 {
@@ -568,7 +927,7 @@ impl StreamingGenerator {
                 for l in bs..be {
                     let t0 = Instant::now();
                     let dst = scratch.host_slot_mut(l);
-                    let (_, layout) = cat.load_layer_pack_into(l, dst)?;
+                    let (_, layout) = self.load_pack_into(&mut cat, l, dst)?;
                     self.io_secs += t0.elapsed().as_secs_f64();
                     self.io_bytes += layout.total as u64;
                 }
@@ -577,9 +936,9 @@ impl StreamingGenerator {
             if !has_hybrid {
                 let t0 = Instant::now();
                 let base = scratch.host_slot(layer);
-                let (pack, layout) = self.catalog.layer_pack_views_from_base(layer, base)?;
+                let (pack, layout) = self.pack_views_from_base(layer, base)?;
                 self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += layout.total as u64;
+                // Views over the already-staged block: no disk read.
                 return Ok((pack, layout));
             }
             // has_hybrid: continúa al ping-pong por capa de abajo.
@@ -588,9 +947,12 @@ impl StreamingGenerator {
         scratch.prepare_host_write(&orch.pool, slot)?;
         self.map_secs += t_map.elapsed().as_secs_f64();
         let t0 = Instant::now();
-        let (pack, layout) = self
-            .catalog
-            .load_layer_pack_into(layer, scratch.host_slot_mut(slot))?;
+        let fused = self.fused_qkv_dims(layer);
+        let dst = scratch.host_slot_mut(slot);
+        let (pack, layout) = match fused {
+            Some((q, kv)) => self.catalog.load_layer_pack_into_fused(layer, dst, q, kv)?,
+            None => self.catalog.load_layer_pack_into(layer, dst)?,
+        };
         self.io_secs += t0.elapsed().as_secs_f64();
         self.io_bytes += layout.total as u64;
         self.owned_mem
@@ -765,9 +1127,8 @@ impl StreamingGenerator {
                     sc.ensure_host_readable(&orch.pool, slot)?;
                     self.map_secs += t_map.elapsed().as_secs_f64();
                     let base = sc.host_slot(layer_idx);
-                    (current, layout) =
-                        self.catalog.layer_pack_views_from_base(layer_idx, base)?;
-                    self.io_bytes += layout.total as u64;
+                    (current, layout) = self.pack_views_from_base(layer_idx, base)?;
+                    // Resident: views over preloaded memory, no disk read.
                 } else {
                     let t_map = Instant::now();
                     sc.ensure_host_readable(&orch.pool, slot)?;
@@ -785,70 +1146,115 @@ impl StreamingGenerator {
             {
                 let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
+                let next_fused = self.fused_qkv_dims(next);
                 if let Some(sc) = scratch.as_mut() {
                     let next_slot = (layer_idx + 1) % 2;
-                    let slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
+                    let mut slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
                     if let Some(m) = self.owned_mem.as_mut() {
                         m.note_prefetch_staging(0);
                     }
                     prefetch = Some(thread::spawn(move || {
                         let dst = unsafe { slot_ptr.as_mut_slice() };
-                        cat.load_layer_pack_into(next, dst)
+                        match next_fused {
+                            Some((q, kv)) => cat.load_layer_pack_into_fused(next, dst, q, kv),
+                            None => cat.load_layer_pack_into(next, dst),
+                        }
                     }));
                 } else {
-                    let cap = self.layer_scratch_cap.max(layout.total).max(1);
-                    prefetch = Some(thread::spawn(move || {
-                        let mut blob = vec![0u8; cap];
-                        let (pack, lay) = cat.load_layer_pack_into(next, &mut blob)?;
-                        Ok((pack, lay))
+                    // No scratch: the prefetch must return **owned** matrices.
+                    // Returning views into a `blob` local to this closure would
+                    // dangle the moment the closure returns (the pack is used by
+                    // the main thread afterwards). The owned loaders copy every
+                    // tensor into its own allocation, so the pack owns its bytes.
+                    prefetch = Some(thread::spawn(move || match next_fused {
+                        Some((q, kv)) => {
+                            let pack = cat.load_layer_pack_fused(next, q, kv)?.0;
+                            let lay = pack.layout();
+                            Ok((pack, lay))
+                        }
+                        None => {
+                            let pack = cat.load_layer_pack(next)?;
+                            let lay = pack.layout();
+                            Ok((pack, lay))
+                        }
                     }));
                 }
             }
 
             // --- CPU Attention (∥ DMA already enqueued) ---
             let t_attn = Instant::now();
-            let mut xn = self.act().to_vec();
-            rms_norm(&mut xn, &self.layer_norms[layer_idx].attn_norm, eps);
+            let sel = self.act_sel;
+            self.scratch_xn.resize(h, 0.0);
+            self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
+            rms_norm(&mut self.scratch_xn, &self.layer_norms[layer_idx].attn_norm, eps);
 
             let q_dim = self.attn_cfg.hidden_size();
             let kv_dim = self.attn_cfg.kv_dim();
-            let mut q = vec![0.0f32; q_dim];
-            let mut k = vec![0.0f32; kv_dim];
-            let mut v = vec![0.0f32; kv_dim];
-            current.wq.gemv(&xn, &mut q)?;
-            current.wk.gemv(&xn, &mut k)?;
-            current.wv.gemv(&xn, &mut v)?;
+            self.scratch_q.resize(q_dim, 0.0);
+            self.scratch_k.resize(kv_dim, 0.0);
+            self.scratch_v.resize(kv_dim, 0.0);
+            current.wq.gemv(&self.scratch_xn, &mut self.scratch_q)?;
+            current.wk.gemv(&self.scratch_xn, &mut self.scratch_k)?;
+            current.wv.gemv(&self.scratch_xn, &mut self.scratch_v)?;
+            if let Some(b) = self.attn_bias.get(layer_idx) {
+                add_qkv_bias(b, &mut self.scratch_q, &mut self.scratch_k, &mut self.scratch_v);
+            }
 
-            let mut attn_out = vec![0.0f32; q_dim];
+            self.scratch_attn.resize(q_dim, 0.0);
             attention_decode_step(
                 &self.attn_cfg,
                 &mut self.kv[layer_idx],
-                &mut q,
-                &mut k,
-                &v,
+                &mut self.scratch_q,
+                &mut self.scratch_k,
+                &self.scratch_v,
                 pos,
-                &mut attn_out,
+                &mut self.scratch_attn,
             );
             if let Some(ref gate_w) = current.attn_gate {
-                let mut gate = vec![0.0f32; q_dim];
-                gate_w.gemv(&xn, &mut gate)?;
+                self.scratch_gate.resize(q_dim, 0.0);
+                gate_w.gemv(&self.scratch_xn, &mut self.scratch_gate)?;
                 for i in 0..q_dim {
-                    attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
+                    self.scratch_attn[i] *= 1.0 / (1.0 + (-self.scratch_gate[i]).exp());
                 }
             }
-            let mut attn_proj = vec![0.0f32; h];
-            current.wo.gemv(&attn_out, &mut attn_proj)?;
+            self.scratch_proj.resize(h, 0.0);
+            current.wo.gemv(&self.scratch_attn, &mut self.scratch_proj)?;
+            if let Some(b) = self.attn_bias.get(layer_idx) {
+                add_bias(&mut self.scratch_proj, &b.o);
+            }
             {
-                let x = self.act_mut();
+                let x = &mut self.act_pp[sel];
                 for i in 0..h {
-                    x[i] += attn_proj[i];
+                    x[i] += self.scratch_proj[i];
                 }
             }
             self.attn_secs += t_attn.elapsed().as_secs_f64();
+            // Optional depthwise causal short-conv residual (generic `Conv` op),
+            // applied after attention and before the FFN norm.
+            self.ensure_conv_layer(layer_idx)?;
+            if let Some(Some((k, ch, w))) =
+                self.conv_weights.as_ref().and_then(|v| v.get(layer_idx))
+            {
+                let (k, ch) = (*k, *ch);
+                let act = self.conv_activation;
+                let state = self.conv_states.as_mut().unwrap()[layer_idx]
+                    .as_mut()
+                    .unwrap();
+                let x = &mut self.act_pp[sel];
+                if x.len() == ch {
+                    apply_depthwise_conv(x, state, k, w.as_slice(), act);
+                } else {
+                    return Err(StreamInferError::Msg(format!(
+                        "conv layer {layer_idx}: tensor channels {ch} != residual len {}; a \
+                         non-residual conv needs a family-specific path (no silent skip)",
+                        x.len()
+                    )));
+                }
+            }
 
             // --- FFN: unmap after Attn, then enqueue async ---
-            let mut xn = self.act().to_vec();
-            rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
+            self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
+            rms_norm(&mut self.scratch_xn, &self.layer_norms[layer_idx].ffn_norm, eps);
 
             self.ws_gate.fill(0.0);
             self.ws_up.fill(0.0);
@@ -874,7 +1280,7 @@ impl StreamingGenerator {
                     orch,
                     &current.gate,
                     &current.up,
-                    &xn,
+                    &self.scratch_xn,
                     &mut self.ws_gate,
                     &mut self.ws_up,
                     &mut self.used_dgpu,
@@ -919,6 +1325,7 @@ impl StreamingGenerator {
                 )?;
             } else {
                 // FFN disperso embebido (D16) u override de evolución: CSR en GPU/CPU.
+                let xn = self.scratch_xn.clone();
                 self.run_ffn_block(orch, &current, &xn, ov)?;
             }
             self.ffn_secs += t_ffn_fin.elapsed().as_secs_f64();
@@ -956,6 +1363,8 @@ impl StreamingGenerator {
 
         let mut xn = self.act().to_vec();
         rms_norm(&mut xn, &self.output_norm, eps);
+        self.last_hidden_nextn.clear();
+        self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         if self.has_output_weight {
@@ -1016,15 +1425,25 @@ impl StreamingGenerator {
                 scratch.prepare_host_write(&orch.pool, next_bs)?;
                 self.map_secs += t_map.elapsed().as_secs_f64();
                 let (ptr, _len) = scratch.host_slot_block_ptr_mut(next_slot);
-                let slot_ptr = PrefetchSlotPtr::new(ptr, scratch.slot_capacity());
+                let mut slot_ptr = PrefetchSlotPtr::new(ptr, scratch.slot_capacity());
                 let stride = scratch.resident_stride;
                 let mut cat = self.catalog.fork_reader()?;
+                let fused: Vec<Option<(usize, usize)>> = (next_bs..next_be)
+                    .map(|l| self.fused_qkv_dims(l))
+                    .collect();
                 prefetch = self.io_worker.run(move || -> Result<(), GgufError> {
                     let dst = unsafe { slot_ptr.as_mut_slice() };
                     for l in next_bs..next_be {
                         let off = (l - next_bs) * stride;
                         let end = (off + stride).min(dst.len());
-                        cat.load_layer_pack_into(l, &mut dst[off..end])?;
+                        match fused[l - next_bs] {
+                            Some((q, kv)) => {
+                                cat.load_layer_pack_into_fused(l, &mut dst[off..end], q, kv)?;
+                            }
+                            None => {
+                                cat.load_layer_pack_into(l, &mut dst[off..end])?;
+                            }
+                        }
                     }
                     Ok(())
                 });
@@ -1038,8 +1457,11 @@ impl StreamingGenerator {
                 scratch.ensure_host_readable(&orch.pool, layer)?;
                 self.map_secs += t_map.elapsed().as_secs_f64();
                 let base = scratch.host_slot(layer);
-                let (current, layout) =
-                    self.catalog.layer_pack_views_from_base(layer, base)?;
+                let (current, layout) = self.pack_views_from_base(layer, base)?;
+                // DMA this layer's FFN slices into every dGPU mirror (resolved at the
+                // layer's in-block offset) so the GPU FFN reads fresh weights instead
+                // of a stale mirror. Enqueued before Attn to overlap the copy.
+                self.begin_ffn_dma(orch, scratch, layer, &layout)?;
 
                 // ── CPU Attention ────────────────────────────────────────────────
                 let t_attn = Instant::now();
@@ -1054,6 +1476,9 @@ impl StreamingGenerator {
                 current.wq.gemv(&xn, &mut q)?;
                 current.wk.gemv(&xn, &mut kk)?;
                 current.wv.gemv(&xn, &mut v)?;
+                if let Some(b) = self.attn_bias.get(layer) {
+                    add_qkv_bias(b, &mut q, &mut kk, &mut v);
+                }
 
                 let mut attn_out = vec![0.0f32; q_dim];
                 attention_decode_step(
@@ -1074,6 +1499,9 @@ impl StreamingGenerator {
                 }
                 let mut attn_proj = vec![0.0f32; h];
                 current.wo.gemv(&attn_out, &mut attn_proj)?;
+                if let Some(b) = self.attn_bias.get(layer) {
+                    add_bias(&mut attn_proj, &b.o);
+                }
                 {
                     let x = self.act_mut();
                     for i in 0..h {
@@ -1154,6 +1582,8 @@ impl StreamingGenerator {
         // Final projection (resident cache or on-demand).
         let mut xn = self.act().to_vec();
         rms_norm(&mut xn, &self.output_norm, eps);
+        self.last_hidden_nextn.clear();
+        self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         if self.has_output_weight {
@@ -1202,7 +1632,7 @@ impl StreamingGenerator {
         for l in bs..be {
             let t0 = Instant::now();
             let dst = scratch.host_slot_mut(l);
-            let (_, layout) = cat.load_layer_pack_into(l, dst)?;
+            let (_, layout) = self.load_pack_into(&mut cat, l, dst)?;
             self.io_secs += t0.elapsed().as_secs_f64();
             self.io_bytes += layout.total as u64;
         }
@@ -1238,7 +1668,7 @@ impl StreamingGenerator {
                     for note in &plan.hw_notes {
                         debug!("ExecPlan HW: {note}");
                     }
-                    self.exec_plan = Some(plan);
+                    self.exec_plan = Some(std::sync::Arc::new(plan));
                 }
                 Err(u) => {
                     return Err(StreamInferError::Msg(format!(
@@ -1299,12 +1729,19 @@ impl StreamingGenerator {
             .map(|p| p.max_full_block_bytes)
             .unwrap_or(window_bytes)
             .max(1);
-        self.layer_scratch_cap = window_bytes;
+        // Reserve KV cache + activations + metadata before sizing the weight
+        // window so the 75–80 % target covers the whole Hayai-owned footprint.
+        let reserve_bytes = crate::metrics::StreamingMemoryBudget::kv_activation_bytes(
+            &self.config,
+            self.kv_sinks,
+            self.kv_window,
+        ) + 64 * 1024 * 1024;
         let win = compute_window_plan(
             &orch.pool,
             full_bytes,
             self.config.num_layers,
             self.memory_strategy,
+            reserve_bytes,
         );
         self.window_plan = Some(win);
         let resident = win.resident && win.k_chunk >= self.config.num_layers;
@@ -1340,11 +1777,25 @@ impl StreamingGenerator {
             + self.ws_down.len())
             * 4;
         let mut owned = crate::metrics::HayaiOwnedMemory::default();
-        if resident {
-            owned.note_scratch(layer_bytes as u64 * self.config.num_layers as u64);
+        // Two ping-pong slots of `k_chunk` layers each (resident → k_chunk = n_layers).
+        let slots = if resident {
+            self.config.num_layers
         } else {
-            owned.note_scratch(layer_bytes as u64 * 2);
+            win.k_chunk
+        };
+        let mut scratch_bytes = 2u64
+            .saturating_mul(slots as u64)
+            .saturating_mul(layer_bytes as u64);
+        // Resident mode also keeps the final projection and embedding resident.
+        if resident {
+            if let Some(ow) = &self.resident_output {
+                scratch_bytes = scratch_bytes.saturating_add(ow.nbytes() as u64);
+            }
+            if let Some(emb) = &self.resident_embed {
+                scratch_bytes = scratch_bytes.saturating_add(emb.nbytes() as u64);
+            }
         }
+        owned.note_scratch(scratch_bytes);
         owned.note_kv(budget.kv_bytes);
         owned.note_activations(act_bytes as u64);
         owned.note_metadata(self.catalog.header_bytes as u64);
@@ -1362,7 +1813,8 @@ impl StreamingGenerator {
 
         // Resident mode: preload every layer pack once (disk → device memory) and
         // cache the final projection + embedding matrices for zero-I/O decode.
-        if resident {
+        // Mamba has no llama-shaped layer pack (its weights live in `mamba_cache`).
+        if resident && self.model_kind() != ModelKind::Mamba {
             info!(
                 "Resident mode: pre-loading all {} layers into device memory",
                 self.config.num_layers
@@ -1416,15 +1868,15 @@ impl StreamingGenerator {
                                 unit.non_expert_bytes
                                     + unit.experts.len() * unit.max_expert_bytes
                             } else {
-                                let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                                let (_, layout) = self.load_pack_into(&mut cat, i, dst)?;
                                 layout.total
                             }
                         } else {
-                            let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                            let (_, layout) = self.load_pack_into(&mut cat, i, dst)?;
                             layout.total
                         }
                     } else {
-                        let (_, layout) = cat.load_layer_pack_into(i, dst)?;
+                        let (_, layout) = self.load_pack_into(&mut cat, i, dst)?;
                         layout.total
                     }
                 };
@@ -1453,18 +1905,20 @@ impl StreamingGenerator {
 
 
     /// Layer-role derived model kind (op-based, never `general.architecture`).
+    ///
+    /// Uses the **same** detection as [`ModelKind::from_catalog`] (which `open()`
+    /// uses to size the KV caches), then falls back to the stored `ExecPlan` for
+    /// ops whose tensor names the probe does not recognize.
     pub fn model_kind(&self) -> ModelKind {
-        // Catálogo primero: los tensores `ssm_*` pueden no aparecer en los units
-        // del plan (el clasificador `AttnQkv` gana al de `DeltaNet` en el orden de
-        // fases), pero definen un híbrido Qwen3.5 y deben enrutar a `forward_hybrid`.
-        for i in 0..self.config.num_layers.min(16) {
-            if crate::deltanet::is_deltanet_layer(&self.catalog, i) {
-                return ModelKind::Hybrid;
-            }
+        let catalog_kind = ModelKind::from_catalog(&self.catalog);
+        if catalog_kind != ModelKind::Dense {
+            return catalog_kind;
         }
         if let Some(p) = &self.exec_plan {
             let has = |op: crate::LayerOpKind| p.known_ops.contains(&op);
-            if has(crate::LayerOpKind::DeltaNet) {
+            if has(crate::LayerOpKind::Mamba) {
+                ModelKind::Mamba
+            } else if has(crate::LayerOpKind::DeltaNet) {
                 ModelKind::Hybrid
             } else if has(crate::LayerOpKind::Router)
                 || has(crate::LayerOpKind::ExpertGate)
@@ -1487,6 +1941,78 @@ impl StreamingGenerator {
 
     /// Prefill `prompt_ids` and return logits ready for sampling (family dispatch:
     /// HRM / Qwen3.5 hybrid / Gemma4 / llama). Advances the KV cache over the prompt.
+    /// Prefill a multimodal input sequence (text tokens + media embedding rows).
+    /// Currently supported on Gemma-family models (vision/audio injection).
+    pub fn prefill_media(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        items: &[MediaInput],
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if items.is_empty() {
+            return Err(StreamInferError::Msg("empty multimodal prompt".into()));
+        }
+        if self.model_kind() != ModelKind::Gemma {
+            return Err(StreamInferError::Msg(
+                "multimodal input is currently supported on Gemma models only".into(),
+            ));
+        }
+        let mut last = Vec::new();
+        for it in items {
+            last = match it {
+                MediaInput::Token(t) => {
+                    crate::gemma_infer::forward_gemma(self, orch, *t, scratch)?
+                }
+                MediaInput::Emb(e) => {
+                    crate::gemma_infer::forward_gemma_embd(self, orch, e, scratch)?
+                }
+            };
+        }
+        Ok(last)
+    }
+
+    /// Generate from a multimodal input sequence (see [`Self::prefill_media`]).
+    pub fn generate_media(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        items: &[MediaInput],
+        max_new_tokens: usize,
+    ) -> Result<GenerateStats, StreamInferError> {
+        let prompt_tokens = items.len();
+        let mut scratch = self.prepare_session(orch)?;
+        let wall0 = Instant::now();
+        let mut last_logits = self.prefill_media(orch, items, &mut scratch)?;
+        if let Some(g) = &self.grammar {
+            self.grammar_state = Some(g.initial_state());
+        }
+        let mut all_new = Vec::new();
+        for _ in 0..max_new_tokens {
+            if self.grammar.is_some() {
+                self.mask_logits_with_grammar(&mut last_logits);
+            }
+            let next = sample_with(
+                &last_logits,
+                self.sampler,
+                &mut self.rng,
+                &self.penalties,
+                &all_new,
+            );
+            self.advance_grammar(next);
+            if self.tokenizer.is_stop(next) {
+                break;
+            }
+            all_new.push(next);
+            last_logits = self.decode_step(orch, next, &mut scratch)?;
+        }
+        self.wall_compute_secs = wall0.elapsed().as_secs_f64();
+        Ok(GenerateStats {
+            text: self.tokenizer.decode(&all_new),
+            prompt_tokens,
+            new_tokens: all_new.len(),
+            total_positions: self.position,
+        })
+    }
+
     pub fn prefill(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -1514,9 +2040,17 @@ impl StreamingGenerator {
                 ModelKind::MoE => {
                     crate::moe_infer::prefill_moe(self, orch, prompt_ids, scratch)
                 }
+                ModelKind::Mamba => {
+                    crate::mamba_infer::prefill_mamba(self, orch, prompt_ids, scratch)
+                }
                 ModelKind::Dense => {
-                    // Prefill with Attn∥FFN wavefront (PRD §3.3).
-                    self.prefill_wavefront(orch, prompt_ids, scratch)
+                    // Prefill with Attn∥FFN wavefront (PRD §3.3), or the batched
+                    // layer-major path when `HAYAI_PREFILL_BATCH=1`.
+                    if std::env::var("HAYAI_PREFILL_BATCH").ok().as_deref() == Some("1") {
+                        self.prefill_batched(orch, prompt_ids, scratch)
+                    } else {
+                        self.prefill_wavefront(orch, prompt_ids, scratch)
+                    }
                 }
             }
         }
@@ -1537,6 +2071,7 @@ impl StreamingGenerator {
                 ModelKind::Hybrid => crate::hybrid_infer::forward_hybrid(self, orch, token, scratch, None),
                 ModelKind::Gemma => crate::gemma_infer::forward_gemma(self, orch, token, scratch),
                 ModelKind::MoE => crate::moe_infer::forward_moe(self, orch, token, scratch),
+                ModelKind::Mamba => self.forward_mamba(orch, token),
                 ModelKind::Dense => self.forward_staged(orch, token, scratch),
             }
         }
@@ -1568,6 +2103,66 @@ impl StreamingGenerator {
     }
 
 
+    /// Enable grammar-constrained decoding. Builds the per-token text cache and
+    /// resets the live grammar state to the grammar's initial state.
+    pub fn set_grammar(&mut self, grammar: hayai_model::Grammar) {
+        self.grammar_token_texts = self.tokenizer.token_texts();
+        self.grammar_state = Some(grammar.initial_state());
+        self.grammar = Some(grammar);
+    }
+
+    pub fn clear_grammar(&mut self) {
+        self.grammar = None;
+        self.grammar_state = None;
+        self.grammar_token_texts.clear();
+    }
+
+    /// Set the logits of every token that would leave the grammar to `-inf`.
+    /// EOS is allowed only when the grammar may stop here.
+    fn mask_logits_with_grammar(&self, logits: &mut [f32]) {
+        let (Some(grammar), Some(state)) = (&self.grammar, &self.grammar_state) else {
+            return;
+        };
+        for (id, text) in self.grammar_token_texts.iter().enumerate() {
+            if id >= logits.len() {
+                break;
+            }
+            if self.tokenizer.is_stop(id as u32) {
+                if !grammar.is_accepting(state) {
+                    logits[id] = f32::NEG_INFINITY;
+                }
+                continue;
+            }
+            match text {
+                Some(t) if !t.is_empty() => {
+                    if grammar.advance_str(state, t).is_none() {
+                        logits[id] = f32::NEG_INFINITY;
+                    }
+                }
+                // Special / partial-UTF-8 tokens emit no clean text: disallow.
+                _ => logits[id] = f32::NEG_INFINITY,
+            }
+        }
+    }
+
+    /// Advance the live grammar state after `token` was sampled.
+    fn advance_grammar(&mut self, token: u32) {
+        let (Some(grammar), Some(state)) = (&self.grammar, self.grammar_state.take()) else {
+            return;
+        };
+        if self.tokenizer.is_stop(token) {
+            self.grammar_state = Some(state);
+            return;
+        }
+        let next = self
+            .grammar_token_texts
+            .get(token as usize)
+            .and_then(|t| t.as_deref())
+            .and_then(|t| grammar.advance_str(&state, t));
+        // `None` only if the mask was bypassed; keep the previous state.
+        self.grammar_state = Some(next.unwrap_or(state));
+    }
+
     pub fn generate(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -1584,13 +2179,26 @@ impl StreamingGenerator {
         let mut scratch = self.prepare_session(orch)?;
         let wall0 = Instant::now();
         let mut last_logits = self.prefill(orch, &prompt_ids, &mut scratch)?;
+        if let Some(g) = &self.grammar {
+            self.grammar_state = Some(g.initial_state());
+        }
         let mut all_new = Vec::new();
         for _ in 0..max_new_tokens {
-            let next = sample(&last_logits, self.sampler, &mut self.rng);
-            all_new.push(next);
-            if next == self.tokenizer.eos_id {
+            if self.grammar.is_some() {
+                self.mask_logits_with_grammar(&mut last_logits);
+            }
+            let next = sample_with(
+                &last_logits,
+                self.sampler,
+                &mut self.rng,
+                &self.penalties,
+                &all_new,
+            );
+            self.advance_grammar(next);
+            if self.tokenizer.is_stop(next) {
                 break;
             }
+            all_new.push(next);
             last_logits = self.decode_step(orch, next, &mut scratch)?;
         }
         self.wall_compute_secs = wall0.elapsed().as_secs_f64();
@@ -1641,6 +2249,139 @@ impl StreamingGenerator {
         self.forward_inner(orch, token, None, Some(override_ffn))
     }
 
+    /// Build per-layer CSR FFN overrides from the global sparse genome
+    /// (`saor.sparse` + `saor.genome` + `saor.tau`). Returns `None` for dense
+    /// GGUFs. The dense FFN weights are read once, pruned by the decoded CPPN
+    /// topology and kept as CSR (research "Vía B" runtime path).
+    pub fn build_global_sparse_overrides(
+        &mut self,
+    ) -> Result<Option<Vec<FfnOverride>>, StreamInferError> {
+        use hayai_model::sparse_dag::{META_GENOME, META_SPARSE, META_TAU};
+        let is_sparse = matches!(
+            self.catalog.metadata.get(META_SPARSE),
+            Some(hayai_model::MetadataValue::Bool(true))
+        );
+        if !is_sparse {
+            return Ok(None);
+        }
+        let genome = self
+            .catalog
+            .metadata
+            .get(META_GENOME)
+            .and_then(|v| v.as_f32_array())
+            .ok_or_else(|| StreamInferError::Msg("sparse model is missing saor.genome".into()))?;
+        let tau = self
+            .catalog
+            .metadata
+            .get(META_TAU)
+            .and_then(|v| v.as_f32())
+            .ok_or_else(|| StreamInferError::Msg("sparse model is missing saor.tau".into()))?;
+        let n_layers = self.config.num_layers;
+        let mut out = Vec::with_capacity(n_layers);
+        for layer in 0..n_layers {
+            let y = hayai_model::layer_coord(layer, n_layers);
+            let mut ov = FfnOverride::default();
+            for (block, slot) in [("ffn_gate", 0u8), ("ffn_up", 1), ("ffn_down", 2)] {
+                let name = format!("blk.{layer}.{block}.weight");
+                if self.catalog.tensor(&name).is_err() {
+                    continue;
+                }
+                let info = self.catalog.tensor(&name)?.clone();
+                let nbytes = hayai_model::tensor_nbytes(&info)?;
+                let mut buf = vec![0u8; nbytes];
+                self.catalog.read_tensor_into(&name, &mut buf)?;
+                let dense = hayai_model::gguf::dequantize(&info, &buf)?;
+                let csr = hayai_model::sparse_layer_csr(
+                    &genome,
+                    tau,
+                    y,
+                    &dense,
+                    info.ncols(),
+                    info.nrows(),
+                );
+                match slot {
+                    0 => ov.gate = Some(csr),
+                    1 => ov.up = Some(csr),
+                    _ => ov.down = Some(csr),
+                }
+            }
+            out.push(ov);
+        }
+        Ok(Some(out))
+    }
+
+    /// Prefill with per-layer FFN overrides (Dense only, used by the global
+    /// sparse genome runtime). Token-by-token; the wavefront path has no override.
+    pub fn prefill_with_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        prompt_ids: &[u32],
+        scratch: &mut hayai_opencl::StreamingScratch,
+        override_ffn: &[FfnOverride],
+    ) -> Result<Vec<f32>, StreamInferError> {
+        if prompt_ids.is_empty() {
+            return Err(StreamInferError::Msg("empty prompt tokenization".into()));
+        }
+        if self.model_kind() != ModelKind::Dense {
+            return Err(StreamInferError::Msg(
+                "sparse-global override is only supported for Dense models".into(),
+            ));
+        }
+        let mut last = Vec::new();
+        for &tok in prompt_ids {
+            last = self.forward_inner(orch, tok, Some(scratch), Some(override_ffn))?;
+        }
+        Ok(last)
+    }
+
+    /// Like [`Self::generate`] but with per-layer FFN overrides (Dense only).
+    pub fn generate_with_override(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        prompt: &str,
+        max_new_tokens: usize,
+        override_ffn: &[FfnOverride],
+    ) -> Result<GenerateStats, StreamInferError> {
+        let prompt_ids = self.tokenizer.encode(prompt, self.tokenizer.add_bos);
+        if prompt_ids.is_empty() {
+            return Err(StreamInferError::Msg("empty prompt tokenization".into()));
+        }
+        let prompt_len = prompt_ids.len();
+        let mut scratch = self.prepare_session(orch)?;
+        let wall0 = Instant::now();
+        let mut last_logits =
+            self.prefill_with_override(orch, &prompt_ids, &mut scratch, override_ffn)?;
+        if let Some(g) = &self.grammar {
+            self.grammar_state = Some(g.initial_state());
+        }
+        let mut all_new = Vec::new();
+        for _ in 0..max_new_tokens {
+            if self.grammar.is_some() {
+                self.mask_logits_with_grammar(&mut last_logits);
+            }
+            let next = sample_with(
+                &last_logits,
+                self.sampler,
+                &mut self.rng,
+                &self.penalties,
+                &all_new,
+            );
+            self.advance_grammar(next);
+            if self.tokenizer.is_stop(next) {
+                break;
+            }
+            all_new.push(next);
+            last_logits = self.decode_step_with_override(orch, next, &mut scratch, override_ffn)?;
+        }
+        self.wall_compute_secs = wall0.elapsed().as_secs_f64();
+        Ok(GenerateStats {
+            text: self.tokenizer.decode(&all_new),
+            prompt_tokens: prompt_len,
+            new_tokens: all_new.len(),
+            total_positions: self.position,
+        })
+    }
+
     /// Forward batcheado **agnóstico a arquitectura**: despacha Dense → [`Self::forward_batched`]
     /// y Hybrid → `hybrid_infer::forward_batched_hybrid` (estado KV + DeltaNet por
     /// candidato). `scratch` se requiere solo para el path Hybrid.
@@ -1651,7 +2392,7 @@ impl StreamingGenerator {
         pos: usize,
         kv: &mut [Vec<LayerKvCache>],
         n_candidates: usize,
-        mut get_override: impl FnMut(usize, usize) -> FfnOverride,
+        get_override: impl FnMut(usize, usize) -> FfnOverride,
         scratch: &mut hayai_opencl::StreamingScratch,
     ) -> Result<Vec<Vec<f32>>, StreamInferError> {
         match self.model_kind() {
@@ -1698,7 +2439,7 @@ impl StreamingGenerator {
         tokens: &[u32],
         kv: &mut [Vec<LayerKvCache>],
         n_candidates: usize,
-        mut get_override: impl FnMut(
+        get_override: impl FnMut(
             usize,
             usize,
             &Option<Arc<Vec<f32>>>,
@@ -2156,6 +2897,8 @@ fn begin_gemv_from_scratch(
     layer: usize,
     tensor_off: usize,
 ) -> Result<PendingGemv, StreamInferError> {
+    eng.ffn_calls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (kernel, label) = match m.ggml_type {
         GgmlType::Q4_0 => (&eng.gemv_q4_0, "q4_0"),
         GgmlType::Q4_1 => (&eng.gemv_q4_1, "q4_1"),
@@ -2184,8 +2927,8 @@ fn begin_gemv_from_scratch(
     };
     use hayai_opencl::WeightBind;
     let woff = scratch.weight_offset(layer, tensor_off);
-    match scratch.weight_bind(eng, layer)? {
-        WeightBind::Svm { ptr } => Ok(eng.ggml_gemv_async_from_svm(
+    match scratch.weight_bind(eng, layer) {
+        Ok(WeightBind::Svm { ptr }) => Ok(eng.ggml_gemv_async_from_svm(
             kernel,
             label,
             m.nrows,
@@ -2194,7 +2937,7 @@ fn begin_gemv_from_scratch(
             woff,
             xn,
         )?),
-        WeightBind::Device { buf } => Ok(eng.ggml_gemv_async_from_device(
+        Ok(WeightBind::Device { buf }) => Ok(eng.ggml_gemv_async_from_device(
             kernel,
             label,
             m.nrows,
@@ -2203,6 +2946,10 @@ fn begin_gemv_from_scratch(
             woff,
             xn,
         )?),
+        // No SVM ownership and no VRAM mirror (e.g. the mirror did not fit in
+        // `CL_DEVICE_MAX_MEM_ALLOC_SIZE`, or the pool had no mirror): upload the
+        // host bytes for this GEMV instead of failing. Correct, just slower.
+        Err(_) => begin_gemv(eng, m, xn),
     }
 }
 
@@ -2236,8 +2983,14 @@ pub(crate) fn ffn_begin_gate_up_scratch(
         return Ok(GateUpInflight::Done);
     }
 
-    let gate_eng = orch.pool.for_role(0);
-    let up_eng = orch.pool.for_role(1);
+    let gate_eng = orch
+        .pool
+        .for_role(0)
+        .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
+    let up_eng = orch
+        .pool
+        .for_role(1)
+        .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
     *used_dgpu = true;
     if orch.pool.len() >= 2 {
         *used_apu = true;
@@ -2291,7 +3044,10 @@ pub(crate) fn ffn_finish_scratch(
     }
 
     if !orch.pool.is_empty() {
-        let eng = orch.pool.for_role(2);
+        let eng = orch
+            .pool
+            .for_role(2)
+            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
         *used_dgpu = true;
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
             begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
@@ -2338,7 +3094,10 @@ pub(crate) fn ffn_finish_gelu_scratch(
     }
 
     if !orch.pool.is_empty() {
-        let eng = orch.pool.for_role(2);
+        let eng = orch
+            .pool
+            .for_role(2)
+            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
         *used_dgpu = true;
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
             begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
@@ -2362,6 +3121,10 @@ fn build_attn_config(
         .meta_u32(&format!("{}.attention.key_length", config.architecture))
         .or_else(|| cat.meta_u32("llama.attention.key_length"))
         .unwrap_or(0) as usize;
+    // Attention-less families (Mamba SSM) report head_count=0; clamp so the config
+    // is harmless (their forward never uses it) and never divides by zero.
+    let n_heads = config.num_attention_heads.max(1);
+    let n_kv = config.num_key_value_heads.max(1);
     let q_nrows = (0..config.num_layers).find_map(|i| {
         cat.tensor(&format!("blk.{i}.attn_q.weight"))
             .ok()
@@ -2370,14 +3133,14 @@ fn build_attn_config(
     let head_dim = if head_dim_meta > 0 {
         head_dim_meta
     } else if let Some(qn) = q_nrows {
-        (qn / config.num_attention_heads).max(1)
+        (qn / n_heads).max(1)
     } else {
-        config.hidden_size / config.num_attention_heads
+        (config.hidden_size / n_heads).max(1)
     };
     let mut cfg = AttentionConfig::from_model(
-        head_dim * config.num_attention_heads,
-        config.num_attention_heads,
-        config.num_key_value_heads,
+        head_dim * n_heads,
+        n_heads,
+        n_kv,
         config.rope_theta,
     );
     cfg.head_dim = head_dim;
@@ -2413,8 +3176,9 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
         .or_else(|| cat.meta_u32(&format!("{prefix}.block_count")))
         .or_else(|| cat.meta_u32("llama.block_count"))
         .or_else(|| cat.meta_u32("qwen2.block_count"))
-        .ok_or_else(|| GgufError::MissingKey("block_count".into()))? as usize;
-    // Physical `blk.N` count (HRM metadata may encode H×L×cycles ≫ resident blocks).
+        .unwrap_or(0) as usize;
+    // Physical `blk.N` count (HRM metadata may encode H×L×cycles ≫ resident blocks;
+    // also lets unknown architectures load without a `block_count` key).
     let layers_physical = cat
         .tensors
         .iter()
@@ -2427,10 +3191,15 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
         .max()
         .map(|m| m + 1)
         .unwrap_or(0);
-    let mut layers_n = if layers_physical > 0 && layers_physical < layers_meta {
-        tracing::info!(
-            "block_count meta={layers_meta} physical_blk={layers_physical} — using physical"
-        );
+    if layers_meta == 0 && layers_physical == 0 {
+        return Err(GgufError::MissingKey("block_count".into()));
+    }
+    let mut layers_n = if layers_physical > 0 && (layers_meta == 0 || layers_physical < layers_meta) {
+        if layers_meta != 0 && layers_physical < layers_meta {
+            tracing::info!(
+                "block_count meta={layers_meta} physical_blk={layers_physical} — using physical"
+            );
+        }
         layers_physical
     } else {
         layers_meta
@@ -2462,7 +3231,9 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
         .or_else(|| cat.meta_u32("llama.attention.head_count_kv"))
         .or_else(|| cat.meta_u32("qwen2.attention.head_count_kv"))
         .unwrap_or(n_heads as u32) as usize;
-    let hrm = if arch == "hrm_text" || arch.contains("hrm") {
+    // HRM detection is op/tensor-driven: the recurrence marker tensor is authoritative,
+    // the architecture name is only a fallback (another name with the same ops works).
+    let hrm = if arch == "hrm_text" || arch.contains("hrm") || cat.tensor("hrm.z_l_init").is_ok() {
         let layers_per_stack = cat
             .meta_u32(&format!("{prefix}.layers_per_stack"))
             .unwrap_or((layers_n / 2).max(1) as u32) as usize;
@@ -2476,6 +3247,14 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
             l_cycles,
             layers_per_stack,
             embedding_scale,
+            prefix_lm: cat
+                .metadata
+                .get(&format!("{prefix}.prefix_lm"))
+                .and_then(|v| match v {
+                    hayai_model::MetadataValue::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .unwrap_or(false),
         })
     } else {
         None
@@ -2597,6 +3376,327 @@ mod tests {
             ),
             ModelKind::Gemma
         );
+    }
+
+    #[test]
+    fn depthwise_causal_conv_silu_residual() {
+        // k=3, channels=2, weights w[c*k + t] (t=0 oldest).
+        let w = [1.0f32, 2.0, 3.0, 0.5, 1.0, 1.5];
+        let mut state = vec![0.0f32; 2 * 2]; // (k-1)*channels
+        // Token 0: x = [1, 1]; taps 0,1 read zero history.
+        let mut x = [1.0f32, 1.0];
+        super::apply_depthwise_conv(&mut x, &mut state, 3, &w, ConvActivation::Silu);
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        assert!((x[0] - (1.0 + silu(3.0))).abs() < 1e-5, "x0={}", x[0]);
+        assert!((x[1] - (1.0 + silu(1.5))).abs() < 1e-5, "x1={}", x[1]);
+        // History now holds the first input as the newest sample.
+        assert_eq!(&state[2..4], &[1.0, 1.0]);
+        // Token 1: x = [1, 1]; c0 = 1*0 + 2*1 + 3*1 = 5; c1 = 0.5*0 + 1*1 + 1.5*1 = 2.5.
+        let mut x = [1.0f32, 1.0];
+        super::apply_depthwise_conv(&mut x, &mut state, 3, &w, ConvActivation::Silu);
+        assert!((x[0] - (1.0 + silu(5.0))).abs() < 1e-5, "x0={}", x[0]);
+        assert!((x[1] - (1.0 + silu(2.5))).abs() < 1e-5, "x1={}", x[1]);
+    }
+
+    #[test]
+    fn depthwise_conv_kernel_one_is_pointwise() {
+        let w = [0.5f32, -1.0];
+        let mut state: Vec<f32> = Vec::new();
+        let mut x = [2.0f32, 4.0];
+        super::apply_depthwise_conv(&mut x, &mut state, 1, &w, ConvActivation::Silu);
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        assert!((x[0] - (2.0 + silu(1.0))).abs() < 1e-5);
+        assert!((x[1] - (4.0 + silu(-4.0))).abs() < 1e-5);
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn fused_qkv_detected_on_open_and_separate_not() {
+        // llama-shaped 1-block model with a fused attn_qkv (concat [q|k|v]).
+        let hidden = 8u64;
+        let n_heads = 2u64;
+        let n_kv = 1u64;
+        let q_dim = (n_heads * 4) as usize;
+        let kv_dim = (n_kv * 4) as usize;
+        let inter = 16u64;
+        let vocab = 16u64;
+        let z = |n: u64| vec![0.0f32; n as usize];
+
+        let path = temp_dir().join("hayai_fused_open.gguf");
+        let tokens: Vec<MetadataValue> = (0..vocab)
+            .map(|i| MetadataValue::String(format!("t{i}")))
+            .collect();
+        write_minimal_gguf(
+            &path,
+            &[
+                ("general.architecture", MetadataValue::String("llama".into())),
+                ("llama.block_count", MetadataValue::U32(1)),
+                ("llama.embedding_length", MetadataValue::U32(hidden as u32)),
+                ("llama.attention.head_count", MetadataValue::U32(n_heads as u32)),
+                ("llama.attention.head_count_kv", MetadataValue::U32(n_kv as u32)),
+                ("llama.attention.key_length", MetadataValue::U32(4)),
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+            ],
+            &[
+                ("token_embd.weight", vec![hidden, vocab], z(hidden * vocab)),
+                ("output_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.attn_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.ffn_norm.weight", vec![hidden], z(hidden)),
+                (
+                    "blk.0.attn_qkv.weight",
+                    vec![hidden, (q_dim + 2 * kv_dim) as u64],
+                    z(hidden * (q_dim + 2 * kv_dim) as u64),
+                ),
+                (
+                    "blk.0.attn_output.weight",
+                    vec![q_dim as u64, hidden],
+                    z(q_dim as u64 * hidden),
+                ),
+                ("blk.0.ffn_gate.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_up.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_down.weight", vec![inter, hidden], z(inter * hidden)),
+            ],
+        )
+        .unwrap();
+        let meta = {
+            let cat = GgufCatalog::open(&path).unwrap();
+            cat.metadata.clone()
+        };
+        let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
+        let gen = StreamingGenerator::open(
+            &path,
+            tok,
+            4,
+            128,
+            hayai_model::SamplerConfig::Greedy,
+            42,
+        )
+        .unwrap();
+        assert_eq!(gen.fused_qkv_dims(0), Some((q_dim, kv_dim)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn global_sparse_overrides_build_from_genome() {
+        let hidden = 8u64;
+        let n_heads = 2u64;
+        let n_kv = 1u64;
+        let inter = 16u64;
+        let vocab = 16u64;
+        let z = |n: u64| vec![0.0f32; n as usize];
+        let genome: Vec<MetadataValue> =
+            (0..hayai_model::cppn::genome_len()).map(|_| MetadataValue::F32(0.0)).collect();
+        let tokens: Vec<MetadataValue> = (0..vocab)
+            .map(|i| MetadataValue::String(format!("t{i}")))
+            .collect();
+        let path = temp_dir().join("hayai_sparse_global.gguf");
+        let q_dim = n_heads * 4;
+        let kv_dim = n_kv * 4;
+        write_minimal_gguf(
+            &path,
+            &[
+                ("general.architecture", MetadataValue::String("llama".into())),
+                ("llama.block_count", MetadataValue::U32(1)),
+                ("llama.embedding_length", MetadataValue::U32(hidden as u32)),
+                ("llama.attention.head_count", MetadataValue::U32(n_heads as u32)),
+                ("llama.attention.head_count_kv", MetadataValue::U32(n_kv as u32)),
+                ("llama.attention.key_length", MetadataValue::U32(4)),
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+                ("saor.sparse", MetadataValue::Bool(true)),
+                ("saor.tau", MetadataValue::F32(-1.0)),
+                ("saor.genome", MetadataValue::Array(genome)),
+            ],
+            &[
+                ("token_embd.weight", vec![hidden, vocab], z(hidden * vocab)),
+                ("output_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.attn_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.ffn_norm.weight", vec![hidden], z(hidden)),
+                (
+                    "blk.0.attn_qkv.weight",
+                    vec![hidden, q_dim + 2 * kv_dim],
+                    z(hidden * (q_dim + 2 * kv_dim)),
+                ),
+                ("blk.0.attn_output.weight", vec![q_dim, hidden], z(q_dim * hidden)),
+                ("blk.0.ffn_gate.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_up.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_down.weight", vec![inter, hidden], z(inter * hidden)),
+            ],
+        )
+        .unwrap();
+        let meta = {
+            let cat = GgufCatalog::open(&path).unwrap();
+            cat.metadata.clone()
+        };
+        let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
+        let mut gen = StreamingGenerator::open(
+            &path,
+            tok,
+            4,
+            128,
+            hayai_model::SamplerConfig::Greedy,
+            42,
+        )
+        .unwrap();
+        assert_eq!(gen.model_kind(), ModelKind::Dense);
+        let ov = gen.build_global_sparse_overrides().unwrap().expect("sparse");
+        assert_eq!(ov.len(), 1);
+        let gate = ov[0].gate.as_ref().expect("gate csr");
+        assert_eq!((gate.d_in, gate.d_out), (hidden as usize, inter as usize));
+        assert_eq!(gate.vals.len(), (hidden * inter) as usize); // tau=-1 → all active
+        let down = ov[0].down.as_ref().expect("down csr");
+        assert_eq!((down.d_in, down.d_out), (inter as usize, hidden as usize));
+        assert_eq!(down.vals.len(), (inter * hidden) as usize);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn depthwise_conv_is_causal_and_channel_generic() {
+        // k=2, ch=3 (deliberately != hidden); per-channel taps [t_old, t_cur].
+        let w = [0.5f32, 1.0, -1.0, 2.0, 0.25, 0.0];
+        let mut state = vec![0.0f32; 3]; // (k-1) * ch
+        let mut x = vec![1.0f32, 1.0, 1.0];
+        apply_depthwise_conv(&mut x, &mut state, 2, &w, ConvActivation::Silu);
+        // First step: only the current tap contributes.
+        let silu = |a: f32| a / (1.0 + (-a).exp());
+        assert!((x[0] - (1.0 + silu(1.0))).abs() < 1e-4);
+        assert!((x[1] - (1.0 + silu(2.0))).abs() < 1e-4);
+        assert!((x[2] - (1.0 + silu(0.0))).abs() < 1e-4);
+        // History now holds the pre-activation inputs.
+        assert_eq!(state, vec![1.0, 1.0, 1.0]);
+        let mut x2 = vec![0.0f32, 0.0, 0.0];
+        apply_depthwise_conv(&mut x2, &mut state, 2, &w, ConvActivation::Silu);
+        // Second step: the current tap is 0, so only history survives (causal, t=0 oldest).
+        assert!((x2[0] - silu(0.5)).abs() < 1e-4);
+        assert!((x2[1] - silu(-1.0)).abs() < 1e-4);
+        assert!((x2[2] - silu(0.25)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn conv_activation_none_is_identity() {
+        let w = [0.0f32, 2.0]; // k=2, ch=1
+        let mut state = vec![0.0f32; 1];
+        let mut x = vec![3.0f32];
+        apply_depthwise_conv(&mut x, &mut state, 2, &w, ConvActivation::None);
+        assert!((x[0] - 9.0).abs() < 1e-6);
+        assert!(ConvActivation::parse("gelu") == ConvActivation::Gelu);
+        assert!(ConvActivation::parse("nonsense") == ConvActivation::Silu);
+    }
+
+    /// Framework invariant: execution is driven by **ops/tensors**, never by the
+    /// `general.architecture` string. An unknown family name with llama-shaped
+    /// tensors must load and run as `Dense`.
+    #[test]
+    fn unknown_architecture_loads_from_ops_not_name() {
+        let path = temp_dir().join("hayai_unknown_arch.gguf");
+        let hidden = 16u64;
+        let vocab = 16u64;
+        let inter = 32u64;
+        let q_dim = 16u64; // 2 heads * head_dim 8
+        let kv_dim = 16u64;
+        let z = |n: u64| vec![0.0f32; n as usize];
+        let tokens: Vec<MetadataValue> = (0..vocab)
+            .map(|i| MetadataValue::String(format!("t{i}")))
+            .collect();
+        write_minimal_gguf(
+            &path,
+            &[
+                (
+                    "general.architecture",
+                    MetadataValue::String("future_family".into()),
+                ),
+                ("future_family.block_count", MetadataValue::U32(1)),
+                (
+                    "future_family.embedding_length",
+                    MetadataValue::U32(hidden as u32),
+                ),
+                ("future_family.attention.head_count", MetadataValue::U32(2)),
+                (
+                    "future_family.attention.head_count_kv",
+                    MetadataValue::U32(2),
+                ),
+                ("future_family.attention.key_length", MetadataValue::U32(8)),
+                (
+                    "future_family.feed_forward_length",
+                    MetadataValue::U32(inter as u32),
+                ),
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+            ],
+            &[
+                ("token_embd.weight", vec![hidden, vocab], z(hidden * vocab)),
+                ("output_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.attn_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.ffn_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.attn_q.weight", vec![hidden, q_dim], z(hidden * q_dim)),
+                ("blk.0.attn_k.weight", vec![hidden, kv_dim], z(hidden * kv_dim)),
+                ("blk.0.attn_v.weight", vec![hidden, kv_dim], z(hidden * kv_dim)),
+                ("blk.0.attn_output.weight", vec![q_dim, hidden], z(q_dim * hidden)),
+                ("blk.0.ffn_gate.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_up.weight", vec![hidden, inter], z(hidden * inter)),
+                ("blk.0.ffn_down.weight", vec![inter, hidden], z(inter * hidden)),
+            ],
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        assert_eq!(ModelKind::from_catalog(&cat), ModelKind::Dense);
+        let cfg = load_config(&cat).unwrap();
+        assert_eq!(cfg.hidden_size, hidden as usize);
+        assert_eq!(cfg.num_layers, 1);
+        assert_eq!(cfg.num_attention_heads, 2);
+        let meta = cat.metadata.clone();
+        let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
+        let gen =
+            StreamingGenerator::open(&path, tok, 4, 128, hayai_model::SamplerConfig::Greedy, 42)
+                .unwrap();
+        assert_eq!(gen.model_kind(), ModelKind::Dense);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mamba ops under an unknown family name must still route to the Mamba path.
+    #[test]
+    fn mamba_detected_from_ops_not_name() {
+        let path = temp_dir().join("hayai_unknown_mamba.gguf");
+        let hidden = 8u64;
+        let vocab = 8u64;
+        let z = |n: u64| vec![0.0f32; n as usize];
+        let tokens: Vec<MetadataValue> = (0..vocab)
+            .map(|i| MetadataValue::String(format!("t{i}")))
+            .collect();
+        write_minimal_gguf(
+            &path,
+            &[
+                (
+                    "general.architecture",
+                    MetadataValue::String("future_ssm".into()),
+                ),
+                ("future_ssm.block_count", MetadataValue::U32(1)),
+                ("future_ssm.embedding_length", MetadataValue::U32(hidden as u32)),
+                ("tokenizer.ggml.tokens", MetadataValue::Array(tokens)),
+                ("tokenizer.ggml.merges", MetadataValue::Array(vec![])),
+                ("tokenizer.ggml.bos_token_id", MetadataValue::U32(1)),
+                ("tokenizer.ggml.eos_token_id", MetadataValue::U32(2)),
+            ],
+            &[
+                ("token_embd.weight", vec![hidden, vocab], z(hidden * vocab)),
+                ("blk.0.attn_norm.weight", vec![hidden], z(hidden)),
+                ("blk.0.ssm_in.weight", vec![hidden, 2 * hidden], z(hidden * 2 * hidden)),
+                ("blk.0.ssm_x.weight", vec![hidden, 4], z(hidden * 4)),
+                ("blk.0.ssm_d", vec![hidden], z(hidden)),
+                ("blk.0.ssm_out.weight", vec![hidden, hidden], z(hidden * hidden)),
+            ],
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        assert_eq!(ModelKind::from_catalog(&cat), ModelKind::Mamba);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

@@ -36,6 +36,8 @@ serde_json = "1"
 futures = "0.3"
 tokio-stream = "0.1"
 minijinja = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "flac", "ogg", "vorbis", "wav", "pcm", "isomp4", "alac"] }
 
 # Workspace crates
 hayai-core = { path = "crates/hayai-core" }

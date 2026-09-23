@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn f16_roundtrip() {
-        for v in [0.0f32, 1.0, -1.0, 0.5, 123.45, 0.0001, -9876.5, 3.14159] {
+        for v in [0.0f32, 1.0, -1.0, 0.5, 123.45, 0.0001, -9876.5, 1.2345] {
             let h = f32_to_f16(v);
             let back = crate::gguf::f16_to_f32(h);
             assert!(

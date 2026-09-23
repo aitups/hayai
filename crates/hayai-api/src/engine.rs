@@ -1,6 +1,6 @@
 //! Generation execution on top of [`hayai_core::GenerationSession`].
 
-use crate::models::{ApiError, ChatMessage, sampler_from};
+use crate::models::{ApiError, ChatMessage, SamplingParams};
 use crate::registry::ModelHandle;
 use hayai_core::GenerationSession;
 use std::sync::Arc;
@@ -14,23 +14,25 @@ pub fn generate_text(
     handle: Arc<ModelHandle>,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    seed: u64,
+    params: SamplingParams,
     stop: &[String],
     mut on_delta: impl FnMut(&str) -> Result<(), ApiError>,
 ) -> Result<(String, String, usize, usize), ApiError> {
-    let sampler = sampler_from(temperature, top_p);
+    let sampler = params.sampler();
     let mut session = GenerationSession::start(
         &handle.path,
         handle.sinks,
         handle.window,
         handle.memory_strategy,
         sampler,
-        seed,
+        params.seed,
         handle.orch.clone(),
     )
     .map_err(|e| ApiError::internal(e.to_string()))?;
+    session.set_penalties(params.penalties);
+    if let Some(grammar) = params.grammar {
+        session.set_grammar(grammar);
+    }
 
     let prompt_tokens = session
         .prefill(prompt)
@@ -48,28 +50,44 @@ pub fn generate_text(
             }
             Err(e) => return Err(ApiError::internal(e.to_string())),
         }
-        let full = session.generated_text();
+        // Byte-exact decode: emit only the complete UTF-8 prefix so a multi-byte
+        // character split across tokens is held back instead of being rendered as
+        // U+FFFD and later contradicted.
+        let raw = handle.tokenizer.decode_bytes(session.generated_ids());
+        let valid = match std::str::from_utf8(&raw) {
+            Ok(s) => s,
+            Err(e) => std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or(""),
+        };
+        debug_assert!(
+            valid.starts_with(decoded.as_str()),
+            "decoded text must be a prefix of the next valid decode"
+        );
+        if valid.len() < decoded.len() {
+            // Defensive: never slice below the already-emitted prefix.
+            decoded.truncate(valid.len());
+        }
         // Stop-sequence check before emitting the delta (avoids emitting the stop).
         if let Some((_stop_str, stop_at)) = stop
             .iter()
             .filter(|s| !s.is_empty())
-            .filter_map(|s| full.find(s.as_str()).map(|i| (s.clone(), i)))
+            .filter_map(|s| valid.find(s.as_str()).map(|i| (s.clone(), i)))
             .min_by_key(|(_, i)| *i)
         {
-            let before_stop = &full[..stop_at];
-            let delta = before_stop[decoded.len()..].to_string();
-            if !delta.is_empty() {
-                on_delta(&delta)?;
+            // `stop_at` may precede `decoded` when the match spans already-emitted
+            // text; only emit the part that is both after `decoded` and before the
+            // stop (this previously panicked on `before_stop[decoded.len()..]`).
+            if stop_at > decoded.len() {
+                on_delta(&valid[decoded.len()..stop_at])?;
+                decoded.push_str(&valid[decoded.len()..stop_at]);
             }
-            decoded = before_stop.to_string();
             finish = "stop";
             session.mark_finished();
             break;
         }
-        let delta = full[decoded.len()..].to_string();
-        decoded = full;
-        if !delta.is_empty() {
-            on_delta(&delta)?;
+        if valid.len() > decoded.len() {
+            let delta = &valid[decoded.len()..];
+            on_delta(delta)?;
+            decoded.push_str(delta);
         }
     }
 
@@ -78,18 +96,26 @@ pub fn generate_text(
 }
 
 /// Render chat messages into a prompt using the model's chat template.
-pub fn chat_prompt(handle: &ModelHandle, messages: &[ChatMessage]) -> String {
-    let msgs: Vec<(String, String)> = messages
+pub fn chat_prompt(handle: &ModelHandle, messages: &[ChatMessage], tools: &serde_json::Value) -> String {
+    let msgs: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
+        .map(|m| {
+            let mut o = serde_json::Map::new();
+            o.insert("role".into(), serde_json::json!(m.role));
+            o.insert("content".into(), serde_json::json!(m.content));
+            if let Some(tc) = &m.tool_calls {
+                o.insert("tool_calls".into(), tc.clone());
+            }
+            if let Some(id) = &m.tool_call_id {
+                o.insert("tool_call_id".into(), serde_json::json!(id));
+            }
+            if let Some(n) = &m.name {
+                o.insert("name".into(), serde_json::json!(n));
+            }
+            serde_json::Value::Object(o)
+        })
         .collect();
     handle
         .chat_template
-        .render(&msgs, true, &handle.tokenizer)
-}
-
-/// Parse chat messages for the legacy completions endpoint (single prompt).
-pub fn legacy_prompt(handle: &ModelHandle, prompt: &str) -> String {
-    let _ = handle;
-    prompt.to_string()
+        .render(&msgs, true, &handle.tokenizer, tools)
 }

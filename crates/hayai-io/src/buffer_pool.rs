@@ -14,9 +14,18 @@ impl AlignedBuffer {
     pub const ALIGN: usize = 4096;
 
     /// Allocate a zeroed, page-aligned buffer of `len` bytes.
+    ///
+    /// Aborts with a clear message if `len` is larger than any allocatable
+    /// object. It must **not** fall back to a smaller allocation: the stored
+    /// `len` is used for both slicing and deallocation, so a mismatched layout
+    /// would be out-of-bounds UB.
     pub fn zeroed(len: usize) -> Self {
-        let layout = std::alloc::Layout::from_size_align(len.max(1), Self::ALIGN)
-            .unwrap_or_else(|_| std::alloc::Layout::from_size_align(1, Self::ALIGN).unwrap());
+        let layout = match std::alloc::Layout::from_size_align(len.max(1), Self::ALIGN) {
+            Ok(layout) => layout,
+            Err(_) => panic!(
+                "AlignedBuffer: requested size {len} exceeds the maximum allocatable object"
+            ),
+        };
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);

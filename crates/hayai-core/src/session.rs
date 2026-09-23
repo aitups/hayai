@@ -8,7 +8,7 @@
 use crate::adaptive_window::MemoryStrategy;
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{StreamInferError, StreamingGenerator};
-use hayai_model::{GgufCatalog, SamplerConfig, Tokenizer};
+use hayai_model::{Grammar, GrammarState, GgufCatalog, Penalties, SamplerConfig, Tokenizer};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +21,9 @@ pub struct GenerationSession {
     prompt_tokens: usize,
     generated_ids: Vec<u32>,
     finished: bool,
-    eos: u32,
+    grammar: Option<Grammar>,
+    grammar_state: Option<GrammarState>,
+    grammar_token_texts: Vec<Option<String>>,
 }
 
 impl GenerationSession {
@@ -47,7 +49,6 @@ impl GenerationSession {
         let mut guard = orch.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = gen.prepare_session(&mut guard)?;
         drop(guard);
-        let eos = gen.tokenizer.eos_id;
         Ok(Self {
             gen,
             orch,
@@ -56,12 +57,65 @@ impl GenerationSession {
             prompt_tokens: 0,
             generated_ids: Vec::new(),
             finished: false,
-            eos,
+            grammar: None,
+            grammar_state: None,
+            grammar_token_texts: Vec::new(),
         })
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.gen.tokenizer
+    }
+
+    /// Set repetition/presence/frequency/logit-bias penalties for this session.
+    pub fn set_penalties(&mut self, penalties: Penalties) {
+        self.gen.penalties = penalties;
+    }
+
+    /// Enable grammar-constrained decoding for this session (GBNF).
+    pub fn set_grammar(&mut self, grammar: Grammar) {
+        self.grammar_token_texts = self.gen.tokenizer.token_texts();
+        self.grammar_state = Some(grammar.initial_state());
+        self.grammar = Some(grammar);
+    }
+
+    /// Mask the logits of tokens that would leave the grammar, and allow EOS only
+    /// when the grammar may stop here.
+    fn mask_logits_with_grammar(&self, logits: &mut [f32]) {
+        let (Some(grammar), Some(state)) = (&self.grammar, &self.grammar_state) else {
+            return;
+        };
+        for (id, text) in self.grammar_token_texts.iter().enumerate() {
+            if id >= logits.len() {
+                break;
+            }
+            if self.gen.tokenizer.is_stop(id as u32) {
+                if !grammar.is_accepting(state) {
+                    logits[id] = f32::NEG_INFINITY;
+                }
+                continue;
+            }
+            match text {
+                Some(t) if !t.is_empty() => {
+                    if grammar.advance_str(state, t).is_none() {
+                        logits[id] = f32::NEG_INFINITY;
+                    }
+                }
+                _ => logits[id] = f32::NEG_INFINITY,
+            }
+        }
+    }
+
+    fn advance_grammar(&mut self, token: u32) {
+        let (Some(grammar), Some(state)) = (&self.grammar, self.grammar_state.take()) else {
+            return;
+        };
+        let next = self
+            .grammar_token_texts
+            .get(token as usize)
+            .and_then(|t| t.as_deref())
+            .and_then(|t| grammar.advance_str(&state, t));
+        self.grammar_state = Some(next.unwrap_or(state));
     }
 
     pub fn model_name(&self) -> &str {
@@ -80,6 +134,9 @@ impl GenerationSession {
         let mut guard = self.orch.lock().unwrap_or_else(|e| e.into_inner());
         self.last_logits = self.gen.prefill(&mut guard, &ids, &mut self.scratch)?;
         self.prompt_tokens = ids.len();
+        if let Some(g) = &self.grammar {
+            self.grammar_state = Some(g.initial_state());
+        }
         Ok(ids.len())
     }
 
@@ -90,9 +147,21 @@ impl GenerationSession {
         if self.finished {
             return Ok(None);
         }
+        if self.grammar.is_some() {
+            let mut logits = std::mem::take(&mut self.last_logits);
+            self.mask_logits_with_grammar(&mut logits);
+            self.last_logits = logits;
+        }
         let sampler = self.gen.sampler;
-        let next = hayai_model::sample(&self.last_logits, sampler, &mut self.gen.rng);
-        if next == self.eos {
+        let next = hayai_model::sample_with(
+            &self.last_logits,
+            sampler,
+            &mut self.gen.rng,
+            &self.gen.penalties,
+            &self.generated_ids,
+        );
+        self.advance_grammar(next);
+        if self.gen.tokenizer.is_stop(next) {
             self.finished = true;
             return Ok(None);
         }

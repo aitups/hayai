@@ -77,61 +77,6 @@ impl GgmlType {
         }
     }
 
-    pub fn block_size(self) -> Option<usize> {
-        match self {
-            Self::Q4_0 => Some(18),
-            Self::Q4_1 => Some(20),
-            Self::Q8_0 => Some(34),
-            Self::Q2_K => Some(84),
-            Self::Q3_K => Some(110),
-            Self::Q4_K => Some(144),
-            Self::Q5_0 => Some(22),
-            Self::Q5_1 => Some(24),
-            Self::Q5_K => Some(176),
-            Self::Q6_K => Some(210),
-            Self::Q8_K => Some(256), // d(4)+qs(256) approx — refine with GEMV
-            Self::IQ4_NL => Some(18), // d(2)+qs(16) for QK4_NL=32
-            Self::IQ2_XXS => Some(66), // d(2)+qs(64)
-            Self::IQ2_XS => Some(74), // d(2)+qs(64)+scales(8)
-            Self::IQ2_S => Some(82), // d(2)+qs(64)+qh(8)+scales(8)
-            Self::IQ3_XXS => Some(98), // d(2)+qs(96)
-            Self::IQ3_S => Some(110),
-            Self::IQ1_S => Some(50),
-            Self::IQ1_M => Some(56),
-            Self::IQ4_XS => Some(136), // d(2)+scales_h(2)+scales_l(4)+qs(128)
-            Self::TQ1_0 => Some(54),
-            Self::TQ2_0 => Some(66),
-            _ => None,
-        }
-    }
-
-    pub fn type_size_elements(self) -> Option<usize> {
-        match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::IQ4_NL => Some(32),
-            Self::Q8_0 => Some(32),
-            Self::Q2_K
-            | Self::Q3_K
-            | Self::Q4_K
-            | Self::Q5_K
-            | Self::Q6_K
-            | Self::Q8_K
-            | Self::IQ2_XXS
-            | Self::IQ2_XS
-            | Self::IQ2_S
-            | Self::IQ3_XXS
-            | Self::IQ3_S
-            | Self::IQ1_S
-            | Self::IQ1_M
-            | Self::IQ4_XS
-            | Self::TQ1_0
-            | Self::TQ2_0 => Some(256),
-            Self::F32 | Self::I32 => Some(1),
-            Self::F16 | Self::BF16 | Self::I16 => Some(1),
-            Self::F64 | Self::I64 => Some(1),
-            Self::I8 => Some(1),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -155,8 +100,9 @@ impl MetadataValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U32(v) => Some(*v),
-            Self::U64(v) => Some(*v as u32),
-            Self::I32(v) if *v >= 0 => Some(*v as u32),
+            Self::U64(v) => u32::try_from(*v).ok(),
+            Self::I32(v) => u32::try_from(*v).ok(),
+            Self::I64(v) => u32::try_from(*v).ok(),
             Self::U16(v) => Some(*v as u32),
             Self::U8(v) => Some(*v as u32),
             _ => None,
@@ -247,6 +193,11 @@ pub struct TensorInfo {
 impl TensorInfo {
     pub fn n_elements(&self) -> u64 {
         self.dims.iter().product()
+    }
+
+    /// Checked element count: `None` if the dimension product overflows `u64`.
+    pub fn n_elements_checked(&self) -> Option<u64> {
+        self.dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d))
     }
 
     pub fn nrows(&self) -> usize {

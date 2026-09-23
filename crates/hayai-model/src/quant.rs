@@ -1,4 +1,7 @@
-//! Packed GGUF tensors as mmap views (zero-copy) + GGML-compatible GEMV.
+//! Packed GGUF tensors + GGML-compatible GEMV.
+//!
+//! Production streaming uses `QuantStorage::External` views over scratch slots;
+//! `QuantStorage::Mapped` is the **dev/test** full-file mmap path only.
 
 use crate::gguf::f16_to_f32;
 use crate::gguf::GgufFile;
@@ -202,6 +205,50 @@ impl QuantMatrix {
                     out[i] = f16_to_f32(h);
                 }
             }
+            GgmlType::BF16 => {
+                let start = row * self.ncols * 2;
+                for i in 0..self.ncols {
+                    let o = start + i * 2;
+                    let bits = (u16::from_le_bytes(data[o..o + 2].try_into().unwrap()) as u32) << 16;
+                    out[i] = f32::from_bits(bits);
+                }
+            }
+            GgmlType::F64 => {
+                let start = row * self.ncols * 8;
+                for i in 0..self.ncols {
+                    let o = start + i * 8;
+                    out[i] = f64::from_le_bytes(data[o..o + 8].try_into().unwrap()) as f32;
+                }
+            }
+            GgmlType::I8 => {
+                let start = row * self.ncols;
+                for i in 0..self.ncols {
+                    out[i] = data[start + i] as i8 as f32;
+                }
+            }
+            GgmlType::I16 => {
+                let start = row * self.ncols * 2;
+                for i in 0..self.ncols {
+                    let o = start + i * 2;
+                    out[i] = i16::from_le_bytes(data[o..o + 2].try_into().unwrap()) as f32;
+                }
+            }
+            GgmlType::I32 => {
+                let start = row * self.ncols * 4;
+                for i in 0..self.ncols {
+                    let o = start + i * 4;
+                    out[i] = i32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as f32;
+                }
+            }
+            GgmlType::I64 => {
+                let start = row * self.ncols * 8;
+                for i in 0..self.ncols {
+                    let o = start + i * 8;
+                    out[i] = i64::from_le_bytes(data[o..o + 8].try_into().unwrap()) as f32;
+                }
+            }
+            GgmlType::Q8_1 => extract_q8_1_row(data, self.ncols, row, out)?,
+            GgmlType::Q8_K => extract_q8_k_row(data, self.ncols, row, out)?,
             GgmlType::Q4_0 => extract_q4_0_row(data, self.ncols, row, out)?,
             GgmlType::Q4_1 => extract_q4_1_row(data, self.ncols, row, out)?,
             GgmlType::Q8_0 => extract_q8_0_row(data, self.ncols, row, out)?,
@@ -245,6 +292,31 @@ impl QuantMatrix {
                 gemv_bf16(self.ncols, data, input, output);
                 Ok(())
             }
+            GgmlType::F64 => {
+                gemv_f64(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::I8 => {
+                gemv_i8(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::I16 => {
+                gemv_i16(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::I32 => {
+                gemv_i32(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::I64 => {
+                gemv_i64(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::Q8_1 => {
+                gemv_q8_1(self.ncols, data, input, output);
+                Ok(())
+            }
+            GgmlType::Q8_K => gemv_q8_k(self.nrows, self.ncols, data, input, output),
             GgmlType::Q4_0 => {
                 gemv_q4_0(self.ncols, data, input, output);
                 Ok(())
@@ -281,32 +353,6 @@ impl QuantMatrix {
         }
     }
 
-    /// True if OpenCL has a native GGML GEMV for this type (FFN path).
-    /// CPU fallback for FFN is only allowed when **no** GPU is in the pool.
-    pub fn opencl_gemv_supported(&self) -> bool {
-        matches!(
-            self.ggml_type,
-            GgmlType::Q4_0
-                | GgmlType::Q4_1
-                | GgmlType::Q5_0
-                | GgmlType::Q5_1
-                | GgmlType::Q2_K
-                | GgmlType::Q3_K
-                | GgmlType::Q4_K
-                | GgmlType::Q5_K
-                | GgmlType::Q6_K
-                | GgmlType::IQ4_NL
-                | GgmlType::IQ4_XS
-                | GgmlType::IQ3_XXS
-                | GgmlType::IQ3_S
-                | GgmlType::IQ2_XXS
-                | GgmlType::IQ2_XS
-                | GgmlType::IQ2_S
-                | GgmlType::Q8_0
-                | GgmlType::F16
-                | GgmlType::F32
-        )
-    }
 }
 
 fn gemv_f32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
@@ -347,6 +393,145 @@ fn gemv_bf16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
         }
         *out = sum;
     });
+}
+
+fn gemv_f64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let base = row * ncols * 8;
+        let mut sum = 0.0f32;
+        for col in 0..ncols {
+            let o = base + col * 8;
+            let w = f64::from_le_bytes(data[o..o + 8].try_into().unwrap()) as f32;
+            sum += w * input[col];
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_i8(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let base = row * ncols;
+        let mut sum = 0.0f32;
+        for col in 0..ncols {
+            sum += (data[base + col] as i8) as f32 * input[col];
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_i16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let base = row * ncols * 2;
+        let mut sum = 0.0f32;
+        for col in 0..ncols {
+            let o = base + col * 2;
+            sum += i16::from_le_bytes(data[o..o + 2].try_into().unwrap()) as f32 * input[col];
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_i32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let base = row * ncols * 4;
+        let mut sum = 0.0f32;
+        for col in 0..ncols {
+            let o = base + col * 4;
+            sum += i32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as f32 * input[col];
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_i64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let base = row * ncols * 8;
+        let mut sum = 0.0f32;
+        for col in 0..ncols {
+            let o = base + col * 8;
+            sum += i64::from_le_bytes(data[o..o + 8].try_into().unwrap()) as f32 * input[col];
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_q8_1(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    assert_eq!(ncols % 32, 0);
+    let blocks_per_row = ncols / 32;
+    let row_bytes = blocks_per_row * 36;
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let row_base = row * row_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let base = row_base + b * 36;
+            let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+            let x_base = b * 32;
+            for j in 0..32 {
+                sum += (data[base + 4 + j] as i8) as f32 * d * input[x_base + j];
+            }
+        }
+        *out = sum;
+    });
+}
+
+fn gemv_q8_k(nrows: usize, ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) -> Result<(), GgufError> {
+    if ncols % 256 != 0 {
+        return Err(GgufError::Msg(format!("q8_k GEMV requires ncols%256==0, got {ncols}")));
+    }
+    let blocks_per_row = ncols / 256;
+    let row_bytes = blocks_per_row * 292;
+    let need = nrows * row_bytes;
+    if data.len() < need {
+        return Err(GgufError::Truncated("q8_k weights"));
+    }
+    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+        let row_base = row * row_bytes;
+        let mut sum = 0.0f32;
+        for b in 0..blocks_per_row {
+            let base = row_base + b * 292;
+            let d = f32::from_le_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]]);
+            let x_base = b * 256;
+            for j in 0..256 {
+                sum += (data[base + 4 + j] as i8) as f32 * d * input[x_base + j];
+            }
+        }
+        *out = sum;
+    });
+    Ok(())
+}
+
+fn extract_q8_1_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
+    let blocks = ncols / 32;
+    let row_bytes_n = blocks * 36;
+    let base = row * row_bytes_n;
+    if data.len() < base + row_bytes_n {
+        return Err(GgufError::Truncated("q8_1 row"));
+    }
+    for b in 0..blocks {
+        let bb = base + b * 36;
+        let d = f16_to_f32(u16::from_le_bytes([data[bb], data[bb + 1]]));
+        for j in 0..32 {
+            out[b * 32 + j] = (data[bb + 4 + j] as i8) as f32 * d;
+        }
+    }
+    Ok(())
+}
+
+fn extract_q8_k_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
+    let blocks = ncols / 256;
+    let row_bytes_n = blocks * 292;
+    let base = row * row_bytes_n;
+    if data.len() < base + row_bytes_n {
+        return Err(GgufError::Truncated("q8_k row"));
+    }
+    for b in 0..blocks {
+        let bb = base + b * 292;
+        let d = f32::from_le_bytes([data[bb], data[bb + 1], data[bb + 2], data[bb + 3]]);
+        for j in 0..256 {
+            out[b * 256 + j] = (data[bb + 4 + j] as i8) as f32 * d;
+        }
+    }
+    Ok(())
 }
 
 /// Q4_0 GEMV with `f32x8` MAC on each half-block (Attn hot path, PRD §2 SIMD).
@@ -513,5 +698,79 @@ mod tests {
             }
             assert!((y_q[row] - s).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn bf16_f64_i16_gemv_match_dense() {
+        // BF16 2×4.
+        let w = [1.0f32, -2.0, 0.5, 3.0, 0.0, 1.0, -1.0, 2.0];
+        let mut bf = Vec::new();
+        for v in w {
+            bf.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let qm = QuantMatrix::owned("bf", 4, 2, GgmlType::BF16, bf);
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let mut y = vec![0.0; 2];
+        qm.gemv(&x, &mut y).unwrap();
+        assert!((y[0] - 10.5).abs() < 1e-3);
+        assert!((y[1] - 7.0).abs() < 1e-3);
+
+        // F64 dequant + GEMV.
+        let vals = [1.0f64, 2.0, -3.0, 4.0];
+        let mut b = Vec::new();
+        for v in vals {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let qm = QuantMatrix::owned("f", 4, 1, GgmlType::F64, b);
+        let ones = [1.0f32, 1.0, 1.0, 1.0];
+        let mut y = vec![0.0; 1];
+        qm.gemv(&ones, &mut y).unwrap();
+        assert!((y[0] - 4.0).abs() < 1e-6);
+
+        // I16 dequant + GEMV.
+        let iv: [i16; 4] = [1, -2, 3, -4];
+        let mut b = Vec::new();
+        for v in iv {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let qm = QuantMatrix::owned("i", 4, 1, GgmlType::I16, b);
+        let mut y = vec![0.0; 1];
+        qm.gemv(&ones, &mut y).unwrap();
+        assert_eq!(y[0], -2.0);
+    }
+
+    #[test]
+    fn q8_1_and_q8_k_gemv() {
+        // Q8_1: 1×32, d = 1.0, all qs = 1.
+        let mut b = vec![0x00u8, 0x3Cu8]; // f16 1.0 = 0x3C00
+        b.extend_from_slice(&[0u8, 0u8]); // s
+        b.extend_from_slice(&[1u8; 32]);
+        let qm = QuantMatrix::owned("q8_1", 32, 1, GgmlType::Q8_1, b);
+        let ones = vec![1.0f32; 32];
+        let mut y = vec![0.0; 1];
+        qm.gemv(&ones, &mut y).unwrap();
+        assert!((y[0] - 32.0).abs() < 1e-3);
+
+        // Q8_K: 1×256, d = 1.0, all qs = 1.
+        let mut b = Vec::new();
+        b.extend_from_slice(&1.0f32.to_le_bytes());
+        b.extend_from_slice(&[1u8; 256]);
+        b.extend_from_slice(&[0u8; 32]);
+        let qm = QuantMatrix::owned("q8_k", 256, 1, GgmlType::Q8_K, b.clone());
+        let ones = vec![1.0f32; 256];
+        let mut y = vec![0.0; 1];
+        qm.gemv(&ones, &mut y).unwrap();
+        assert!((y[0] - 256.0).abs() < 1e-3);
+        // dequantize agrees.
+        let info = crate::gguf_types::TensorInfo {
+            name: "q8_k".into(),
+            dims: vec![256, 1],
+            ggml_type: GgmlType::Q8_K,
+            type_id: 15,
+            offset: 0,
+        };
+        let d = dequantize(&info, &b).unwrap();
+        assert_eq!(d.len(), 256);
+        assert!((d[0] - 1.0).abs() < 1e-6);
     }
 }

@@ -1,4 +1,7 @@
-//! End-to-end decode using GGUF mmap weights: Attn on CPU, FFN on OpenCL when available.
+//! Dev decode path using full-file **mmap** weights (`Generator`/`LlamaWeights`).
+//!
+//! Production inference uses [`crate::stream_infer::StreamingGenerator`] with
+//! deterministic disk streaming and no weight mmap.
 
 use hayai_cpu::{attention_decode_step, rms_norm, AttentionConfig, LayerKvCache};
 use hayai_model::{sample, spmm_csr_cpu, CsrSparse, GgufError, LlamaWeights, SamplerConfig, Tokenizer};
@@ -436,11 +439,11 @@ impl Generator {
         for _ in 0..max_new_tokens {
             let logits = self.forward(orch, last)?;
             let next = sample(&logits, self.sampler, &mut self.rng);
-            all_ids.push(next);
-            new_tokens += 1;
-            if next == self.tokenizer.eos_id {
+            if self.tokenizer.is_stop(next) {
                 break;
             }
+            all_ids.push(next);
+            new_tokens += 1;
             last = next;
         }
 

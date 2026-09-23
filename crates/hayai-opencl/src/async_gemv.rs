@@ -8,28 +8,51 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
 use opencl3::types::{cl_float, cl_int, cl_long, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
 use std::ptr;
 
-/// In-flight GGML GEMV. Device buffers + host output stay alive until [`PendingGemv::wait`].
+/// In-flight GGML GEMV. Device buffers + host output stay alive until the
+/// completion event is waited on. If the value is dropped without calling
+/// [`PendingGemv::wait`], the event is still waited on (see [`Drop`]) so the
+/// driver never writes into an already-freed host buffer.
 pub struct PendingGemv {
     _weights_owned: Option<Buffer<cl_uchar>>,
     _input: Buffer<cl_float>,
     _output_dev: Buffer<cl_float>,
     host_out: Vec<f32>,
-    complete: Event,
+    complete: Option<Event>,
     device_name: String,
     label: &'static str,
 }
 
 impl PendingGemv {
-    pub fn wait(self) -> Result<Vec<f32>, OpenClError> {
-        self.complete
-            .wait()
-            .map_err(|e| OpenClError::ClError(format!("wait {}: {e}", self.label)))?;
+    /// Block until the device GEMV completes and take the host output vector.
+    pub fn wait(mut self) -> Result<Vec<f32>, OpenClError> {
+        self.finish()?;
         tracing::debug!(
             "OpenCL async ggml_gemv_{} done on {}",
             self.label,
             self.device_name
         );
-        Ok(self.host_out)
+        Ok(std::mem::take(&mut self.host_out))
+    }
+
+    /// Wait on the completion event at most once. Idempotent.
+    fn finish(&mut self) -> Result<(), OpenClError> {
+        if let Some(event) = self.complete.take() {
+            event
+                .wait()
+                .map_err(|e| OpenClError::ClError(format!("wait {}: {e}", self.label)))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingGemv {
+    fn drop(&mut self) {
+        // Never free `host_out` while a non-blocking read may still target it.
+        // A driver error here cannot be propagated from `Drop`, but waiting is
+        // the soundness requirement; report it for debugging.
+        if let Err(e) = self.finish() {
+            tracing::warn!("PendingGemv dropped before completion: {e}");
+        }
     }
 }
 
@@ -91,6 +114,11 @@ impl OpenClEngine {
     }
 
     /// GEMV with SVM base pointer + byte offset (APU zero-copy; expert Base+Offset).
+    ///
+    /// The raw `svm_base` is handed to `clSetKernelArg` (SVM pointer argument); it
+    /// is not dereferenced by Rust, so this is not an `unsafe fn` — the caller is
+    /// responsible for the pointer being a valid SVM allocation.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn ggml_gemv_async_from_svm(
         &self,
         kernel: &Kernel,
@@ -102,6 +130,7 @@ impl OpenClEngine {
         input: &[f32],
     ) -> Result<PendingGemv, OpenClError> {
         assert_eq!(input.len(), n);
+        crate::compute::validate_gemv_shape(label, m, n)?;
         let m_i = m as cl_int;
         let n_i = n as cl_int;
         let off_i = weight_off as cl_long;
@@ -121,7 +150,7 @@ impl OpenClEngine {
                 .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
         }
 
-        let local = preferred_local_async(m);
+        let local = preferred_local_async(m, self.device_info.max_work_group_size);
         let global = ((m + local - 1) / local) * local;
 
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
@@ -158,7 +187,7 @@ impl OpenClEngine {
             _input: input_buf,
             _output_dev: output_buf,
             host_out,
-            complete,
+            complete: Some(complete),
             device_name: self.device_info.device_name.clone(),
             label,
         })
@@ -175,6 +204,7 @@ impl OpenClEngine {
         input: &[f32],
     ) -> Result<PendingGemv, OpenClError> {
         assert_eq!(input.len(), n);
+        crate::compute::validate_gemv_weights(label, m, n, weights.len())?;
         let mut weights_buf = unsafe {
             Buffer::<cl_uchar>::create(
                 &self.context,
@@ -189,17 +219,11 @@ impl OpenClEngine {
                 .enqueue_write_buffer(&mut weights_buf, CL_BLOCKING, 0, weights, &[])
                 .map_err(|e| OpenClError::ClError(format!("write weights: {e}")))?;
         }
-        let pending =
+        let mut pending =
             self.ggml_gemv_begin_dev(kernel, label, m, n, &weights_buf, weight_off, input)?;
-        Ok(PendingGemv {
-            _weights_owned: Some(weights_buf),
-            _input: pending._input,
-            _output_dev: pending._output_dev,
-            host_out: pending.host_out,
-            complete: pending.complete,
-            device_name: pending.device_name,
-            label: pending.label,
-        })
+        // Keep the weights buffer alive for the lifetime of the in-flight GEMV.
+        pending._weights_owned = Some(weights_buf);
+        Ok(pending)
     }
 
     fn ggml_gemv_begin_dev(
@@ -213,6 +237,7 @@ impl OpenClEngine {
         input: &[f32],
     ) -> Result<PendingGemv, OpenClError> {
         assert_eq!(input.len(), n);
+        crate::compute::validate_gemv_shape(label, m, n)?;
         let m_i = m as cl_int;
         let n_i = n as cl_int;
         let off_i = weight_off as cl_long;
@@ -232,7 +257,7 @@ impl OpenClEngine {
                 .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
         }
 
-        let local = preferred_local_async(m);
+        let local = preferred_local_async(m, self.device_info.max_work_group_size);
         let global = ((m + local - 1) / local) * local;
 
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
@@ -269,19 +294,20 @@ impl OpenClEngine {
             _input: input_buf,
             _output_dev: output_buf,
             host_out,
-            complete,
+            complete: Some(complete),
             device_name: self.device_info.device_name.clone(),
             label,
         })
     }
 }
 
-fn preferred_local_async(m: usize) -> usize {
+fn preferred_local_async(m: usize, max_work_group: usize) -> usize {
+    let cap = max_work_group.max(1);
     const CANDIDATES: [usize; 4] = [256, 128, 64, 32];
     for &ls in &CANDIDATES {
-        if m % ls == 0 {
+        if ls <= cap && m % ls == 0 {
             return ls;
         }
     }
-    64.min(m.max(16))
+    64.min(m.max(16)).min(cap)
 }

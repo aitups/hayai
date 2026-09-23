@@ -30,6 +30,7 @@ pub struct DeltaNetLayerWeights {
 }
 
 /// Per-layer recurrent state for decode.
+#[derive(Clone)]
 pub struct DeltaNetState {
     /// Last `(conv_k - 1) * conv_dim` mixed channels, oldest→newest.
     pub conv: Vec<f32>,

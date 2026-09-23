@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# The repo pins `nightly-x86_64-pc-windows-gnu` in rust-toolchain.toml; CI runs
+# on Linux, so override the toolchain like AGENTS.md documents.
+env:
+  RUSTUP_TOOLCHAIN: nightly
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace
+      - name: test
+        run: cargo test -p hayai-core -p hayai-model -p hayai-opencl -p hayai-cpu
+
+  # Advisory: Miri over the pure-Rust unsafe paths (dequant, buffers, sparse DAG).
+  # OpenCL FFI is not runnable under Miri, so only hayai-model is targeted.
+  miri:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: miri (hayai-model)
+        run: cargo miri test -p hayai-model

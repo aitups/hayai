@@ -56,6 +56,10 @@ impl IoUringLayerPrefetcher {
         };
         // Small ring; one in-flight read per layer is enough for the ping-pong pipeline.
         let ring = IoUring::new(8).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // Sequential access hint for the page cache (ignored under O_DIRECT).
+        if !want_direct {
+            let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+        }
         info!(
             "Opened io_uring streaming file {:?} — {} layers × {} KB",
             path,

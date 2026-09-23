@@ -38,6 +38,12 @@ struct Args {
     /// Chat template override: template string or @path/to/file
     #[arg(long, env = "HAYAI_CHAT_TEMPLATE")]
     chat_template: Option<String>,
+    /// Maximum concurrent generation requests (the rest queue on the model lock).
+    #[arg(long, default_value = "4", env = "HAYAI_MAX_CONCURRENCY")]
+    max_concurrency: usize,
+    /// Optional bearer token required on /v1/* (HAYAI_API_KEY).
+    #[arg(long, env = "HAYAI_API_KEY")]
+    api_key: Option<String>,
     #[arg(long, default_value = "info", env = "HAYAI_LOG")]
     log: String,
 }
@@ -54,13 +60,16 @@ async fn main() -> anyhow::Result<()> {
 
     let mode = ExecutionMode::parse(&args.device);
     let strategy = MemoryStrategy::parse(&args.memory_strategy);
-    let chat_override = args.chat_template.as_deref().map(|t| {
-        if let Some(p) = t.strip_prefix('@') {
-            std::fs::read_to_string(p).unwrap_or_else(|_| t.to_string())
-        } else {
-            t.to_string()
+    let chat_override = match args.chat_template.as_deref() {
+        Some(t) if t.starts_with('@') => {
+            let path = &t[1..];
+            Some(std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("failed to read --chat-template file '{path}': {e}")
+            })?)
         }
-    });
+        Some(t) => Some(t.to_string()),
+        None => None,
+    };
 
     let mut registry = ModelRegistry::new(mode, args.sinks, args.window, strategy, chat_override);
 
@@ -87,7 +96,11 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("Listening on http://{}:{}", args.host, args.port);
 
-    let app = router(Arc::new(registry));
+    let app = router(
+        Arc::new(registry),
+        args.max_concurrency,
+        args.api_key.clone(),
+    );
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     axum::serve(listener, app).await?;
     Ok(())

@@ -8,42 +8,23 @@ use tracing::{info, warn};
 /// CPU OpenCL devices are excluded from the FFN pool (host CPU already runs Attn/KV).
 pub struct OpenClDevicePool {
     pub engines: Vec<OpenClEngine>,
+    /// FFN role (`0=gate, 1=up, 2=down`) → engine index, balanced by capability.
+    role_map: Vec<usize>,
 }
 
 impl OpenClDevicePool {
-    /// Initialize **every** non-CPU OpenCL device. Product policy: if it speaks OpenCL
-    /// as a GPU, it is in the pool — vendor/type agnostic (NVIDIA/Intel/AMD/Mali/…).
+    /// Initialize **every** OpenCL device, GPU first. Product policy: any device
+    /// that speaks OpenCL 3.0 joins the pool — vendor/type agnostic (NVIDIA/Intel/
+    /// AMD/ARM/…). CPU-OpenCL is included **last** (the host CPU already runs
+    /// attention, but an OpenCL CPU device is still a usable FFN target).
     pub fn try_init_all_gpus() -> Result<Self, OpenClError> {
         let devices = discover_opencl_devices();
-        let gpu_infos: Vec<&OpenClDeviceInfo> = devices
-            .iter()
-            .filter(|d| d.device_kind != DeviceKind::CpuOpenCl)
-            .collect();
-
-        if gpu_infos.is_empty() {
+        if devices.is_empty() {
             return Err(OpenClError::NoDeviceFound);
         }
-
-        // Prefer discrete first for stable primary/scratch ownership, then integrated, then other.
-        let mut ordered: Vec<&OpenClDeviceInfo> = Vec::new();
-        for d in &gpu_infos {
-            if d.device_kind == DeviceKind::DiscreteGpu {
-                ordered.push(d);
-            }
-        }
-        for d in &gpu_infos {
-            if d.device_kind == DeviceKind::IntegratedGpu {
-                ordered.push(d);
-            }
-        }
-        for d in &gpu_infos {
-            if !matches!(
-                d.device_kind,
-                DeviceKind::DiscreteGpu | DeviceKind::IntegratedGpu
-            ) {
-                ordered.push(d);
-            }
-        }
+        // Discrete → APU → integrated → accelerator → other → CPU-OpenCL.
+        let mut ordered: Vec<&OpenClDeviceInfo> = devices.iter().collect();
+        ordered.sort_by_key(|d| d.device_kind.pool_rank());
 
         let mut engines = Vec::new();
         for info in ordered {
@@ -70,13 +51,26 @@ impl OpenClDevicePool {
             return Err(OpenClError::NoDeviceFound);
         }
 
+        let role_map = plan_roles(&engines);
         info!("OpenCL device pool size: {}", engines.len());
-        Ok(Self { engines })
+        Ok(Self { engines, role_map })
     }
 
     /// Create an empty pool (no OpenCL devices). Used in tests and CPU-only mode.
     pub fn empty() -> Self {
-        Self { engines: Vec::new() }
+        Self {
+            engines: Vec::new(),
+            role_map: Vec::new(),
+        }
+    }
+
+    /// Pool with a single explicitly-selected engine (`--device <name>`).
+    pub fn single(engine: OpenClEngine) -> Self {
+        let role_map = plan_roles(std::slice::from_ref(&engine));
+        Self {
+            engines: vec![engine],
+            role_map,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -87,21 +81,47 @@ impl OpenClDevicePool {
         self.engines.is_empty()
     }
 
-    pub fn primary(&self) -> &OpenClEngine {
-        &self.engines[0]
+    /// Primary (first) engine, or `None` when the pool is empty (CPU-only).
+    pub fn primary(&self) -> Option<&OpenClEngine> {
+        self.engines.first()
     }
 
-    pub fn primary_mut(&mut self) -> &mut OpenClEngine {
-        &mut self.engines[0]
+    pub fn primary_mut(&mut self) -> Option<&mut OpenClEngine> {
+        self.engines.first_mut()
     }
 
-    pub fn get(&self, idx: usize) -> &OpenClEngine {
-        &self.engines[idx % self.engines.len()]
+    /// Round-robin engine for matrix `idx`, or `None` for an empty pool.
+    pub fn get(&self, idx: usize) -> Option<&OpenClEngine> {
+        if self.engines.is_empty() {
+            None
+        } else {
+            Some(&self.engines[idx % self.engines.len()])
+        }
     }
 
     /// Round-robin pick for matrix `role` (0=gate, 1=up, 2=down, …).
-    pub fn for_role(&self, role: usize) -> &OpenClEngine {
-        self.get(role)
+    pub fn for_role(&self, role: usize) -> Option<&OpenClEngine> {
+        if self.engines.is_empty() {
+            return None;
+        }
+        let idx = self
+            .role_map
+            .get(role)
+            .copied()
+            .unwrap_or(role % self.engines.len());
+        self.engines.get(idx)
+    }
+
+    /// Device index assigned to each FFN role (empty = round-robin fallback).
+    pub fn role_map(&self) -> &[usize] {
+        &self.role_map
+    }
+
+    /// Override the role assignment (used by the hardware-aware planner).
+    pub fn set_role_map(&mut self, map: Vec<usize>) {
+        if !self.engines.is_empty() {
+            self.role_map = map.into_iter().map(|i| i % self.engines.len()).collect();
+        }
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -116,20 +136,25 @@ impl OpenClDevicePool {
             .engines
             .iter()
             .any(|e| e.device_info.device_kind == DeviceKind::DiscreteGpu);
-        let has_i = self
-            .engines
-            .iter()
-            .any(|e| e.device_info.device_kind == DeviceKind::IntegratedGpu);
+        let has_i = self.engines.iter().any(|e| {
+            matches!(
+                e.device_info.device_kind,
+                DeviceKind::Apu | DeviceKind::IntegratedGpu
+            )
+        });
         has_d && has_i
     }
 
-    /// APU / integrated GPU with SVM — preferred host for `clSVMAlloc` (expert guidance).
+    /// APU / unified-memory device with SVM — preferred host for `clSVMAlloc`.
     pub fn apu_svm(&self) -> Option<&OpenClEngine> {
         self.engines
             .iter()
-            .find(|e| {
-                e.device_info.device_kind == DeviceKind::IntegratedGpu
-                    && e.device_info.supports_svm
+            .find(|e| e.device_info.device_kind == DeviceKind::Apu && e.device_info.supports_svm)
+            .or_else(|| {
+                self.engines.iter().find(|e| {
+                    e.device_info.device_kind == DeviceKind::IntegratedGpu
+                        && e.device_info.supports_svm
+                })
             })
             .or_else(|| {
                 self.engines
@@ -137,4 +162,36 @@ impl OpenClDevicePool {
                     .find(|e| e.device_info.supports_svm)
             })
     }
+}
+
+/// Assign the 3 FFN roles (gate/up/down) across the pool to balance estimated
+/// load by compute-unit count (greedy LPT). Deterministic and vendor-agnostic.
+pub fn plan_roles(engines: &[OpenClEngine]) -> Vec<usize> {
+    let n = engines.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Throughput proxy: faster device classes get proportionally more roles.
+    // `pool_rank` (0 = discrete) maps to weight 1/(rank+1). Cross-vendor CU counts
+    // are not comparable, so ordering is the safer default; the calibration
+    // profile can override the map via `set_role_map`.
+    let weight: Vec<f64> = engines
+        .iter()
+        .map(|e| 1.0 / (e.device_info.device_kind.pool_rank() as f64 + 1.0))
+        .collect();
+    let mut load = vec![0.0f64; n];
+    let mut map = Vec::with_capacity(3);
+    for _role in 0..3 {
+        let best = (0..n)
+            .min_by(|&a, &b| {
+                // Least normalized load; on a tie prefer the faster class.
+                let ka = (load[a] / weight[a], -weight[a]);
+                let kb = (load[b] / weight[b], -weight[b]);
+                ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or(0);
+        map.push(best);
+        load[best] += weight[best];
+    }
+    map
 }

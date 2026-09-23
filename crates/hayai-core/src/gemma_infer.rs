@@ -31,8 +31,6 @@ pub(crate) fn build_layer_kv_caches(
 }
 
 struct GemmaMeta {
-    n_heads: usize,
-    n_kv: usize,
     head_full: usize,
     head_swa: usize,
     rope_full: f32,
@@ -42,6 +40,11 @@ struct GemmaMeta {
     per_layer_dim: usize,
     softcap: f32,
     is_swa: Vec<bool>,
+    /// Per-layer attention dims resolved from that block's tensors (gemma-4-12B mixes
+    /// global: n_kv=8/head 256 and SWA: n_kv=1/head 512).
+    head_dim_l: Vec<usize>,
+    n_heads_l: Vec<usize>,
+    n_kv_l: Vec<usize>,
 }
 
 impl GemmaMeta {
@@ -50,8 +53,8 @@ impl GemmaMeta {
         config: &hayai_model::ModelConfig,
     ) -> Result<Self, StreamInferError> {
         let arch = &config.architecture;
-        let n_heads = config.num_attention_heads;
-        let n_kv = config.num_key_value_heads;
+        let cfg_heads = config.num_attention_heads;
+        let cfg_kv = config.num_key_value_heads;
         let head_full = cat
             .meta_u32(&format!("{arch}.attention.key_length"))
             .unwrap_or(512) as usize;
@@ -89,9 +92,38 @@ impl GemmaMeta {
                     .map(|i| (i + 1) % 6 != 0)
                     .collect()
             });
+        // Per-layer attention dims from tensors (never a single scalar): gemma-4-12B
+        // global layers are head_dim 256 / n_kv 8, SWA layers head_dim 512 / n_kv 1.
+        let mut head_dim_l = Vec::with_capacity(config.num_layers);
+        let mut n_heads_l = Vec::with_capacity(config.num_layers);
+        let mut n_kv_l = Vec::with_capacity(config.num_layers);
+        for i in 0..config.num_layers {
+            let swa = is_swa.get(i).copied().unwrap_or(true);
+            let default_hd = if swa { head_swa } else { head_full };
+            let qn_dim = |name: &str| {
+                cat.tensor(name)
+                    .ok()
+                    .map(|t| t.ncols().max(t.nrows()))
+                    .filter(|&d| d > 0)
+            };
+            let hd = qn_dim(&format!("blk.{i}.attn_q_norm.weight"))
+                .or_else(|| qn_dim(&format!("blk.{i}.attn_k_norm.weight")))
+                .unwrap_or(default_hd);
+            let n_heads = cat
+                .tensor(&format!("blk.{i}.attn_output.weight"))
+                .ok()
+                .map(|t| (t.ncols() / hd).max(1))
+                .unwrap_or(cfg_heads);
+            let n_kv = cat
+                .tensor(&format!("blk.{i}.attn_k.weight"))
+                .ok()
+                .map(|t| (t.nrows() / hd).max(1))
+                .unwrap_or(cfg_kv);
+            head_dim_l.push(hd);
+            n_heads_l.push(n_heads);
+            n_kv_l.push(n_kv);
+        }
         Ok(Self {
-            n_heads,
-            n_kv,
             head_full,
             head_swa,
             rope_full,
@@ -101,6 +133,9 @@ impl GemmaMeta {
             per_layer_dim,
             softcap,
             is_swa,
+            head_dim_l,
+            n_heads_l,
+            n_kv_l,
         })
     }
 
@@ -114,11 +149,11 @@ impl GemmaMeta {
 
     fn layer_attn(&self, layer: usize) -> AttentionConfig {
         let swa = self.is_swa(layer);
-        let head_dim = if swa { self.head_swa } else { self.head_full };
+        let head_dim = self.head_dim_l.get(layer).copied().unwrap_or(self.head_full);
         let rope = if swa { self.rope_swa } else { self.rope_full };
         AttentionConfig {
-            num_heads: self.n_heads,
-            num_kv_heads: self.n_kv,
+            num_heads: self.n_heads_l.get(layer).copied().unwrap_or(1),
+            num_kv_heads: self.n_kv_l.get(layer).copied().unwrap_or(1),
             head_dim,
             rope_theta: rope,
             rope_dim: head_dim,
@@ -160,6 +195,27 @@ pub(crate) fn forward_gemma(
     token: u32,
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
+    forward_gemma_inner(gen, orch, Some(token), None, scratch)
+}
+
+/// Gemma forward with a pre-computed input embedding (multimodal injection); the
+/// token is only used for token-derived per-layer inputs (PLE), defaulting to 0.
+pub(crate) fn forward_gemma_embd(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    embd: &[f32],
+    scratch: &mut StreamingScratch,
+) -> Result<Vec<f32>, StreamInferError> {
+    forward_gemma_inner(gen, orch, None, Some(embd), scratch)
+}
+
+fn forward_gemma_inner(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    token: Option<u32>,
+    embd: Option<&[f32]>,
+    scratch: &mut StreamingScratch,
+) -> Result<Vec<f32>, StreamInferError> {
     let h = gen.config.hidden_size;
     let eps = gen.config.rms_norm_eps;
     let n_layers = gen.config.num_layers;
@@ -167,13 +223,28 @@ pub(crate) fn forward_gemma(
     let meta = GemmaMeta::from_catalog(&gen.catalog, &gen.config)?;
 
     let mut x = vec![0.0f32; h];
-    gen.embed_row("token_embd.weight", token, h, &mut x)?;
-    // Gemma: scale token embeddings by sqrt(n_embd).
-    let emb_scale = (h as f32).sqrt();
-    for v in x.iter_mut() {
-        *v *= emb_scale;
+    match embd {
+        Some(e) => {
+            if e.len() != h {
+                return Err(StreamInferError::Msg(format!(
+                    "media embedding len {} != hidden {h}",
+                    e.len()
+                )));
+            }
+            x.copy_from_slice(e);
+        }
+        None => gen.embed_row("token_embd.weight", token.unwrap_or(0), h, &mut x)?,
     }
-
+    // Gemma scales **token** embeddings by sqrt(n_embd); multimodal embeddings from
+    // the projector are already in the hidden space and are injected unscaled
+    // (llama.cpp: `inpL = scale(inpL, ubatch.token ? sqrt(n_embd) : 1.0)`).
+    if embd.is_none() {
+        let emb_scale = (h as f32).sqrt();
+        for v in x.iter_mut() {
+            *v *= emb_scale;
+        }
+    }
+    let token = token.unwrap_or(0);
     // Global-attn proportional RoPE factors (cached at session open; SWA uses None).
     let rope_freqs = gen.gemma_rope_freqs.clone();
 

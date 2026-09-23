@@ -15,6 +15,9 @@
 
 use hayai_opencl::OpenClDevicePool;
 
+/// Target utilization of usable host/device memory (low end of the 75–80 % band).
+pub const DEFAULT_UTILIZATION: f64 = 0.75;
+
 /// User-visible / CLI strategy selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryStrategy {
@@ -69,71 +72,113 @@ pub struct WindowPlan {
 /// - the per-layer pack size in bytes,
 /// - the number of physical layers in the model,
 /// - the OpenCL device pool (from which available VRAM is queried),
-/// - the user memory strategy.
+/// - the user memory strategy,
+/// - `reserve_bytes`: KV cache + activations + metadata that must stay resident.
 ///
-/// Safety margin: keep 20 % of each device's reported memory free for OS/driver/KV.
+/// `AutoFit` targets [`DEFAULT_UTILIZATION`] (75 %) of the **usable** memory —
+/// `min(host RAM, tightest device)`. Each dGPU mirror holds the whole base, so a
+/// single mirror allocation is capped by that device's
+/// `CL_DEVICE_MAX_MEM_ALLOC_SIZE`. A full-resident base uses one slot of
+/// `n_layers`; otherwise ping-pong allocates two slots of `k_chunk` layers each.
 pub fn compute_window_plan(
     pool: &OpenClDevicePool,
     layer_bytes: usize,
     n_layers: usize,
     strategy: MemoryStrategy,
+    reserve_bytes: u64,
 ) -> WindowPlan {
     if layer_bytes == 0 || n_layers == 0 {
-        return WindowPlan { k_chunk: 1, resident: false, window_bytes: 0 };
+        return WindowPlan {
+            k_chunk: 1,
+            resident: false,
+            window_bytes: 0,
+        };
     }
+    let layer_u64 = layer_bytes as u64;
 
     let available_bytes: u64 = match strategy {
         MemoryStrategy::Minimal => {
-            // Exactly 2 slots (current behaviour).
             return WindowPlan {
                 k_chunk: 1,
                 resident: false,
-                window_bytes: layer_bytes as u64 * 2,
+                window_bytes: layer_u64 * 2,
             };
         }
-        MemoryStrategy::CapBytes(cap) => cap,
+        MemoryStrategy::CapBytes(cap) => cap.saturating_sub(reserve_bytes),
         MemoryStrategy::AutoFit => {
-            // Sum usable headroom across all accelerators.
-            // For each device take 80 % of global_mem_size.
-            let gpu_mem: u64 = pool
+            let host = system_available_ram_bytes()
+                .map(|b| (b as f64 * DEFAULT_UTILIZATION) as u64);
+            // The base lives in host RAM (SVM/pinned) and is mirrored to each
+            // device that can hold it. Devices that cannot (base > their
+            // max single-allocation) are skipped and use host-upload instead, so
+            // the *best* device bounds the accelerator side (not the min).
+            let dev = pool
                 .engines
                 .iter()
                 .map(|e| {
-                    let m = e.device_info.global_mem_size;
-                    // Apply 80 % safety margin.
-                    m.saturating_mul(4) / 5
+                    let by_mem = (e.device_info.global_mem_size as f64 * DEFAULT_UTILIZATION) as u64;
+                    let by_alloc = if e.device_info.max_alloc_size > 0 {
+                        e.device_info.max_alloc_size
+                    } else {
+                        u64::MAX
+                    };
+                    by_mem.min(by_alloc)
                 })
-                .max()
-                .unwrap_or(0);
-
-            // Also consider system RAM (conservative: half of physical RAM, capped at 8 GiB).
-            // We use a simple heuristic: if no GPU, fall back to RAM estimate.
-            let sys_ram_estimate: u64 = system_available_ram_bytes()
-                .map(|b| b.saturating_mul(1) / 2)
-                .unwrap_or(0)
-                .min(8 * 1024 * 1024 * 1024);
-
-            if pool.is_empty() {
-                sys_ram_estimate
-            } else {
-                gpu_mem.max(sys_ram_estimate)
-            }
+                .max();
+            let total = match (host, dev) {
+                (Some(h), Some(d)) => h.min(d),
+                (Some(h), None) => h,
+                (None, Some(d)) => d,
+                (None, None) => 0,
+            };
+            total.saturating_sub(reserve_bytes)
         }
     };
 
-    // How many layers fit in the available headroom (always at least 1, at most n_layers)?
-    let layer_bytes_u64 = layer_bytes as u64;
+    plan_from_available(layer_bytes, n_layers, strategy, available_bytes)
+}
 
-    // Reserve 2× base slots regardless (ping-pong overhead), then add extra layers.
-    let base = layer_bytes_u64.saturating_mul(2);
-    let extra_bytes = available_bytes.saturating_sub(base);
-    let extra_layers = (extra_bytes / layer_bytes_u64) as usize;
-    let k_chunk = (1 + extra_layers).min(n_layers);
+/// Map an available byte budget to a [`WindowPlan`] (pure; unit-testable).
+pub fn plan_from_available(
+    layer_bytes: usize,
+    n_layers: usize,
+    strategy: MemoryStrategy,
+    available_bytes: u64,
+) -> WindowPlan {
+    if layer_bytes == 0 || n_layers == 0 {
+        return WindowPlan {
+            k_chunk: 1,
+            resident: false,
+            window_bytes: 0,
+        };
+    }
+    let layer_u64 = layer_bytes as u64;
+    if strategy == MemoryStrategy::Minimal {
+        return WindowPlan {
+            k_chunk: 1,
+            resident: false,
+            window_bytes: layer_u64 * 2,
+        };
+    }
 
-    let resident = k_chunk >= n_layers;
-    let window_bytes = layer_bytes_u64.saturating_mul(k_chunk as u64 + 1); // +1 for ping-pong
+    // Full resident base: one slot of `n_layers` layers (slot 1 is a dummy).
+    let resident_needed = layer_u64.saturating_mul(n_layers as u64);
+    if resident_needed > 0 && resident_needed <= available_bytes {
+        return WindowPlan {
+            k_chunk: n_layers,
+            resident: true,
+            window_bytes: resident_needed,
+        };
+    }
 
-    WindowPlan { k_chunk, resident, window_bytes }
+    // Ping-pong: two slots of `k_chunk` layers each, clamped to `< n_layers`.
+    let max_k = n_layers.saturating_sub(1).max(1);
+    let k_chunk = ((available_bytes / (2 * layer_u64)).max(1) as usize).min(max_k);
+    WindowPlan {
+        k_chunk,
+        resident: false,
+        window_bytes: 2 * layer_u64 * k_chunk as u64,
+    }
 }
 
 /// Estimate available system RAM (best-effort, platform-specific).
@@ -209,7 +254,7 @@ mod tests {
     #[test]
     fn minimal_strategy_gives_k1() {
         let pool = OpenClDevicePool::empty();
-        let plan = compute_window_plan(&pool, 100_000, 32, MemoryStrategy::Minimal);
+        let plan = compute_window_plan(&pool, 100_000, 32, MemoryStrategy::Minimal, 0);
         assert_eq!(plan.k_chunk, 1);
         assert!(!plan.resident);
     }
@@ -217,9 +262,36 @@ mod tests {
     #[test]
     fn cap_bytes_strategy() {
         let pool = OpenClDevicePool::empty();
-        // 1 MB per layer, cap 10 MB → k_chunk = min(10, 32) = 9 (10MB / 1MB - 2 base slots = 8 extra, +1 = 9)
-        let plan = compute_window_plan(&pool, 1_000_000, 32, MemoryStrategy::CapBytes(10_000_000));
-        assert!(plan.k_chunk >= 8);
+        // 1 MB/layer, 10 MB cap → two slots → k_chunk = 10 / 2 = 5.
+        let plan = compute_window_plan(&pool, 1_000_000, 32, MemoryStrategy::CapBytes(10_000_000), 0);
+        assert_eq!(plan.k_chunk, 5);
+        assert!(!plan.resident);
+    }
+
+    #[test]
+    fn cap_bytes_reserves_kv_and_activations() {
+        let pool = OpenClDevicePool::empty();
+        // Half the cap reserved → k_chunk = (10 - 5) / 2 = 2 (integer div 5/2).
+        let plan = compute_window_plan(&pool, 1_000_000, 32, MemoryStrategy::CapBytes(10_000_000), 5_000_000);
+        assert_eq!(plan.k_chunk, 2);
+    }
+
+    #[test]
+    fn plan_resident_when_base_fits() {
+        // 32 layers × 1 MB = 32 MB base fits in 40 MB → resident, one slot.
+        let p = plan_from_available(1_000_000, 32, MemoryStrategy::AutoFit, 40_000_000);
+        assert!(p.resident);
+        assert_eq!(p.k_chunk, 32);
+        assert_eq!(p.window_bytes, 32_000_000);
+    }
+
+    #[test]
+    fn plan_ping_pong_when_base_does_not_fit() {
+        // 32 MB base > 10 MB → two slots of k_chunk = 10/2 = 5 layers.
+        let p = plan_from_available(1_000_000, 32, MemoryStrategy::AutoFit, 10_000_000);
+        assert!(!p.resident);
+        assert_eq!(p.k_chunk, 5);
+        assert_eq!(p.window_bytes, 10_000_000);
     }
 
     #[test]

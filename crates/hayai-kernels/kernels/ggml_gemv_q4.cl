@@ -1604,3 +1604,84 @@ __kernel void ggml_gemv_iq2_s(
     }
     output[row] = sum;
 }
+
+// BF16: high 16 bits of an IEEE-754 float32.
+__kernel void ggml_gemv_bf16(
+    const int M,
+    const int N,
+    const long weight_off,
+    __global const uchar* restrict weights,
+    __global const float* restrict input,
+    __global float* restrict output,
+    __local float* restrict local_input
+) {
+    int row = get_global_id(0);
+    hayai_wg_barrier(local_input);
+    if (row >= M) return;
+    __global const uchar* wbase = weights + weight_off + row * N * 2;
+    float sum = 0.0f;
+    for (int c = 0; c < N; c++) {
+        uint bits = (uint)wbase[c * 2] | ((uint)wbase[c * 2 + 1] << 8);
+        sum += as_float(bits << 16) * input[c];
+    }
+    output[row] = sum;
+}
+
+// Q8_1: block = { half d; half s; int8 qs[32] } = 36 bytes / 32 elems.
+__kernel void ggml_gemv_q8_1(
+    const int M,
+    const int N,
+    const long weight_off,
+    __global const uchar* restrict weights,
+    __global const float* restrict input,
+    __global float* restrict output,
+    __local float* restrict local_input
+) {
+    int row = get_global_id(0);
+    hayai_wg_barrier(local_input);
+    if (row >= M) return;
+    int blocks = N / 32;
+    int row_bytes = blocks * 36;
+    __global const uchar* wbase = weights + weight_off + row * row_bytes;
+    float sum = 0.0f;
+    for (int bi = 0; bi < blocks; bi++) {
+        __global const uchar* block = wbase + bi * 36;
+        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+        __global const uchar* qs = block + 4;
+        int x_base = bi * 32;
+        for (int j = 0; j < 32; j++) {
+            sum += (float)((char)qs[j]) * d * input[x_base + j];
+        }
+    }
+    output[row] = sum;
+}
+
+// Q8_K: block = { float d; int8 qs[256]; int16 bsums[16] } = 292 bytes / 256 elems.
+__kernel void ggml_gemv_q8_k(
+    const int M,
+    const int N,
+    const long weight_off,
+    __global const uchar* restrict weights,
+    __global const float* restrict input,
+    __global float* restrict output,
+    __local float* restrict local_input
+) {
+    int row = get_global_id(0);
+    hayai_wg_barrier(local_input);
+    if (row >= M) return;
+    int blocks = N / 256;
+    int row_bytes = blocks * 292;
+    __global const uchar* wbase = weights + weight_off + row * row_bytes;
+    float sum = 0.0f;
+    for (int bi = 0; bi < blocks; bi++) {
+        __global const uchar* block = wbase + bi * 292;
+        uint db = (uint)block[0] | ((uint)block[1] << 8) | ((uint)block[2] << 16) | ((uint)block[3] << 24);
+        float d = as_float(db);
+        __global const uchar* qs = block + 4;
+        int x_base = bi * 256;
+        for (int j = 0; j < 256; j++) {
+            sum += (float)((char)qs[j]) * d * input[x_base + j];
+        }
+    }
+    output[row] = sum;
+}

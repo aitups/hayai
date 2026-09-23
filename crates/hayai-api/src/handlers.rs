@@ -43,27 +43,54 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<crate::models::ChatCompletionRequest>,
 ) -> Response {
+    if let Some(e) =
+        crate::models::validate_generation(req.max_tokens, req.n, req.logprobs.as_ref())
+    {
+        return err_response(StatusCode::BAD_REQUEST, e);
+    }
+    let permit = match state.gen_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return err_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiError::internal("server is shutting down"),
+            )
+        }
+    };
     let handle = match state.registry.handle(&req.model) {
         Ok(h) => h,
         Err(e) => return err_response(StatusCode::NOT_FOUND, e),
     };
 
     if req.stream {
-        return stream_chat_response(state.registry.clone(), handle, req);
+        return stream_chat_response(state.registry.clone(), handle, req, permit);
     }
 
     let rid = crate::models::request_id();
     let created = crate::models::created_now();
-    let prompt = engine::chat_prompt(&handle, &req.messages);
+    let tools = req.tools.clone().unwrap_or_else(|| serde_json::json!([]));
+    let prompt = engine::chat_prompt(&handle, &req.messages, &tools);
     let handle2 = handle.clone();
+    let mut params = crate::models::SamplingParams::new(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.min_p,
+        req.presence_penalty,
+        req.frequency_penalty,
+        req.logit_bias.as_ref(),
+        req.seed,
+    );
+    if let Err(e) = params.apply_grammar(req.grammar.as_deref()) {
+        return err_response(StatusCode::BAD_REQUEST, ApiError::bad_request(e));
+    }
     let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         engine::generate_text(
             handle2,
             &prompt,
             req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.seed,
+            params,
             &req.stop,
             |_| Ok(()),
         )
@@ -72,6 +99,13 @@ pub async fn chat_completions(
 
     match result {
         Ok(Ok((text, finish, prompt_tokens, completion_tokens))) => {
+            // Best-effort: surface model-emitted tool calls as OpenAI `tool_calls`.
+            let tool_calls = crate::models::parse_tool_calls(&text);
+            let (content, finish) = if tool_calls.is_some() {
+                (String::new(), "tool_calls".to_string())
+            } else {
+                (text, finish)
+            };
             let body = ChatCompletionResponse {
                 id: rid,
                 object: "chat.completion",
@@ -81,7 +115,9 @@ pub async fn chat_completions(
                     index: 0,
                     message: crate::models::ChatMessage {
                         role: "assistant".into(),
-                        content: text,
+                        content,
+                        tool_calls: tool_calls.map(serde_json::Value::Array),
+                        ..Default::default()
                     },
                     finish_reason: finish,
                 }],
@@ -106,19 +142,32 @@ fn stream_chat_response(
     _registry: Arc<ModelRegistry>,
     handle: Arc<ModelHandle>,
     req: crate::models::ChatCompletionRequest,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
-    let prompt = engine::chat_prompt(&handle, &req.messages);
+    let tools = req.tools.clone().unwrap_or_else(|| serde_json::json!([]));
+    let prompt = engine::chat_prompt(&handle, &req.messages, &tools);
     let handle2 = handle.clone();
     let model = req.model.clone();
     let stop = req.stop.clone();
     let rid = crate::models::request_id();
+    let mut params = crate::models::SamplingParams::new(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.min_p,
+        req.presence_penalty,
+        req.frequency_penalty,
+        req.logit_bias.as_ref(),
+        req.seed,
+    );
+    if let Err(e) = params.apply_grammar(req.grammar.as_deref()) {
+        return err_response(StatusCode::BAD_REQUEST, ApiError::bad_request(e));
+    }
     tokio::spawn(async move {
+        let _permit = permit;
         let _ = tokio::task::spawn_blocking(move || {
-            stream_chat(
-                tx, handle2, rid, model, &prompt, req.max_tokens, req.temperature, req.top_p,
-                req.seed, &stop,
-            )
+            stream_chat(tx, handle2, rid, model, &prompt, req.max_tokens, params, &stop)
         })
         .await;
     });
@@ -127,6 +176,7 @@ fn stream_chat_response(
 }
 
 /// Streaming loop: emit one SSE chunk per delta, then a `[DONE]` event.
+#[allow(clippy::too_many_arguments)]
 fn stream_chat(
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     handle: Arc<ModelHandle>,
@@ -134,9 +184,7 @@ fn stream_chat(
     model: String,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    seed: u64,
+    params: crate::models::SamplingParams,
     stop: &[String],
 ) {
     let model_name = model.clone();
@@ -152,6 +200,7 @@ fn stream_chat(
                 delta: crate::models::ChatMessage {
                     role: "assistant".into(),
                     content: delta.to_string(),
+                    ..Default::default()
                 },
                 finish_reason: None,
             }],
@@ -161,9 +210,7 @@ fn stream_chat(
         )));
         Ok::<(), ApiError>(())
     };
-    match engine::generate_text(
-        handle, prompt, max_tokens, temperature, top_p, seed, stop, send,
-    ) {
+    match engine::generate_text(handle, prompt, max_tokens, params, stop, send) {
         Ok((_text, finish, _p, _c)) => {
             let chunk = ChatChunk {
                 id: rid_,
@@ -175,6 +222,7 @@ fn stream_chat(
                     delta: crate::models::ChatMessage {
                         role: "assistant".into(),
                         content: String::new(),
+                        ..Default::default()
                     },
                     finish_reason: Some(finish),
                 }],
@@ -202,6 +250,20 @@ pub async fn completions(
     State(state): State<AppState>,
     Json(req): Json<crate::models::CompletionRequest>,
 ) -> Response {
+    if let Some(e) =
+        crate::models::validate_generation(req.max_tokens, req.n, req.logprobs.as_ref())
+    {
+        return err_response(StatusCode::BAD_REQUEST, e);
+    }
+    let permit = match state.gen_permits.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return err_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiError::internal("server is shutting down"),
+            )
+        }
+    };
     let handle = match state.registry.handle(&req.model) {
         Ok(h) => h,
         Err(e) => return err_response(StatusCode::NOT_FOUND, e),
@@ -214,11 +276,24 @@ pub async fn completions(
         let model = req.model.clone();
         let stop = req.stop.clone();
         let rid = crate::models::request_id();
+        let mut params = crate::models::SamplingParams::new(
+            req.temperature,
+            req.top_p,
+            req.top_k,
+            req.min_p,
+            req.presence_penalty,
+            req.frequency_penalty,
+            req.logit_bias.as_ref(),
+            req.seed,
+        );
+        if let Err(e) = params.apply_grammar(req.grammar.as_deref()) {
+            return err_response(StatusCode::BAD_REQUEST, ApiError::bad_request(e));
+        }
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = tokio::task::spawn_blocking(move || {
                 stream_completion(
-                    tx, handle2, rid, model, &prompt, req.max_tokens, req.temperature,
-                    req.top_p, req.seed, &stop,
+                    tx, handle2, rid, model, &prompt, req.max_tokens, params, &stop,
                 )
             })
             .await;
@@ -231,17 +306,22 @@ pub async fn completions(
     let created = crate::models::created_now();
     let prompt = req.prompt.clone();
     let handle2 = handle.clone();
+    let mut params = crate::models::SamplingParams::new(
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.min_p,
+        req.presence_penalty,
+        req.frequency_penalty,
+        req.logit_bias.as_ref(),
+        req.seed,
+    );
+    if let Err(e) = params.apply_grammar(req.grammar.as_deref()) {
+        return err_response(StatusCode::BAD_REQUEST, ApiError::bad_request(e));
+    }
     let result = tokio::task::spawn_blocking(move || {
-        engine::generate_text(
-            handle2,
-            &prompt,
-            req.max_tokens,
-            req.temperature,
-            req.top_p,
-            req.seed,
-            &req.stop,
-            |_| Ok(()),
-        )
+        let _permit = permit;
+        engine::generate_text(handle2, &prompt, req.max_tokens, params, &req.stop, |_| Ok(()))
     })
     .await;
 
@@ -275,6 +355,7 @@ pub async fn completions(
 
 
 
+#[allow(clippy::too_many_arguments)]
 fn stream_completion(
     tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
     handle: Arc<ModelHandle>,
@@ -282,9 +363,7 @@ fn stream_completion(
     model: String,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
-    top_p: f32,
-    seed: u64,
+    params: crate::models::SamplingParams,
     stop: &[String],
 ) {
     let model_name = model.clone();
@@ -306,9 +385,7 @@ fn stream_completion(
         )));
         Ok::<(), ApiError>(())
     };
-    match engine::generate_text(
-        handle, prompt, max_tokens, temperature, top_p, seed, stop, send,
-    ) {
+    match engine::generate_text(handle, prompt, max_tokens, params, stop, send) {
         Ok((_text, finish, _p, _c)) => {
             let chunk = crate::models::CompletionChunk {
                 id: rid_,

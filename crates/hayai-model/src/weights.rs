@@ -2,7 +2,7 @@ use crate::config::ModelConfig;
 use crate::gguf::GgufFile;
 use crate::gguf_types::GgufError;
 use crate::quant::QuantMatrix;
-use crate::sparse_dag::{load_embedded_block, sparse_dag_to_csr};
+use crate::sparse_dag::{load_embedded_block, try_sparse_dag_to_csr};
 use std::sync::Arc;
 use tracing::info;
 
@@ -64,7 +64,7 @@ fn load_ffn(
             let block = load_embedded_block(gguf, base)?
                 .ok_or_else(|| GgufError::MissingTensor(name.to_string()))?;
             let (row_ptr, col_idx, vals) =
-                sparse_dag_to_csr(&block.adjacency, &block.weights, block.d_in, block.d_out);
+                try_sparse_dag_to_csr(&block.adjacency, &block.weights, block.d_in, block.d_out)?;
             let csr = CsrSparse {
                 row_ptr,
                 col_idx,
@@ -98,7 +98,9 @@ impl LlamaWeights {
             .meta_str("general.architecture")
             .unwrap_or("llama")
             .to_string();
-        let prefix = if arch == "llama" || arch == "qwen2" || arch.contains("smollm") {
+        // `qwen2` must use its own metadata prefix (with a `llama.*` fallback)
+        // rather than being forced to `llama.*`, which dropped `qwen2.*` keys.
+        let prefix = if arch.is_empty() || arch == "llama" || arch.contains("smollm") {
             "llama"
         } else {
             arch.as_str()

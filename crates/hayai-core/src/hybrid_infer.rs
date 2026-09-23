@@ -16,17 +16,132 @@ use hayai_opencl::StreamingScratch;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// FFN matrices of one hybrid layer (dense or embedded sparse CSR), preloaded by
+/// the prefetch thread so a DeltaNet/FFN-only block does not stall on disk.
+type FfnMats = (
+    QuantMatrix,
+    QuantMatrix,
+    QuantMatrix,
+    Option<hayai_model::CsrSparse>,
+    Option<hayai_model::CsrSparse>,
+    Option<hayai_model::CsrSparse>,
+);
+
 pub(crate) fn prefill_hybrid(
     gen: &mut StreamingGenerator,
     orch: &mut EngineOrchestrator,
     tokens: &[u32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
-    let mut logits = Vec::new();
-    for &tok in tokens {
-        logits = forward_hybrid(gen, orch, tok, scratch, None)?;
+    let mut all = prefill_hybrid_all(gen, orch, tokens, scratch)?;
+    all.0.pop().ok_or_else(|| StreamInferError::Msg("empty prefill".into()))
+}
+
+/// Layer-major hybrid prefill returning **per-token** logits and post-norm hidden
+/// states (`t_h_nextn`). Used by speculative decoding to verify a draft batch and
+/// to prime the MTP head.
+pub(crate) fn prefill_hybrid_all(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    tokens: &[u32],
+    scratch: &mut StreamingScratch,
+) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), StreamInferError> {
+    let h = gen.config.hidden_size;
+    let eps = gen.config.rms_norm_eps;
+    let n_layers = gen.config.num_layers;
+    let t_count = tokens.len();
+    if t_count == 0 {
+        return Err(StreamInferError::Msg("empty prefill".into()));
     }
-    Ok(logits)
+    ensure_deltanet_cache(gen)?;
+
+    let skip_dn = std::env::var("HAYAI_SKIP_DN_ATTN").ok().as_deref() == Some("1");
+    let skip_fa = std::env::var("HAYAI_SKIP_FA_ATTN").ok().as_deref() == Some("1");
+    let max_layers = std::env::var("HAYAI_MAX_LAYERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(n_layers)
+        .min(n_layers);
+
+    // Embed every prompt token once.
+    let mut xs: Vec<Vec<f32>> = Vec::with_capacity(t_count);
+    for &tok in tokens {
+        let mut x = vec![0.0f32; h];
+        gen.embed_row("token_embd.weight", tok, h, &mut x)?;
+        xs.push(x);
+    }
+    let base_pos = gen.position;
+
+    // Layer-major prefill: each layer's weights are read **once** for the whole
+    // prompt (vs. once per token in the old token-major loop), and the token loop
+    // stays in cache. Full-attn layers run the prompt through their per-layer KV
+    // cache in order; DeltaNet layers advance their recurrent state per token.
+    for layer in 0..max_layers {
+        match hybrid_layer_kind(&gen.catalog, layer) {
+            HybridLayerKind::NextN => {
+                static WARN_NEXTN: std::sync::Once = std::sync::Once::new();
+                WARN_NEXTN.call_once(|| {
+                    tracing::warn!(
+                        "blk.{layer}: next-n/MTP layer skipped (not implemented in the streaming path)"
+                    );
+                });
+                continue;
+            }
+            HybridLayerKind::FullAttn if !skip_fa => {
+                // Stage the layer pack into the ping-pong scratch once (host-mapped
+                // views, FFN slices DMA'd to device mirrors) and reuse it for every
+                // prompt token instead of host-uploading the FFN per token.
+                let slot = layer % 2;
+                let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
+                gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
+                for (t, x) in xs.iter_mut().enumerate() {
+                    full_attn_apply(gen, layer, base_pos + t, eps, &pack, x)?;
+                    ffn_apply(
+                        gen,
+                        orch,
+                        Some(scratch),
+                        layer,
+                        eps,
+                        &pack,
+                        Some(&layout),
+                        x,
+                        None,
+                    )?;
+                }
+            }
+            HybridLayerKind::DeltaNet if !skip_dn => {
+                // DeltaNet attention weights are cached resident
+                // (`ensure_deltanet_cache`); only the FFN is read, once.
+                let t0 = Instant::now();
+                let ffn = gen.catalog.load_ffn_matrices(layer)?;
+                gen.io_secs += t0.elapsed().as_secs_f64();
+                gen.io_bytes += (ffn.0.nbytes() + ffn.1.nbytes() + ffn.2.nbytes()) as u64;
+                for x in xs.iter_mut() {
+                    run_deltanet_block(gen, orch, scratch, layer, eps, x, None, Some(&ffn))?;
+                }
+            }
+            _ => {
+                // FFN-only (ablation: attention skipped on this layer kind).
+                let t0 = Instant::now();
+                let ffn = gen.catalog.load_ffn_matrices(layer)?;
+                gen.io_secs += t0.elapsed().as_secs_f64();
+                gen.io_bytes += (ffn.0.nbytes() + ffn.1.nbytes() + ffn.2.nbytes()) as u64;
+                for x in xs.iter_mut() {
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, x, None, Some(&ffn))?;
+                }
+            }
+        }
+    }
+
+    gen.position = base_pos + t_count;
+    let mut all_logits = Vec::with_capacity(t_count);
+    let mut all_hidden = Vec::with_capacity(t_count);
+    for x in xs.iter_mut() {
+        let lg = output_logits(gen, orch, x, eps)?;
+        all_hidden.push(gen.last_hidden_nextn.clone());
+        all_logits.push(lg);
+    }
+    Ok((all_logits, all_hidden))
 }
 
 pub(crate) fn forward_hybrid(
@@ -69,21 +184,71 @@ pub(crate) fn forward_hybrid(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(n_layers)
         .min(n_layers);
+    let mut pre: Option<(usize, std::thread::JoinHandle<Result<FfnMats, hayai_model::GgufError>>)> =
+        None;
     for layer in 0..max_layers {
         let ov = override_ffn.and_then(|o| o.get(layer));
+        // Holds the joined prefetch for this layer so `preloaded` can borrow it.
+        let pre_holder: Option<FfnMats>;
+
+        // Join the prefetch targeting this layer (started one/more layers ago, so
+        // it overlapped the intermediate compute). A prefetch for a later layer is
+        // put back untouched.
+        let preloaded: Option<&FfnMats> = match pre.take() {
+            Some((pl, handle)) if pl == layer => {
+                let mats = handle
+                    .join()
+                    .map_err(|_| StreamInferError::Msg("ffn prefetch thread panicked".into()))??;
+                gen.io_bytes += (mats.0.nbytes() + mats.1.nbytes() + mats.2.nbytes()) as u64;
+                pre_holder = Some(mats);
+                pre_holder.as_ref()
+            }
+            other => {
+                pre = other;
+                None
+            }
+        };
+
+        // Prefetch the next layer that loads its FFN from disk (DeltaNet, or a
+        // FullAttn layer whose attention is skipped). FullAttn layers stage the
+        // whole pack through the ping-pong scratch and need no prefetch here.
+        if pre.is_none() {
+            let next = (layer + 1..max_layers)
+                .find(|&l| needs_ffn_prefetch(&gen.catalog, l, skip_fa));
+            if let Some(next) = next {
+                let mut cat = gen.catalog.fork_reader()?;
+                pre = Some((
+                    next,
+                    std::thread::spawn(move || cat.load_ffn_matrices(next)),
+                ));
+            }
+        }
+
         match hybrid_layer_kind(&gen.catalog, layer) {
-            HybridLayerKind::NextN => continue,
+            HybridLayerKind::NextN => {
+                // MTP / next-n draft head is not executed yet; report it once
+                // instead of silently changing the graph.
+                static WARN_NEXTN: std::sync::Once = std::sync::Once::new();
+                WARN_NEXTN.call_once(|| {
+                    tracing::warn!(
+                        "blk.{layer}: next-n/MTP layer skipped (not implemented in the streaming path)"
+                    );
+                });
+                continue;
+            }
             HybridLayerKind::DeltaNet => {
                 if skip_dn {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
                 } else {
-                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
+                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
                 }
             }
             HybridLayerKind::FullAttn => {
                 if skip_fa {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
                 } else {
+                    // FullAttn stages via scratch; a pending prefetch is for a
+                    // later layer and was retained above.
                     run_full_attn_block(gen, orch, scratch, layer, pos, eps, &mut x, ov)?;
                 }
             }
@@ -103,31 +268,7 @@ pub(crate) fn forward_hybrid(
         }
     }
 
-    let mut xn = x;
-    rms_norm(&mut xn, &gen.output_norm, eps);
-    let vocab = gen.config.vocab_size;
-    let mut logits = vec![0.0f32; vocab];
-    if gen.has_output_weight {
-        if let Some(ow) = &gen.resident_output {
-            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-        } else {
-            let t0 = Instant::now();
-            let ow = gen.catalog.load_quant_matrix("output.weight")?;
-            gen.io_secs += t0.elapsed().as_secs_f64();
-            gen.io_bytes += ow.nbytes() as u64;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-        }
-    } else {
-        if let Some(emb) = &gen.resident_embed {
-            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
-        } else {
-            let t0 = Instant::now();
-            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-            gen.io_secs += t0.elapsed().as_secs_f64();
-            gen.io_bytes += emb.nbytes() as u64;
-            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-        }
-    }
+    let logits = output_logits(gen, orch, &mut x, eps)?;
     gen.position += 1;
     if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
         let at = std::env::var("HAYAI_DUMP_AT_POS")
@@ -137,6 +278,41 @@ pub(crate) fn forward_hybrid(
         if gen.position == at {
             dump_top_logits(&logits, 8);
         }
+    }
+    Ok(logits)
+}
+
+/// Final RMSNorm + LM head projection for one hidden state.
+fn output_logits(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    x: &mut [f32],
+    eps: f32,
+) -> Result<Vec<f32>, StreamInferError> {
+    rms_norm(x, &gen.output_norm, eps);
+    // `t_h_nextn`: post-final-norm hidden consumed by the NextN/MTP draft head.
+    gen.last_hidden_nextn.clear();
+    gen.last_hidden_nextn.extend_from_slice(x);
+    let vocab = gen.config.vocab_size;
+    let mut logits = vec![0.0f32; vocab];
+    if gen.has_output_weight {
+        if let Some(ow) = &gen.resident_output {
+            orch.execute_quant_gemv(ow, x, &mut logits)?;
+        } else {
+            let t0 = Instant::now();
+            let ow = gen.catalog.load_quant_matrix("output.weight")?;
+            gen.io_secs += t0.elapsed().as_secs_f64();
+            gen.io_bytes += ow.nbytes() as u64;
+            orch.execute_quant_gemv(&ow, x, &mut logits)?;
+        }
+    } else if let Some(emb) = &gen.resident_embed {
+        orch.execute_quant_gemv(emb, x, &mut logits)?;
+    } else {
+        let t0 = Instant::now();
+        let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
+        gen.io_secs += t0.elapsed().as_secs_f64();
+        gen.io_bytes += emb.nbytes() as u64;
+        orch.execute_quant_gemv(&emb, x, &mut logits)?;
     }
     Ok(logits)
 }
@@ -179,6 +355,17 @@ pub(crate) fn ensure_deltanet_cache(gen: &mut StreamingGenerator) -> Result<(), 
     Ok(())
 }
 
+/// Whether a layer's FFN is loaded outside the full-pack scratch staging
+/// (`run_deltanet_block` / `run_ffn_only_block`) and can therefore use the
+/// prefetched FFN.
+fn needs_ffn_prefetch(cat: &hayai_model::GgufCatalog, layer: usize, skip_fa: bool) -> bool {
+    match hybrid_layer_kind(cat, layer) {
+        HybridLayerKind::NextN => false,
+        HybridLayerKind::DeltaNet => true,
+        HybridLayerKind::FullAttn => skip_fa,
+    }
+}
+
 /// FFN-only residual block (ablation helper): `x += FFN(rms_norm(x))`.
 fn run_ffn_only_block(
     gen: &mut StreamingGenerator,
@@ -188,20 +375,21 @@ fn run_ffn_only_block(
     eps: f32,
     x: &mut [f32],
     ov: Option<&FfnOverride>,
+    preloaded: Option<&FfnMats>,
 ) -> Result<(), StreamInferError> {
     let h = x.len();
-    let t_io = Instant::now();
-    let gate = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_gate.weight"))?;
-    let up = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_up.weight"))?;
-    let down = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.ffn_down.weight"))?;
-    gen.io_secs += t_io.elapsed().as_secs_f64();
-    gen.io_bytes += (gate.nbytes() + up.nbytes() + down.nbytes()) as u64;
+    // Use the prefetched FFN when available (overlapped with the previous layer);
+    // otherwise read it now into a function-local that stays alive for the call.
+    let loaded: Option<FfnMats> = if preloaded.is_none() {
+        let t_io = Instant::now();
+        let m = gen.catalog.load_ffn_matrices(layer)?;
+        gen.io_secs += t_io.elapsed().as_secs_f64();
+        gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
+        Some(m)
+    } else {
+        None
+    };
+    let m: &FfnMats = preloaded.or(loaded.as_ref()).expect("ffn present");
 
     let mut xn = x.to_vec();
     rms_norm(&mut xn, &gen.layer_norms[layer].ffn_norm, eps);
@@ -209,27 +397,28 @@ fn run_ffn_only_block(
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
     let t_ffn = Instant::now();
+    let sparse = m.3.is_some() || m.4.is_some() || m.5.is_some();
     let has_ov = ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false);
-    if has_ov {
+    if sparse || has_ov {
         let pack = hayai_model::LayerWeightPack {
-            wq: gate.clone(),
-            wk: gate.clone(),
-            wv: gate.clone(),
-            wo: gate.clone(),
-            gate,
-            up,
-            down,
+            wq: m.0.clone(),
+            wk: m.0.clone(),
+            wv: m.0.clone(),
+            wo: m.0.clone(),
+            gate: m.0.clone(),
+            up: m.1.clone(),
+            down: m.2.clone(),
             attn_gate: None,
-            gate_csr: None,
-            up_csr: None,
-            down_csr: None,
+            gate_csr: m.3.clone(),
+            up_csr: m.4.clone(),
+            down_csr: m.5.clone(),
         };
         gen.run_ffn_block(orch, &pack, &xn, ov)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
-            &gate,
-            &up,
+            &m.0,
+            &m.1,
             &xn,
             &mut gen.ws_gate,
             &mut gen.ws_up,
@@ -242,7 +431,7 @@ fn run_ffn_only_block(
         ffn_finish_scratch(
             orch,
             inflight,
-            &down,
+            &m.2,
             &mut gen.ws_gate,
             &mut gen.ws_up,
             &mut gen.ws_down,
@@ -268,6 +457,7 @@ fn run_deltanet_block(
     eps: f32,
     x: &mut [f32],
     ov: Option<&FfnOverride>,
+    preloaded: Option<&FfnMats>,
 ) -> Result<(), StreamInferError> {
     let h = x.len();
     // Norm + DeltaNet residual
@@ -309,13 +499,20 @@ fn run_deltanet_block(
     }
     gen.attn_secs += t0.elapsed().as_secs_f64();
 
-    // FFN via WeightIo (owned matrices — DeltaNet layers have no attn_q pack).
+    // FFN via WeightIo (owned matrices - DeltaNet layers have no attn_q pack).
     // Los bloques dispersos embebidos (D16) cargan con CSR.
-    let t_io = Instant::now();
-    let (gate, up, down, gate_csr, up_csr, down_csr) =
-        gen.catalog.load_ffn_matrices(layer)?;
-    gen.io_secs += t_io.elapsed().as_secs_f64();
-    gen.io_bytes += (gate.nbytes() + up.nbytes() + down.nbytes()) as u64;
+    // Use the prefetched FFN when available (overlapped with the previous layer);
+    // otherwise read it once into a function-local that outlives all uses.
+    let loaded: Option<FfnMats> = if preloaded.is_none() {
+        let t_io = Instant::now();
+        let m = gen.catalog.load_ffn_matrices(layer)?;
+        gen.io_secs += t_io.elapsed().as_secs_f64();
+        gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
+        Some(m)
+    } else {
+        None
+    };
+    let m: &FfnMats = preloaded.or(loaded.as_ref()).expect("ffn present");
 
     let mut xn = x.to_vec();
     rms_norm(&mut xn, &gen.layer_norms[layer].ffn_norm, eps);
@@ -327,29 +524,29 @@ fn run_deltanet_block(
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
     let t_ffn = Instant::now();
-    if gate_csr.is_some() || up_csr.is_some() || down_csr.is_some()
+    if m.3.is_some() || m.4.is_some() || m.5.is_some()
         || ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false)
     {
         // FFN disperso embebido (D16) u override de evolución: CSR.
         let pack = hayai_model::LayerWeightPack {
-            wq: gate.clone(),
-            wk: gate.clone(),
-            wv: gate.clone(),
-            wo: gate.clone(),
-            gate,
-            up,
-            down,
+            wq: m.0.clone(),
+            wk: m.0.clone(),
+            wv: m.0.clone(),
+            wo: m.0.clone(),
+            gate: m.0.clone(),
+            up: m.1.clone(),
+            down: m.2.clone(),
             attn_gate: None,
-            gate_csr,
-            up_csr,
-            down_csr,
+            gate_csr: m.3.clone(),
+            up_csr: m.4.clone(),
+            down_csr: m.5.clone(),
         };
         gen.run_ffn_block(orch, &pack, &xn, ov)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
-            &gate,
-            &up,
+            &m.0,
+            &m.1,
             &xn,
             &mut gen.ws_gate,
             &mut gen.ws_up,
@@ -362,7 +559,7 @@ fn run_deltanet_block(
         ffn_finish_scratch(
             orch,
             inflight,
-            &down,
+            &m.2,
             &mut gen.ws_gate,
             &mut gen.ws_up,
             &mut gen.ws_down,
@@ -394,11 +591,34 @@ fn run_full_attn_block(
     x: &mut [f32],
     ov: Option<&FfnOverride>,
 ) -> Result<(), StreamInferError> {
-    let h = x.len();
     let slot = layer % 2;
     let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
     gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
+    full_attn_apply(gen, layer, pos, eps, &pack, x)?;
+    gen.finish_ffn_unmap(orch, scratch, slot)?;
+    ffn_apply(
+        gen,
+        orch,
+        Some(scratch),
+        layer,
+        eps,
+        &pack,
+        Some(&layout),
+        x,
+        ov,
+    )
+}
 
+/// Attention residual for one full-attention token: `x += Wo·attn(Q,K,V)`.
+pub(crate) fn full_attn_apply(
+    gen: &mut StreamingGenerator,
+    layer: usize,
+    pos: usize,
+    eps: f32,
+    pack: &hayai_model::LayerWeightPack,
+    x: &mut [f32],
+) -> Result<(), StreamInferError> {
+    let h = x.len();
     let t_attn = Instant::now();
     let mut xn = x.to_vec();
     rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
@@ -474,20 +694,37 @@ fn run_full_attn_block(
         x[i] += attn_proj[i];
     }
     gen.attn_secs += t_attn.elapsed().as_secs_f64();
+    // Optional depthwise causal short-conv residual (generic `Conv` op).
+    gen.apply_conv(layer, x)?;
+    Ok(())
+}
 
+/// FFN residual for one token. `scratch` selects the staged/DMA device path;
+/// `None` runs the FFN from host-owned bytes (used by layer-major prefill).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ffn_apply(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    scratch: Option<&mut StreamingScratch>,
+    layer: usize,
+    eps: f32,
+    pack: &hayai_model::LayerWeightPack,
+    layout: Option<&hayai_model::LayerPackLayout>,
+    x: &mut [f32],
+    ov: Option<&FfnOverride>,
+) -> Result<(), StreamInferError> {
+    let h = x.len();
     let mut xn = x.to_vec();
     rms_norm(&mut xn, &gen.layer_norms[layer].ffn_norm, eps);
     gen.ws_gate.fill(0.0);
     gen.ws_up.fill(0.0);
     gen.ws_down.fill(0.0);
-    gen.finish_ffn_unmap(orch, scratch, slot)?;
     let t_ffn = Instant::now();
-    let sparse_ffn =
-        pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
+    let sparse_ffn = pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
     let has_ov = ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false);
     if sparse_ffn || has_ov {
         // FFN disperso embebido (D16) u override de evolución: CSR.
-        gen.run_ffn_block(orch, &pack, &xn, ov)?;
+        gen.run_ffn_block(orch, pack, &xn, ov)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
@@ -498,9 +735,9 @@ fn run_full_attn_block(
             &mut gen.ws_up,
             &mut gen.used_dgpu,
             &mut gen.used_apu,
-            Some(scratch),
+            scratch.as_deref(),
             layer,
-            Some(&layout),
+            layout,
         )?;
         ffn_finish_scratch(
             orch,
@@ -510,16 +747,15 @@ fn run_full_attn_block(
             &mut gen.ws_up,
             &mut gen.ws_down,
             &mut gen.used_dgpu,
-            Some(scratch),
+            scratch.as_deref(),
             layer,
-            Some(&layout),
+            layout,
         )?;
     }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
     }
-    let _ = pack;
     Ok(())
 }
 
@@ -549,6 +785,7 @@ fn apply_head_rmsnorm(
 /// candidato — agnóstico a la arquitectura híbrida (qwen35/qwen27). Reutiliza
 /// `run_deltanet_block` / `run_full_attn_block` intercambiando el estado del
 /// generador por el del candidato (el bloque validado se ejecuta sin cambios).
+#[allow(dead_code)]
 pub(crate) fn forward_batched_hybrid(
     gen: &mut StreamingGenerator,
     orch: &mut EngineOrchestrator,
@@ -597,7 +834,7 @@ pub(crate) fn forward_batched_hybrid(
             }
             match hybrid_layer_kind(&gen.catalog, layer) {
                 HybridLayerKind::DeltaNet => {
-                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x[c], Some(&ov))?;
+                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x[c], Some(&ov), None)?;
                 }
                 HybridLayerKind::FullAttn => {
                     run_full_attn_block(gen, orch, scratch, layer, pos, eps, &mut x[c], Some(&ov))?;

@@ -31,9 +31,12 @@ pub enum TransferPath {
 /// Choose the Phase-1 streaming transfer strategy for a discovered device.
 pub fn select_transfer_path(info: &OpenClDeviceInfo) -> TransferPath {
     match info.device_kind {
+        // Unified-memory devices (APU/superchip) are first-class zero-copy.
+        DeviceKind::Apu if info.supports_svm => TransferPath::SvmZeroCopy,
         DeviceKind::IntegratedGpu if info.supports_svm => TransferPath::SvmZeroCopy,
         DeviceKind::DiscreteGpu => TransferPath::PinnedDma,
         DeviceKind::CpuOpenCl => TransferPath::HostRam,
+        // Accelerator/NPU via OpenCL: zero-copy when SVM is available.
         _ if info.supports_svm => TransferPath::SvmZeroCopy,
         _ => TransferPath::PinnedDma,
     }
@@ -320,6 +323,14 @@ impl OwnedSvmBuffer {
             coarse,
             fine_grain_system
         );
+        // Retain the raw `cl_context`: this buffer can outlive the engine that
+        // created it (e.g. `GenerationSession`'s fields drop before its `orch`
+        // mutex). Without an explicit retain, `Drop` could call `clSVMFree` /
+        // `clReleaseContext` on a destroyed context.
+        unsafe {
+            cl3::context::retain_context(engine.context.get())
+                .map_err(|e| OpenClError::ClError(format!("retain context: {e}")))?;
+        }
         Ok(Self {
             ptr,
             size_bytes,
@@ -335,12 +346,18 @@ impl OwnedSvmBuffer {
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        debug_assert!(self.mapped || !self.coarse);
+        assert!(
+            self.mapped || !self.coarse,
+            "OwnedSvmBuffer::as_mut_slice on a coarse SVM region that is not host-mapped"
+        );
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size_bytes) }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        debug_assert!(self.mapped || !self.coarse);
+        assert!(
+            self.mapped || !self.coarse,
+            "OwnedSvmBuffer::as_slice on a coarse SVM region that is not host-mapped"
+        );
         unsafe { std::slice::from_raw_parts(self.ptr, self.size_bytes) }
     }
 
@@ -390,6 +407,10 @@ impl Drop for OwnedSvmBuffer {
             unsafe {
                 let _ = svm_free(self.context, self.ptr as *mut c_void);
             }
+        }
+        // Balance the `retain_context` taken in `OwnedSvmBuffer::new`.
+        unsafe {
+            let _ = cl3::context::release_context(self.context);
         }
         self.ptr = ptr::null_mut();
     }

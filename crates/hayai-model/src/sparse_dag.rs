@@ -90,15 +90,29 @@ pub fn load_sparse_dag(cat: &mut GgufCatalog) -> Result<Option<SparseDagBlock>, 
 
     // R1: la adyacencia es un bit-tensor de bytes; leer `dims[0]` bytes crudos.
     let adj_len = adj_info.dims.first().copied().unwrap_or(0) as usize;
+    if adj_len as u64 > cat.file_size() {
+        return Err(GgufError::Msg(
+            "sparse DAG adjacency size exceeds the file size".into(),
+        ));
+    }
     let mut adjacency = vec![0u8; adj_len];
     let abs = cat.tensor_abs_offset(&adj_info);
     cat.read_raw_at(abs, &mut adjacency)?;
 
     // Pesos activos en F32 (tipo correcto → `read_tensor_into` es seguro).
-    let mut w_buf = vec![0u8; crate::tensor_nbytes(&w_info)?];
+    let w_nbytes = crate::tensor_nbytes(&w_info)?;
+    if w_nbytes % 4 != 0 {
+        return Err(GgufError::Msg(
+            "sparse DAG weights payload is not a multiple of 4 bytes".into(),
+        ));
+    }
+    let mut w_buf = vec![0u8; w_nbytes];
     cat.read_tensor_into(TENSOR_WEIGHTS, &mut w_buf)?;
     let mut weights = vec![0.0f32; w_buf.len() / 4];
-    bytemuck::cast_slice_mut(&mut weights[..]).copy_from_slice(&w_buf);
+    for (i, chunk) in w_buf.chunks_exact(4).enumerate() {
+        weights[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+    }
+    validate_sparse_block(&adjacency, &weights, d_in, d_out)?;
 
     Ok(Some(SparseDagBlock {
         d_in,
@@ -108,6 +122,34 @@ pub fn load_sparse_dag(cat: &mut GgufCatalog) -> Result<Option<SparseDagBlock>, 
         adjacency,
         weights,
     }))
+}
+
+/// Validate that a sparse block's bit-tensor and weight vector agree with the
+/// declared `d_in × d_out` shape. Shared by the loaders so `sparse_dag_to_csr`
+/// can rely on consistent input.
+fn validate_sparse_block(
+    adjacency: &[u8],
+    weights: &[f32],
+    d_in: usize,
+    d_out: usize,
+) -> Result<(), GgufError> {
+    let total = d_in
+        .checked_mul(d_out)
+        .ok_or_else(|| GgufError::Msg("sparse DAG d_in*d_out overflow".into()))?;
+    if total > adjacency.len().saturating_mul(8) {
+        return Err(GgufError::Msg(format!(
+            "sparse DAG adjacency has {} bytes, too small for {d_in}x{d_out}",
+            adjacency.len()
+        )));
+    }
+    let active: usize = adjacency.iter().map(|b| b.count_ones() as usize).sum();
+    if active != weights.len() {
+        return Err(GgufError::Msg(format!(
+            "sparse DAG weight count {} != {active} active connections",
+            weights.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Carga un bloque disperso **embebido** en un GGUF completo (formato D16 de
@@ -127,8 +169,18 @@ pub fn load_embedded_block(
     let adj_info = gguf.tensor(&adj_name)?;
     let w_info = gguf.tensor(&w_name)?;
     let adj_len = adj_info.dims.first().copied().unwrap_or(0) as usize;
-    let mut adjacency = vec![0u8; adj_len];
-    adjacency.copy_from_slice(&gguf.tensor_bytes(adj_info)?[..adj_len]);
+    // The producer may misreport the adjacency type (R1), so `tensor_nbytes` can
+    // be smaller than `dims[0]`. Read the raw `dims[0]` bytes from the mmap and
+    // bounds-check the range instead of slicing the reported tensor extent.
+    let (adj_start, _) = gguf.tensor_range(adj_info)?;
+    let adj_end = adj_start
+        .checked_add(adj_len)
+        .ok_or_else(|| GgufError::Msg("sparse adjacency range overflow".into()))?;
+    let adjacency = gguf
+        .mmap_bytes()
+        .get(adj_start..adj_end)
+        .ok_or_else(|| GgufError::Truncated("sparse adjacency out of bounds"))?
+        .to_vec();
 
     let w_bytes = gguf.tensor_bytes(w_info)?;
     let mut weights = vec![0.0f32; w_bytes.len() / 4];
@@ -137,9 +189,12 @@ pub fn load_embedded_block(
     }
 
     let m = |k: &str| gguf.meta_u32(&format!("saor.{base}.{k}"));
+    let d_in = m("d_in").unwrap_or(0) as usize;
+    let d_out = m("d_out").unwrap_or(0) as usize;
+    validate_sparse_block(&adjacency, &weights, d_in, d_out)?;
     Ok(Some(SparseDagBlock {
-        d_in: m("d_in").unwrap_or(0) as usize,
-        d_out: m("d_out").unwrap_or(0) as usize,
+        d_in,
+        d_out,
         tau: gguf.meta_f32(&format!("saor.{base}.tau")).unwrap_or(0.0),
         genome: Vec::new(),
         adjacency,
@@ -152,20 +207,40 @@ pub fn load_embedded_block(
 /// conexiones vivas). Filas del CSR = salidas `j`, columnas = entradas `i`.
 ///
 /// Espejo de `saor_domain::topology::Topology::to_csr`.
+///
+/// # Panics
+/// Panics if the inputs are inconsistent (adjacency too small or weight count
+/// mismatched). Use [`try_sparse_dag_to_csr`] for untrusted input.
 pub fn sparse_dag_to_csr(
     adjacency: &[u8],
     weights: &[f32],
     d_in: usize,
     d_out: usize,
 ) -> (Vec<i32>, Vec<i32>, Vec<f32>) {
-    let total = d_in * d_out;
+    try_sparse_dag_to_csr(adjacency, weights, d_in, d_out)
+        .expect("sparse_dag_to_csr: inconsistent sparse block (use try_sparse_dag_to_csr)")
+}
+
+/// Fallible CSR conversion: validates the bit-tensor length and the weight count
+/// against `d_in × d_out` before indexing anything, so a malformed GGUF yields a
+/// clean error instead of an out-of-bounds panic.
+pub fn try_sparse_dag_to_csr(
+    adjacency: &[u8],
+    weights: &[f32],
+    d_in: usize,
+    d_out: usize,
+) -> Result<(Vec<i32>, Vec<i32>, Vec<f32>), GgufError> {
+    let total = d_in
+        .checked_mul(d_out)
+        .ok_or_else(|| GgufError::Msg("sparse DAG d_in*d_out overflow".into()))?;
+    validate_sparse_block(adjacency, weights, d_in, d_out)?;
     // Peso por conexión `conn`, para iterar en orden j-mayor sin desordenar valores.
     let mut weight_by_conn = vec![0.0f32; total];
     let mut w_idx = 0usize;
     for i in 0..d_in {
         for j in 0..d_out {
             let conn = i * d_out + j;
-            if conn < total && (adjacency[conn / 8] & (1 << (conn % 8))) != 0 {
+            if (adjacency[conn / 8] & (1 << (conn % 8))) != 0 {
                 weight_by_conn[conn] = weights[w_idx];
                 w_idx += 1;
             }
@@ -177,14 +252,14 @@ pub fn sparse_dag_to_csr(
     for j in 0..d_out {
         for i in 0..d_in {
             let conn = i * d_out + j;
-            if conn < total && (adjacency[conn / 8] & (1 << (conn % 8))) != 0 {
+            if (adjacency[conn / 8] & (1 << (conn % 8))) != 0 {
                 col_idx.push(i as i32);
                 vals.push(weight_by_conn[conn]);
             }
         }
         row_ptr[j + 1] = col_idx.len() as i32;
     }
-    (row_ptr, col_idx, vals)
+    Ok((row_ptr, col_idx, vals))
 }
 
 /// SpMM CSR de referencia (CPU): `Y[b][j] = sum_k X[b][col[k]] * val[k]`.
@@ -358,6 +433,16 @@ mod tests {
         let r = load_sparse_dag(&mut cat).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn try_to_csr_rejects_inconsistent_input() {
+        // Bit-tensor too small for d_in*d_out.
+        assert!(try_sparse_dag_to_csr(&[0u8], &[], 4, 4).is_err());
+        // Active bit count != weight count.
+        let adj = [0b0000_0001u8];
+        assert!(try_sparse_dag_to_csr(&adj, &[1.0, 2.0], 4, 2).is_err());
+        assert!(try_sparse_dag_to_csr(&adj, &[1.0], 4, 2).is_ok());
     }
 
     #[test]

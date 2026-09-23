@@ -58,6 +58,10 @@ pub struct StreamingScratch {
     /// Which block (1-based) is currently staged in each ping-pong slot
     /// (macro-chunk only). `0` = slot empty / stale.
     pub block_staged: [usize; 2],
+    /// In-flight `WriteBufferRect` DMAs reading from host memory into device
+    /// mirrors. They must complete before the host region they read is
+    /// overwritten (`prepare_host_write`) or unmapped/for device use.
+    dma_inflight: Vec<opencl3::event::Event>,
 }
 
 /// How a pool device should bind weights for Base+Offset GEMV.
@@ -98,6 +102,7 @@ impl StreamingScratch {
                     resident_layers: 0,
                     block_k: k_chunk,
                     block_staged: [0, 0],
+                    dma_inflight: Vec::new(),
                 },
             ));
         }
@@ -128,7 +133,7 @@ impl StreamingScratch {
                 }
                 (Err(e), _) | (_, Err(e)) => {
                     warn!("SVM host base failed ({e}); pinned fallback on primary");
-                    let prim = pool.primary();
+                    let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
                     (
                         TransferPath::PinnedDma,
                         HostBase::Pinned {
@@ -141,7 +146,7 @@ impl StreamingScratch {
                 }
             }
         } else {
-            let prim = pool.primary();
+            let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
             info!(
                 "HeteroScratch host base: pinned on {} (no SVM in pool)",
                 prim.device_info.device_name
@@ -161,6 +166,16 @@ impl StreamingScratch {
         for eng in pool.engines.iter().filter(|e| {
             e.device_info.device_kind == DeviceKind::DiscreteGpu
         }) {
+            if !mirror_fits(eng, slot_bytes) {
+                warn!(
+                    "Skipping VRAM mirror on {} ({} KiB > max alloc {} KiB); \
+                     that device will use host-upload FFN",
+                    eng.device_info.device_name,
+                    slot_bytes / 1024,
+                    eng.device_info.max_alloc_size / 1024
+                );
+                continue;
+            }
             dgpu_mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
                 slots: [
@@ -178,14 +193,22 @@ impl StreamingScratch {
         // Pinned host has no SVM bind path — every FFN device needs a VRAM/device mirror.
         if dgpu_mirrors.is_empty() {
             if let HostBase::Pinned { .. } = &host {
-                let prim = pool.primary();
-                dgpu_mirrors.push(DgpuMirror {
-                    device_id: prim.device_info.device_id,
-                    slots: [
-                        DeviceLayerBuffer::new(prim, slot_bytes)?,
-                        DeviceLayerBuffer::new(prim, slot_bytes)?,
-                    ],
-                });
+                if let Some(prim) = pool.primary() {
+                    if mirror_fits(prim, slot_bytes) {
+                        dgpu_mirrors.push(DgpuMirror {
+                            device_id: prim.device_info.device_id,
+                            slots: [
+                                DeviceLayerBuffer::new(prim, slot_bytes)?,
+                                DeviceLayerBuffer::new(prim, slot_bytes)?,
+                            ],
+                        });
+                    } else {
+                        warn!(
+                            "No VRAM mirror fits on {}; FFN will use host-upload",
+                            prim.device_info.device_name
+                        );
+                    }
+                }
             }
         }
 
@@ -200,6 +223,7 @@ impl StreamingScratch {
                 resident_layers: 0,
                 block_k: k_chunk,
                 block_staged: [0, 0],
+                dma_inflight: Vec::new(),
             },
         ))
     }
@@ -229,6 +253,7 @@ impl StreamingScratch {
                     resident_layers: n_layers,
                     block_k: 1,
                     block_staged: [0, 0],
+                    dma_inflight: Vec::new(),
                 },
             ));
         }
@@ -248,8 +273,10 @@ impl StreamingScratch {
                     let mut mirrors = Self::resident_mirrors(pool, total)?;
                     // Pinned-host fallback not needed here (SVM covers primary FFN).
                     if mirrors.is_empty() {
-                        let prim = pool.primary();
-                        if prim.device_info.device_kind == DeviceKind::DiscreteGpu {
+                        let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
+                        if prim.device_info.device_kind == DeviceKind::DiscreteGpu
+                            && mirror_fits(prim, total)
+                        {
                             mirrors.push(DgpuMirror {
                                 device_id: prim.device_info.device_id,
                                 slots: [
@@ -257,6 +284,12 @@ impl StreamingScratch {
                                     DeviceLayerBuffer::new(prim, 1)?,
                                 ],
                             });
+                        } else if prim.device_info.device_kind == DeviceKind::DiscreteGpu {
+                            warn!(
+                                "Resident: {} cannot mirror {} MiB; using host-upload FFN",
+                                prim.device_info.device_name,
+                                total / (1024 * 1024)
+                            );
                         }
                     }
                     return Ok((
@@ -273,6 +306,7 @@ impl StreamingScratch {
                             resident_layers: n_layers,
                             block_k: 1,
                             block_staged: [0, 0],
+                    dma_inflight: Vec::new(),
                         },
                     ));
                 }
@@ -282,9 +316,9 @@ impl StreamingScratch {
             }
         }
 
-        let prim = pool.primary();
+        let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
         let mut mirrors = Self::resident_mirrors(pool, total)?;
-        if mirrors.is_empty() {
+        if mirrors.is_empty() && mirror_fits(prim, total) {
             mirrors.push(DgpuMirror {
                 device_id: prim.device_info.device_id,
                 slots: [
@@ -315,6 +349,7 @@ impl StreamingScratch {
                 resident_layers: n_layers,
                 block_k: 1,
                 block_staged: [0, 0],
+                dma_inflight: Vec::new(),
             },
         ))
     }
@@ -328,6 +363,16 @@ impl StreamingScratch {
         for eng in pool.engines.iter().filter(|e| {
             e.device_info.device_kind == DeviceKind::DiscreteGpu
         }) {
+            if !mirror_fits(eng, total) {
+                warn!(
+                    "Resident: skipping VRAM mirror on {} ({} MiB > max alloc {} MiB); \
+                     that device will use host-upload FFN",
+                    eng.device_info.device_name,
+                    total / (1024 * 1024),
+                    eng.device_info.max_alloc_size / (1024 * 1024)
+                );
+                continue;
+            }
             mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
                 slots: [
@@ -361,6 +406,7 @@ impl StreamingScratch {
                     resident_layers: 0,
                     block_k: 1,
                     block_staged: [0, 0],
+                    dma_inflight: Vec::new(),
                 },
             ));
         };
@@ -394,6 +440,7 @@ impl StreamingScratch {
                             resident_layers: 0,
                             block_k: 1,
                             block_staged: [0, 0],
+                    dma_inflight: Vec::new(),
                         },
                     ));
                 }
@@ -429,6 +476,7 @@ impl StreamingScratch {
                 resident_layers: 0,
                 block_k: 1,
                 block_staged: [0, 0],
+                dma_inflight: Vec::new(),
             },
         ))
     }
@@ -545,12 +593,24 @@ impl StreamingScratch {
         self.slot_capacity()
     }
 
+    /// Wait on and clear every in-flight host→device mirror DMA. Called before a
+    /// host region is overwritten or remapped.
+    fn wait_dma(&mut self) {
+        for ev in self.dma_inflight.drain(..) {
+            if let Err(e) = ev.wait() {
+                tracing::warn!("DMA event wait failed: {e}");
+            }
+        }
+    }
+
     /// Map SVM (if any) so the host can write/read the layer pack (Attn CPU GEMV).
     pub fn prepare_host_write(
         &mut self,
         pool: &OpenClDevicePool,
         idx: usize,
     ) -> Result<(), OpenClError> {
+        // Never overwrite host bytes a pending mirror DMA is still reading.
+        self.wait_dma();
         if self.resident {
             // idx = layer index; map the whole resident base once.
             if let HostBase::Svm { slots, owner_id } = &mut self.host {
@@ -606,40 +666,24 @@ impl StreamingScratch {
             // Every layer was DMA'd into the dGPU mirrors once at preload (`fill_layer`).
             return Ok(());
         }
-        let slot = self.slot_for(idx);
-        let n = layout.total.min(self.slot_len(slot));
+        // `idx` is the **layer index**: in macro-chunk the layer lives at an in-block
+        // offset inside its block slot, so both the host base and the mirror
+        // destination must be resolved from `idx` (not from the block slot).
+        let n = layout.total.min(self.slot_len(idx));
         let ffn_base = layout.gate_off.min(n);
-        self.dma_ffn_slices_mapped(pool, slot, layout, ffn_base, n)
+        self.dma_ffn_slices_mapped(pool, idx, layout, ffn_base, n)
     }
 
     /// Unmap SVM so the device can consume the slot (call after Attn, before FFN enqueue).
     pub fn unmap_host_for_device(
         &mut self,
-        pool: &OpenClDevicePool,
-        idx: usize,
+        _pool: &OpenClDevicePool,
+        _idx: usize,
     ) -> Result<(), OpenClError> {
-        if self.resident {
-            if let HostBase::Svm { slots, owner_id } = &mut self.host {
-                if let Some(apu) = pool
-                    .engines
-                    .iter()
-                    .find(|e| e.device_info.device_id == *owner_id)
-                {
-                    slots[0].prepare_for_device(apu)?;
-                }
-            }
-            return Ok(());
-        }
-        let slot = self.slot_for(idx);
-        if let HostBase::Svm { slots, owner_id } = &mut self.host {
-            if let Some(apu) = pool
-                .engines
-                .iter()
-                .find(|e| e.device_info.device_id == *owner_id)
-            {
-                slots[slot].prepare_for_device(apu)?;
-            }
-        }
+        // The host slot stays mapped for the whole session: CPU attention reads it
+        // and the device never binds a coarse SVM pointer (`weight_bind` rejects
+        // coarse owners in favour of the mirror / host-upload). Fine-grain SVM
+        // needs no unmap either. So this is intentionally a no-op.
         Ok(())
     }
 
@@ -687,9 +731,10 @@ impl StreamingScratch {
         }
         let host_bytes = self.host_slot(slot)[..n].to_vec();
         if let Some(eng) = engine {
+            let mut events: Vec<opencl3::event::Event> = Vec::new();
             for mirror in &mut self.dgpu_mirrors {
                 if mirror.device_id == eng.device_info.device_id {
-                    unsafe {
+                    let ev = unsafe {
                         eng.queue
                             .enqueue_write_buffer(
                                 &mut mirror.slots[slot].cl_buffer,
@@ -700,9 +745,14 @@ impl StreamingScratch {
                             )
                             .map_err(|e| {
                                 OpenClError::ClError(format!("dGPU DMA WriteBuffer: {e}"))
-                            })?;
-                    }
+                            })?
+                    };
+                    events.push(ev);
                 }
+            }
+            // `host_bytes` is dropped at the end of this call: wait before that.
+            for ev in events {
+                let _ = ev.wait();
             }
         }
         Ok(())
@@ -712,27 +762,33 @@ impl StreamingScratch {
     fn dma_ffn_slices_mapped(
         &mut self,
         pool: &OpenClDevicePool,
-        slot: usize,
+        idx: usize,
         layout: &LayerPackLayout,
         ffn_base: usize,
         n: usize,
     ) -> Result<(), OpenClError> {
         // Collect (device_id, dest_off, host_off, len) while we can borrow host immutably,
         // then issue WriteBufferRect with raw pointers into the mapped slot.
-        let host_ptr = self.host_slot(slot).as_ptr();
+        // `host_slot(idx)` already points at this layer's region (in-block offset for
+        // macro-chunk), so host offsets stay layer-local; the mirror destination adds
+        // `weight_offset(idx, 0)` to place the layer inside its block mirror.
+        let host_ptr = self.host_slot(idx).as_ptr();
+        let mirror_slot = self.slot_for(idx);
+        let dest_base = self.weight_offset(idx, 0);
         let mut jobs: Vec<(cl_device_id, usize, usize, usize)> = Vec::new();
         for mirror in &self.dgpu_mirrors {
             for role in 0..3usize {
-                if pool.for_role(role).device_info.device_id != mirror.device_id {
+                if pool.for_role(role).map(|e| e.device_info.device_id) != Some(mirror.device_id) {
                     continue;
                 }
                 let (off, len) = layout.ffn_region(role);
                 if len == 0 || off < ffn_base || off + len > n {
                     continue;
                 }
-                jobs.push((mirror.device_id, off, off, len));
+                jobs.push((mirror.device_id, dest_base + off, off, len));
             }
         }
+        let mut events: Vec<opencl3::event::Event> = Vec::new();
         for (dev_id, dest_off, host_off, len) in jobs {
             let Some(eng) = pool
                 .engines
@@ -749,9 +805,16 @@ impl StreamingScratch {
                 continue;
             };
             let host = unsafe { std::slice::from_raw_parts(host_ptr.add(host_off), len) };
-            dma_write_rect(eng, &mut mirror.slots[slot].cl_buffer, dest_off, host)?;
+            if let Some(ev) = dma_write_rect(
+                eng,
+                &mut mirror.slots[mirror_slot].cl_buffer,
+                dest_off,
+                host,
+            )? {
+                events.push(ev);
+            }
         }
-        let _ = ffn_base;
+        self.dma_inflight.extend(events);
         Ok(())
     }
 
@@ -760,8 +823,13 @@ impl StreamingScratch {
     pub fn weight_bind(&self, eng: &OpenClEngine, slot: usize) -> Result<WeightBind<'_>, OpenClError> {
         if self.resident {
             // Resident: single base allocation; `slot` is the layer index.
+            // Only a **fine-grain** SVM owner can be read by the device while the
+            // host mapping stays live. A coarse owner falls through to the mirror
+            // (dGPU) or to host-upload (the `begin_gemv_from_scratch` fallback).
             if let HostBase::Svm { slots, owner_id } = &self.host {
-                if eng.device_info.device_id == *owner_id {
+                if eng.device_info.device_id == *owner_id
+                    && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
+                {
                     return Ok(WeightBind::Svm {
                         ptr: slots[0].as_ptr(),
                     });
@@ -783,7 +851,12 @@ impl StreamingScratch {
         }
         let slot = if self.resident { 0 } else { self.slot_for(slot) };
         if let HostBase::Svm { slots, owner_id } = &self.host {
-            if eng.device_info.device_id == *owner_id {
+            // Only a fine-grain owner can be read by the device while the host
+            // mapping stays live. A coarse owner falls through to the mirror
+            // (dGPU) or host-upload, so the slot never needs to be unmapped.
+            if eng.device_info.device_id == *owner_id
+                && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
+            {
                 return Ok(WeightBind::Svm {
                     ptr: slots[slot].as_ptr(),
                 });
@@ -853,6 +926,7 @@ impl StreamingScratch {
         let (host_ptr, _total) = self.host_base_ptr_len();
         let stride = self.resident_stride;
         let base_off = layer.saturating_mul(stride);
+        let mut events: Vec<opencl3::event::Event> = Vec::new();
         for mirror in self.dgpu_mirrors.iter_mut() {
             let Some(eng) = pool
                 .engines
@@ -864,8 +938,11 @@ impl StreamingScratch {
             // SAFETY: host_ptr points into the resident base owned by `self`, which
             // outlives this call; the base stays host-visible while mapped above.
             let src = unsafe { std::slice::from_raw_parts(host_ptr.add(base_off), total) };
-            dma_write_rect(eng, &mut mirror.slots[0].cl_buffer, base_off, src)?;
+            if let Some(ev) = dma_write_rect(eng, &mut mirror.slots[0].cl_buffer, base_off, src)? {
+                events.push(ev);
+            }
         }
+        self.dma_inflight.extend(events);
         Ok(())
     }
 
@@ -887,19 +964,27 @@ impl StreamingScratch {
     }
 }
 
+/// A device VRAM mirror must fit in a single allocation
+/// (`CL_DEVICE_MAX_MEM_ALLOC_SIZE`). Devices that cannot hold it are skipped and
+/// fall back to per-GEMV host upload in `begin_gemv_from_scratch`.
+fn mirror_fits(eng: &OpenClEngine, bytes: usize) -> bool {
+    let max = eng.device_info.max_alloc_size;
+    max == 0 || bytes as u64 <= max
+}
+
 fn dma_write_rect(
     eng: &OpenClEngine,
     dest: &mut Buffer<cl_uchar>,
     dest_off: usize,
     host: &[u8],
-) -> Result<(), OpenClError> {
+) -> Result<Option<opencl3::event::Event>, OpenClError> {
     if host.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let buffer_origin: [size_t; 3] = [dest_off as size_t, 0, 0];
     let host_origin: [size_t; 3] = [0, 0, 0];
     let region: [size_t; 3] = [host.len() as size_t, 1, 1];
-    unsafe {
+    let event = unsafe {
         eng.queue
             .enqueue_write_buffer_rect(
                 dest,
@@ -914,7 +999,83 @@ fn dma_write_rect(
                 host.as_ptr() as *mut c_void,
                 &[],
             )
-            .map_err(|e| OpenClError::ClError(format!("dGPU WriteBufferRect: {e}")))?;
+            .map_err(|e| OpenClError::ClError(format!("dGPU WriteBufferRect: {e}")))?
+    };
+    Ok(Some(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_scratch(stride: usize, k: usize, resident: bool) -> StreamingScratch {
+        let slot_bytes = if resident { stride } else { stride * k };
+        StreamingScratch {
+            host: HostBase::Host {
+                slots: [
+                    AlignedBuffer::zeroed(slot_bytes),
+                    AlignedBuffer::zeroed(slot_bytes),
+                ],
+            },
+            dgpu_mirrors: Vec::new(),
+            path: TransferPath::HostRam,
+            resident,
+            resident_stride: stride,
+            resident_layers: if resident { 1 } else { 0 },
+            block_k: k,
+            block_staged: [0, 0],
+            dma_inflight: Vec::new(),
+        }
     }
-    Ok(())
+
+    #[test]
+    fn macro_chunk_layer_addressing_and_weight_offset() {
+        let (stride, k) = (64usize, 3usize);
+        let mut s = host_scratch(stride, k, false);
+        // Markers per layer: layers 0..k share block slot 0; layer k starts slot 1.
+        s.host_slot_mut(0)[0] = 10;
+        s.host_slot_mut(1)[0] = 11;
+        s.host_slot_mut(2)[0] = 12;
+        s.host_slot_mut(3)[0] = 20;
+        assert_eq!(s.host_slot(0)[0], 10);
+        assert_eq!(s.host_slot(1)[0], 11);
+        assert_eq!(s.host_slot(2)[0], 12);
+        assert_eq!(s.host_slot(3)[0], 20);
+        assert_eq!(s.host_slot(0).len(), stride);
+        // Block slot alternates every `block_k` layers.
+        assert_eq!(s.slot_for(0), 0);
+        assert_eq!(s.slot_for(k - 1), 0);
+        assert_eq!(s.slot_for(k), 1);
+        assert_eq!(s.slot_for(2 * k), 0);
+        // Mirror destination places the layer at its in-block offset.
+        assert_eq!(s.weight_offset(4, 10), (4 % k) * stride + 10);
+        assert_eq!(s.weight_offset(0, 10), 10);
+        assert_eq!(s.slot_capacity(), stride * k);
+    }
+
+    #[test]
+    fn resident_dma_is_noop() {
+        let mut s = host_scratch(8, 1, true);
+        let pool = OpenClDevicePool::empty();
+        let layout = LayerPackLayout {
+            wq_off: 0,
+            wk_off: 0,
+            wv_off: 0,
+            wo_off: 0,
+            gate_off: 0,
+            up_off: 0,
+            down_off: 0,
+            attn_gate_off: 0,
+            wq_len: 0,
+            wk_len: 0,
+            wv_len: 0,
+            wo_len: 0,
+            gate_len: 0,
+            up_len: 0,
+            down_len: 0,
+            attn_gate_len: 0,
+            total: 0,
+        };
+        assert!(s.dma_ffn_keep_mapped(&pool, 0, &layout).is_ok());
+    }
 }

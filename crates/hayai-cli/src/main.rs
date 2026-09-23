@@ -6,7 +6,7 @@ use hayai_core::{
 };
 use hayai_cpu::{cpu_lut_matmul_q4, fp32_matmul, max_abs_diff, unpack_q4_to_fp32};
 use hayai_io::{open_layer_reader, PingPongBuffer};
-use hayai_model::{GgufFile, LlamaWeights, ModelConfig, SamplerConfig, Tokenizer};
+use hayai_model::{GgufFile, LlamaWeights, ModelConfig, Penalties, SamplerConfig, Tokenizer};
 use hayai_opencl::{
     discover_opencl_devices, select_transfer_path, OpenClEngine, StreamingScratch, TransferPath,
 };
@@ -48,10 +48,118 @@ fn render_chat_prompt(tok: &hayai_model::Tokenizer, prompt: &str) -> String {
     tok.apply_chat_template(prompt)
 }
 
+/// Parse `--logit-bias "id:bias,id:bias"` into engine `Penalties.logit_bias`.
+/// Build a multimodal input sequence: text tokens interleaved with media blocks
+/// (begin token + embedding rows + end token) at each `<__media__>` marker. With
+/// no marker, all media are prepended.
+fn build_media_inputs(
+    tok: &hayai_model::Tokenizer,
+    prompt: &str,
+    images: &[PathBuf],
+    audios: &[PathBuf],
+    emb: &hayai_model::ClipEmbedder,
+) -> anyhow::Result<Vec<hayai_core::MediaInput>> {
+    use hayai_core::MediaInput;
+    let mut media: Vec<(Option<u32>, Option<u32>, Vec<Vec<f32>>)> = Vec::new();
+    for p in images {
+        let (px, w, h) = hayai_model::load_image_rgb8(p)?;
+        let e = emb.encode_image_rgb8(&px, w, h)?;
+        media.push((
+            tok.token_to_id.get("<|image>").copied(),
+            tok.token_to_id.get("<image|>").copied(),
+            e.rows,
+        ));
+    }
+    for p in audios {
+        let s = hayai_model::decode_audio_16k(p)?;
+        let e = emb.encode_audio_16k(&s)?;
+        media.push((
+            tok.token_to_id.get("<|audio>").copied(),
+            tok.token_to_id.get("<audio|>").copied(),
+            e.rows,
+        ));
+    }
+
+    let push_block = |items: &mut Vec<MediaInput>,
+                      b: Option<u32>,
+                      e: Option<u32>,
+                      rows: &[Vec<f32>]| {
+        if let Some(b) = b {
+            items.push(MediaInput::Token(b));
+        }
+        for r in rows {
+            items.push(MediaInput::Emb(r.clone()));
+        }
+        if let Some(e) = e {
+            items.push(MediaInput::Token(e));
+        }
+    };
+
+    let parts: Vec<&str> = prompt.split("<__media__>").collect();
+    let mut items: Vec<MediaInput> = Vec::new();
+    if tok.add_bos {
+        items.push(MediaInput::Token(tok.bos_id));
+    }
+    if parts.len() == 1 {
+        for (b, e, rows) in &media {
+            push_block(&mut items, *b, *e, rows);
+        }
+        for id in tok.encode(parts[0], false) {
+            items.push(MediaInput::Token(id));
+        }
+    } else {
+        if parts.len() - 1 != media.len() {
+            anyhow::bail!(
+                "prompt has {} `<__media__>` markers but {} media provided",
+                parts.len() - 1,
+                media.len()
+            );
+        }
+        for (i, part) in parts.iter().enumerate() {
+            for id in tok.encode(part, false) {
+                items.push(MediaInput::Token(id));
+            }
+            if i < media.len() {
+                let (b, e, rows) = &media[i];
+                push_block(&mut items, *b, *e, rows);
+            }
+        }
+    }
+    Ok(items)
+}
+
+fn parse_logit_bias(spec: &str) -> anyhow::Result<Vec<(u32, f32)>> {    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (id, bias) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid --logit-bias entry '{part}' (expected id:bias)"))?;
+        let id: u32 = id
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid token id '{}' in --logit-bias", id.trim()))?;
+        let bias: f32 = bias
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid bias '{}' in --logit-bias", bias.trim()))?;
+        out.push((id, bias));
+    }
+    Ok(out)
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Inspect available hardware (OpenCL APUs, GPUs, CPU SIMD)
     Info,
+
+    /// Calibrate host/disk/device bandwidth and print 75–80% utilization targets
+    Calibrate {
+        /// Optional model file: measures disk bandwidth and its bytes/token target
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Write the JSON profile to this path
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 
     /// Run MatMul micro-benchmark (OpenCL when available, else CPU)
     Bench {
@@ -111,13 +219,47 @@ enum Commands {
         sinks: usize,
         #[arg(long, default_value = "256")]
         window: usize,
-        /// greedy | temperature | top_p
+        /// greedy | temperature | top_p | top_k | top_k_top_p | min_p
         #[arg(long, default_value = "greedy")]
         sample: String,
         #[arg(long, default_value = "0.8")]
         temperature: f32,
         #[arg(long, default_value = "0.9")]
         top_p: f32,
+        #[arg(long, default_value = "0")]
+        top_k: usize,
+        #[arg(long, default_value = "0.0")]
+        min_p: f32,
+        /// Repetition penalty (>1 discourages repeating; 1.0 = off)
+        #[arg(long, default_value = "1.0")]
+        repetition_penalty: f32,
+        #[arg(long, default_value = "0.0")]
+        presence_penalty: f32,
+        #[arg(long, default_value = "0.0")]
+        frequency_penalty: f32,
+        /// Additive logit bias: `id:bias,id:bias` (e.g. `128009:-5,9707:3`).
+        #[arg(long, default_value = "")]
+        logit_bias: String,
+        /// GBNF grammar file for constrained decoding (streaming path only).
+        #[arg(long)]
+        grammar: Option<PathBuf>,
+        /// Decode global sparse FFN topology from `saor.genome`/`saor.tau` at
+        /// runtime (dense FFN models only).
+        #[arg(long, default_value_t = false)]
+        sparse_global: bool,
+        /// MTP speculative decoding: number of draft tokens (0 = disabled,
+        /// Qwen3.5 hybrid only).
+        #[arg(long, default_value_t = 0)]
+        spec_drafts: usize,
+        /// Multimodal projector GGUF (`mmproj-*.gguf`) for `--image`/`--audio`.
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
+        /// Image file(s) (PNG/JPEG/…). Use `<__media__>` in the prompt to place them.
+        #[arg(long)]
+        image: Vec<PathBuf>,
+        /// Audio file(s) (wav/mp3/flac/… 16 kHz target). `<__media__>` places them.
+        #[arg(long)]
+        audio: Vec<PathBuf>,
         #[arg(long, default_value = "42")]
         seed: u64,
         /// Disable ChatML wrap (send prompt as-is)
@@ -158,6 +300,18 @@ enum Commands {
         #[arg(long)]
         model: PathBuf,
     },
+
+    /// Measure NextN/MTP draft-head agreement with the main model (Qwen3.5)
+    MtpProbe {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value = "16")]
+        tokens: usize,
+        #[arg(long, default_value = "cpu")]
+        device: String,
+    },
 }
 
 #[tokio::main]
@@ -172,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info(),
+        Commands::Calibrate { model, out } => cmd_calibrate(model, out)?,
         Commands::Bench { device } => cmd_bench(device)?,
         Commands::Validate { device } => cmd_validate(device)?,
         Commands::BenchIo { device, passes } => cmd_bench_io(device, passes).await?,
@@ -193,6 +348,18 @@ async fn main() -> anyhow::Result<()> {
             sample,
             temperature,
             top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            logit_bias,
+            grammar,
+            sparse_global,
+            spec_drafts,
+            mmproj,
+            image,
+            audio,
             seed,
             raw,
             dev_mmap,
@@ -207,6 +374,18 @@ async fn main() -> anyhow::Result<()> {
             sample,
             temperature,
             top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            logit_bias,
+            grammar,
+            sparse_global,
+            spec_drafts,
+            mmproj,
+            image,
+            audio,
             seed,
             !raw,
             dev_mmap,
@@ -232,6 +411,12 @@ async fn main() -> anyhow::Result<()> {
             memory_strategy,
         )?,
         Commands::Plan { model } => cmd_plan(model)?,
+        Commands::MtpProbe {
+            model,
+            prompt,
+            tokens,
+            device,
+        } => cmd_mtp_probe(model, prompt, tokens, device)?,
     }
 
     Ok(())
@@ -240,15 +425,9 @@ async fn main() -> anyhow::Result<()> {
 fn cmd_plan(model: PathBuf) -> anyhow::Result<()> {
     let cat = hayai_model::GgufCatalog::open(&model)?;
     let devices = discover_opencl_devices();
-    let n_gpu = devices
-        .iter()
-        .filter(|d| {
-            !matches!(
-                d.device_kind,
-                hayai_opencl::DeviceKind::CpuOpenCl
-            )
-        })
-        .count();
+    // The pool now includes every OpenCL device (CPU-OpenCL last), so the plan
+    // sees the full accelerator count.
+    let n_gpu = devices.len();
     let svm = devices.iter().any(|d| d.supports_svm);
     match build_exec_plan(&cat, n_gpu, svm) {
         Ok(plan) => {
@@ -273,6 +452,92 @@ fn cmd_plan(model: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Measure how often the NextN/MTP draft head agrees with the main model on the
+/// next-next token (foundation for speculative decoding).
+fn cmd_mtp_probe(
+    model: PathBuf,
+    prompt: String,
+    tokens: usize,
+    device: String,
+) -> anyhow::Result<()> {
+    use hayai_core::StreamingGenerator;
+    let cat = hayai_model::GgufCatalog::open(&model)?;
+    let tokenizer = Tokenizer::from_catalog(&cat)?;
+    drop(cat);
+    let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::Greedy, 42)?;
+    let mtp = gen
+        .mtp_layer()
+        .ok_or_else(|| anyhow::anyhow!("{} has no NextN/MTP block", model.display()))?;
+    let mode = parse_device_mode(&device);
+    let mut orch = EngineOrchestrator::new(mode, gen.config.clone());
+    let mut scratch = gen.prepare_session(&mut orch)?;
+    let ids = gen.tokenizer.encode(&prompt, gen.tokenizer.add_bos);
+    // Token-by-token prefill, capturing the post-norm hidden after every prompt token
+    // (the MTP head consumes h[i-1] for the token at position i).
+    let mut hiddens: Vec<Vec<f32>> = Vec::with_capacity(ids.len());
+    let mut logits = vec![0.0f32; gen.config.vocab_size];
+    for &tok in &ids {
+        logits = gen.decode_step(&mut orch, tok, &mut scratch)?;
+        hiddens.push(gen.last_hidden_normed());
+    }
+    let hidden_dim = gen.config.hidden_size;
+    let prompt_len = ids.len();
+    // Prime the MTP block's own KV over the prompt: position i uses token[i] and
+    // h[i-1] (h[-1] = 0), exactly like llama.cpp's MTP context prefill.
+    for i in 0..prompt_len {
+        let h = if i == 0 {
+            vec![0.0f32; hidden_dim]
+        } else {
+            hiddens[i - 1].clone()
+        };
+        let _ = gen.forward_mtp(&mut orch, &h, ids[i], i)?;
+    }
+    let mut hidden = hiddens.last().cloned().unwrap_or(vec![0.0f32; hidden_dim]);
+    let mut x = argmax(&logits);
+    let mut agree = 0usize;
+    let mut agree_next = 0usize;
+    let mut shown = String::new();
+    for step in 0..tokens {
+        // Draft at the main position of the just-sampled token (prompt_len + step).
+        let pos = prompt_len + step;
+        let mtp_logits = gen.forward_mtp(&mut orch, &hidden, x, pos)?;
+        let draft = argmax(&mtp_logits);
+        logits = gen.decode_step(&mut orch, x, &mut scratch)?;
+        let truth = argmax(&logits);
+        if draft == truth {
+            agree += 1;
+        }
+        if draft == x {
+            agree_next += 1;
+        }
+        shown.push_str(&format!(
+            " {}|{}",
+            gen.tokenizer.decode(&[truth]).trim(),
+            gen.tokenizer.decode(&[draft]).trim()
+        ));
+        hidden = gen.last_hidden_normed();
+        x = truth;
+    }
+    println!("MTP blk.{mtp} main|draft:{shown}");
+    println!(
+        "MTP draft agreement (t+2): {agree}/{tokens} ({:.1}%)  [draft==input token: {agree_next}]",
+        100.0 * agree as f64 / tokens.max(1) as f64
+    );
+    Ok(())
+}
+
 fn cmd_info() {
     println!("============================================================");
     println!("               HAYAI HARDWARE DISCOVERY");
@@ -289,19 +554,48 @@ fn cmd_info() {
             println!("  Platform:{}", dev.platform_name);
             println!("  Vendor:  {}", dev.vendor);
             println!("  Kind:    {:?}", dev.device_kind);
-            println!("  SVM:     {}", dev.supports_svm);
+            println!(
+                "  SVM:     {} (coarse={}, fine-buffer={}, fine-system={})",
+                dev.supports_svm,
+                dev.svm_coarse(),
+                dev.svm_fine_buffer(),
+                dev.svm_fine_system()
+            );
+            println!("  Unified memory:  {}", dev.unified_memory);
             println!("  Path:    {:?}", path);
             println!("  Compute Units:   {}", dev.max_compute_units);
             println!(
-                "  VRAM/RAM:        {} MB",
-                dev.global_mem_size / (1024 * 1024)
+                "  VRAM/RAM:        {} MB (max alloc {} MB)",
+                dev.global_mem_size / (1024 * 1024),
+                dev.max_alloc_size / (1024 * 1024)
             );
+            println!("  Max work-group:  {}", dev.max_work_group_size);
             println!("------------------------------------------------------------");
         }
     }
     println!("CPU backend: Rayon parallel Q4 LUT MatMul (+ FP32 reference)");
     println!("Test Model:  SmolLM-135M-Instruct");
     println!("============================================================");
+}
+
+fn cmd_calibrate(model: Option<PathBuf>, out: Option<PathBuf>) -> anyhow::Result<()> {
+    let orch = EngineOrchestrator::new(ExecutionMode::Auto, ModelConfig::smollm_135m());
+    let bytes_per_token = model
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() as f64);
+    let profile = hayai_core::calibrate(&orch.pool, model.as_deref());
+    print!("{}", profile.format_report(bytes_per_token));
+    if let Some(path) = out {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        std::fs::write(&path, profile.to_json())?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
 }
 
 fn cmd_bench(device: String) -> anyhow::Result<()> {
@@ -714,6 +1008,18 @@ fn cmd_generate(
     sample_name: String,
     temperature: f32,
     top_p: f32,
+    top_k: usize,
+    min_p: f32,
+    repetition_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    logit_bias: String,
+    grammar: Option<PathBuf>,
+    sparse_global: bool,
+    spec_drafts: usize,
+    mmproj: Option<PathBuf>,
+    images: Vec<PathBuf>,
+    audios: Vec<PathBuf>,
     seed: u64,
     use_chat: bool,
     dev_mmap: bool,
@@ -726,7 +1032,29 @@ fn cmd_generate(
             temperature,
             top_p,
         },
-        other => anyhow::bail!("unknown sampler '{other}' (greedy|temperature|top_p)"),
+        "top_k" | "top-k" => SamplerConfig::TopK {
+            temperature,
+            top_k,
+        },
+        "top_k_top_p" | "top-k-top-p" => SamplerConfig::TopKTopP {
+            temperature,
+            top_k,
+            top_p,
+        },
+        "min_p" | "min-p" => SamplerConfig::MinP {
+            temperature,
+            top_p,
+            min_p,
+        },
+        other => anyhow::bail!(
+            "unknown sampler '{other}' (greedy|temperature|top_p|top_k|top_k_top_p|min_p)"
+        ),
+    };
+    let penalties = Penalties {
+        repetition: repetition_penalty,
+        presence: presence_penalty,
+        frequency: frequency_penalty,
+        logit_bias: parse_logit_bias(&logit_bias)?,
     };
 
     println!("─────────────────────────────────────────────────────────────");
@@ -779,6 +1107,14 @@ fn cmd_generate(
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     drop(cat);
     let mut gen = StreamingGenerator::open(&model, tokenizer, sinks, window, sampler, seed)?;
+    gen.penalties = penalties;
+    if let Some(gpath) = &grammar {
+        let src = std::fs::read_to_string(gpath)
+            .map_err(|e| anyhow::anyhow!("read grammar {}: {e}", gpath.display()))?;
+        let g = hayai_model::Grammar::parse(&src)
+            .map_err(|e| anyhow::anyhow!("parse grammar {}: {e}", gpath.display()))?;
+        gen.set_grammar(g);
+    }
     gen.set_memory_strategy(MemoryStrategy::parse(&memory_strategy));
     println!(
         "  Ready {} in {:.2}s (WeightIo={})",
@@ -802,7 +1138,35 @@ fn cmd_generate(
         }
     );
     let t1 = Instant::now();
-    let stats = gen.generate(&mut orch, &prompt_text, max_tokens)?;
+    let sparse_overrides = if sparse_global {
+        let ov = gen
+            .build_global_sparse_overrides()?
+            .ok_or_else(|| anyhow::anyhow!("--sparse-global: GGUF is not a saor sparse model"))?;
+        Some(ov)
+    } else {
+        None
+    };
+    let stats = if !images.is_empty() || !audios.is_empty() {
+        let mmproj = mmproj
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--mmproj is required with --image/--audio"))?;
+        let embedder = hayai_model::ClipEmbedder::open(mmproj)?;
+        if !images.is_empty() && !embedder.has_vision() {
+            anyhow::bail!("mmproj has no vision encoder");
+        }
+        if !audios.is_empty() && !embedder.has_audio() {
+            anyhow::bail!("mmproj has no audio encoder");
+        }
+        let items = build_media_inputs(&gen.tokenizer, &prompt_text, &images, &audios, &embedder)?;
+        gen.generate_media(&mut orch, &items, max_tokens)?
+    } else if spec_drafts > 0 {
+        gen.generate_speculative(&mut orch, &prompt_text, max_tokens, spec_drafts)?
+    } else {
+        match &sparse_overrides {
+            Some(ov) => gen.generate_with_override(&mut orch, &prompt_text, max_tokens, ov)?,
+            None => gen.generate(&mut orch, &prompt_text, max_tokens)?,
+        }
+    };
     let secs = t1.elapsed().as_secs_f64();
     print_gen_stats(&stats, secs, rss_before, process_rss_bytes());
     let serial = gen.attn_secs + gen.ffn_secs;
@@ -933,6 +1297,7 @@ fn cmd_bench_generate(
         layer_bytes,
         gen.config.num_layers,
         gen.memory_strategy,
+        StreamingMemoryBudget::kv_activation_bytes(&gen.config, sinks, window) + 64 * 1024 * 1024,
     );
     let budget =
         StreamingMemoryBudget::estimate(&gen.config, layer_bytes, win.k_chunk, sinks, window);
@@ -977,6 +1342,8 @@ fn cmd_bench_generate(
     let serial = gen.attn_secs + gen.ffn_secs;
     let wall = gen.wall_compute_secs.max(secs);
     let speedup = if wall > 1e-9 { serial / wall } else { 1.0 };
+    // Print the compute plan after generation so per-device counters are populated.
+    print!("{}", orch.format_compute_plan());
 
     println!("  Load time:     {load_s:.2}s (WeightIo={})", gen.io_backend.as_str());
     println!("  Scratch:       {:?}", gen.transfer_path);

@@ -57,7 +57,7 @@ impl EngineOrchestrator {
                 info!("CPU-Only mode explicitly requested. OpenCL disabled.");
                 (
                     ExecutionMode::CpuOnly,
-                    OpenClDevicePool { engines: Vec::new() },
+                    OpenClDevicePool::empty(),
                 )
             }
             ExecutionMode::OpenClDevice(ref name) => {
@@ -66,9 +66,7 @@ impl EngineOrchestrator {
                     match OpenClEngine::init_device(dev_info) {
                         Ok(eng) => (
                             ExecutionMode::OpenClDevice(dev_info.device_name.clone()),
-                            OpenClDevicePool {
-                                engines: vec![eng],
-                            },
+                            OpenClDevicePool::single(eng),
                         ),
                         Err(e) => {
                             warn!(
@@ -77,7 +75,7 @@ impl EngineOrchestrator {
                             );
                             (
                                 ExecutionMode::CpuOnly,
-                                OpenClDevicePool { engines: Vec::new() },
+                                OpenClDevicePool::empty(),
                             )
                         }
                     }
@@ -88,7 +86,7 @@ impl EngineOrchestrator {
                     );
                     (
                         ExecutionMode::CpuOnly,
-                        OpenClDevicePool { engines: Vec::new() },
+                        OpenClDevicePool::empty(),
                     )
                 }
             }
@@ -108,7 +106,7 @@ impl EngineOrchestrator {
                     );
                     (
                         ExecutionMode::CpuOnly,
-                        OpenClDevicePool { engines: Vec::new() },
+                        OpenClDevicePool::empty(),
                     )
                 }
             },
@@ -235,6 +233,8 @@ impl EngineOrchestrator {
         input: &[f32],
         output: &mut [f32],
     ) -> Result<(), OrchestratorError> {
+        cl.ffn_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let m = matrix.nrows;
         let n = matrix.ncols;
         let w = matrix.data();
@@ -360,12 +360,28 @@ impl EngineOrchestrator {
                     output.copy_from_slice(&v);
                     Ok(())
                 }),
-            // BF16 only appears in small Gemma4 PLE proj — CPU path is fine.
-            GgmlType::BF16 => {
-                return matrix
-                    .gemv(input, output)
-                    .map_err(|e| OrchestratorError::Msg(e.to_string()));
-            }
+            // BF16 / Q8_1 / Q8_K now have OpenCL kernels (async).
+            GgmlType::BF16 => cl
+                .ggml_gemv_async(&cl.gemv_bf16, "bf16", m, n, w, input)
+                .and_then(|p| {
+                    let v = p.wait()?;
+                    output.copy_from_slice(&v);
+                    Ok(())
+                }),
+            GgmlType::Q8_1 => cl
+                .ggml_gemv_async(&cl.gemv_q8_1, "q8_1", m, n, w, input)
+                .and_then(|p| {
+                    let v = p.wait()?;
+                    output.copy_from_slice(&v);
+                    Ok(())
+                }),
+            GgmlType::Q8_K => cl
+                .ggml_gemv_async(&cl.gemv_q8_k, "q8_k", m, n, w, input)
+                .and_then(|p| {
+                    let v = p.wait()?;
+                    output.copy_from_slice(&v);
+                    Ok(())
+                }),
             other => {
                 return Err(OrchestratorError::Msg(format!(
                     "OpenCL GEMV missing for {other:?} — GPU present, CPU fallback disabled (PRD). \
@@ -388,7 +404,9 @@ impl EngineOrchestrator {
                 "begin_gemv_on called with empty GPU pool".into(),
             ));
         }
-        let eng = self.pool.for_role(role);
+        let eng = self.pool.for_role(role).ok_or_else(|| {
+            OrchestratorError::Msg("begin_gemv_on called with empty GPU pool".into())
+        })?;
         begin_gemv_engine(eng, matrix, input)
     }
 
@@ -400,6 +418,28 @@ impl EngineOrchestrator {
         self.opencl_engine()
             .map(|e| e.device_info.device_name.as_str())
             .unwrap_or("CPU")
+    }
+
+    /// Report the FFN role→device assignment and the per-device GEMV counts
+    /// (load-distribution / utilization proxy).
+    pub fn format_compute_plan(&self) -> String {
+        let mut s = String::from("Compute plan (FFN roles):\n");
+        for (role, name) in ["gate", "up", "down"].iter().enumerate() {
+            let dev = self
+                .pool
+                .for_role(role)
+                .map(|e| e.device_info.device_name.as_str())
+                .unwrap_or("CPU");
+            s.push_str(&format!("  {name:<5} -> {dev}\n"));
+        }
+        for e in &self.pool.engines {
+            s.push_str(&format!(
+                "  {}: {} FFN GEMVs\n",
+                e.device_info.device_name,
+                e.ffn_calls.load(std::sync::atomic::Ordering::Relaxed)
+            ));
+        }
+        s
     }
 
     pub fn hetero_devices_active(&self) -> bool {
@@ -432,12 +472,17 @@ pub fn begin_gemv_engine(
         GgmlType::IQ2_S => (&eng.gemv_iq2_s, "iq2_s"),
         GgmlType::F32 => (&eng.gemv_f32, "f32"),
         GgmlType::F16 => (&eng.gemv_f16, "f16"),
+        GgmlType::BF16 => (&eng.gemv_bf16, "bf16"),
+        GgmlType::Q8_1 => (&eng.gemv_q8_1, "q8_1"),
+        GgmlType::Q8_K => (&eng.gemv_q8_k, "q8_k"),
         other => {
             return Err(OrchestratorError::Msg(format!(
                 "OpenCL GEMV missing for {other:?} (GPU pool non-empty; no CPU FFN fallback)"
             )));
         }
     };
+    eng.ffn_calls
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     eng.ggml_gemv_async(kernel_label.0, kernel_label.1, m.nrows, m.ncols, m.data(), xn)
         .map_err(OrchestratorError::from)
 }

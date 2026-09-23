@@ -6,7 +6,8 @@
 
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
-    ffn_begin_gate_up_scratch, ffn_finish_scratch, StreamInferError, StreamingGenerator,
+    add_bias, add_qkv_bias, ffn_begin_gate_up_scratch, ffn_finish_scratch, StreamInferError,
+    StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step, rms_norm};
 use hayai_opencl::StreamingScratch;
@@ -138,6 +139,9 @@ impl StreamingGenerator {
         pack.wq.gemv(&xn, &mut q)?;
         pack.wk.gemv(&xn, &mut k)?;
         pack.wv.gemv(&xn, &mut v)?;
+        if let Some(b) = self.attn_bias.get(blk) {
+            add_qkv_bias(b, &mut q, &mut k, &mut v);
+        }
 
         let mut attn_out = vec![0.0f32; q_dim];
         attention_decode_step(
@@ -162,10 +166,16 @@ impl StreamingGenerator {
 
         let mut attn_proj = vec![0.0f32; h];
         pack.wo.gemv(&attn_out, &mut attn_proj)?;
+        if let Some(b) = self.attn_bias.get(blk) {
+            add_bias(&mut attn_proj, &b.o);
+        }
         for i in 0..h {
             x[i] += attn_proj[i];
         }
         self.attn_secs += t_attn.elapsed().as_secs_f64();
+
+        // Optional generic causal short-conv residual.
+        self.apply_conv(blk, x)?;
 
         let mut xn = x.to_vec();
         rms_norm(&mut xn, &self.layer_norms[blk].ffn_norm, eps);
@@ -175,31 +185,38 @@ impl StreamingGenerator {
         self.finish_ffn_unmap(orch, scratch, slot)?;
 
         let t_ffn = Instant::now();
-        let inflight = ffn_begin_gate_up_scratch(
-            orch,
-            &pack.gate,
-            &pack.up,
-            &xn,
-            &mut self.ws_gate,
-            &mut self.ws_up,
-            &mut self.used_dgpu,
-            &mut self.used_apu,
-            Some(scratch),
-            blk,
-            Some(&layout),
-        )?;
-        ffn_finish_scratch(
-            orch,
-            inflight,
-            &pack.down,
-            &mut self.ws_gate,
-            &mut self.ws_up,
-            &mut self.ws_down,
-            &mut self.used_dgpu,
-            Some(scratch),
-            blk,
-            Some(&layout),
-        )?;
+        let sparse_ffn =
+            pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
+        if sparse_ffn {
+            // Embedded sparse FFN (CSR) — reuse the shared FFN-block runner.
+            self.run_ffn_block(orch, &pack, &xn, None)?;
+        } else {
+            let inflight = ffn_begin_gate_up_scratch(
+                orch,
+                &pack.gate,
+                &pack.up,
+                &xn,
+                &mut self.ws_gate,
+                &mut self.ws_up,
+                &mut self.used_dgpu,
+                &mut self.used_apu,
+                Some(scratch),
+                blk,
+                Some(&layout),
+            )?;
+            ffn_finish_scratch(
+                orch,
+                inflight,
+                &pack.down,
+                &mut self.ws_gate,
+                &mut self.ws_up,
+                &mut self.ws_down,
+                &mut self.used_dgpu,
+                Some(scratch),
+                blk,
+                Some(&layout),
+            )?;
+        }
         self.ffn_secs += t_ffn.elapsed().as_secs_f64();
         for i in 0..h {
             x[i] += self.ws_down[i];

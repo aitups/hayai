@@ -61,6 +61,8 @@ pub enum LayerOpKind {
     SharedExpert,
     /// Gated DeltaNet / SSM / linear-attention family (Qwen3.5 hybrid, etc.).
     DeltaNet,
+    /// Mamba-1 selective-scan SSM (`ssm_in`/`ssm_x`/`ssm_d`, full selective scan).
+    Mamba,
     /// Multi-token prediction / next-n draft head (Qwen3.5 `blk.*.nextn.*`).
     NextN,
     /// Gemma4 per-layer embeddings (PLE).
@@ -153,7 +155,7 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         OutputNorm | AttnNorm | AttnQNorm | AttnKNorm | PostAttnNorm | FfnNorm | PostFfnNorm
         | PleProjNorm | PlePostNorm => OpBinding::CPU_NORM,
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
-        | DeltaNet | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
+        | DeltaNet | Mamba | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
         FfnGate | FfnUp | FfnDown | ExpertGate | ExpertUp | ExpertDown | SharedExpert
         | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
@@ -476,6 +478,40 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     use LayerOpKind::*;
     let n = name.to_ascii_lowercase();
 
+    // ── Bias tensors ─────────────────────────────────────────────────────────
+    // Attention q/k/v/o biases are executed out-of-band: `StreamingGenerator`
+    // preloads `blk.N.attn_q/k/v/output.bias` into `attn_bias`. Unhandled
+    // compute-affecting biases (FFN / output projection) must fail loudly instead
+    // of being silently dropped (that bug made Qwen2.5 produce garbage). Other
+    // biases (e.g. `ssm_dt.bias`) are consumed by their family path below.
+    if n.contains("bias") {
+        let handled_attn = n.ends_with("attn_q.bias")
+            || n.ends_with("attn_k.bias")
+            || n.ends_with("attn_v.bias")
+            || n.ends_with("attn_output.bias")
+            || n.ends_with("q_proj.bias")
+            || n.ends_with("k_proj.bias")
+            || n.ends_with("v_proj.bias")
+            || n.ends_with("o_proj.bias");
+        if handled_attn {
+            return Ok(Aux);
+        }
+        let unhandled = n.ends_with("ffn_gate.bias")
+            || n.ends_with("ffn_up.bias")
+            || n.ends_with("ffn_down.bias")
+            || n.ends_with("gate_proj.bias")
+            || n.ends_with("up_proj.bias")
+            || n.ends_with("down_proj.bias")
+            || n.ends_with("output.bias")
+            || n.ends_with("lm_head.bias")
+            || n.ends_with("token_embd.bias");
+        if unhandled {
+            return Err(format!(
+                "compute-affecting bias tensor not implemented in the streaming path: {name}"
+            ));
+        }
+    }
+
     // ── Phase 0: draft heads (before any attn/ffn substring). ────────────────
     if n.contains(".nextn.") || n.contains("nextn_") || n.contains(".mtp.") || n.contains("mtp_") {
         return Ok(NextN);
@@ -568,7 +604,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 7: attention projections. ──────────────────────────────────────
-    if n.contains("attn_qkv") || n.contains("qkv_proj") {
+    if n.contains("attn_qkv") || n.contains("qkv_proj") || n.contains("wqkv") {
         return Ok(AttnQkv);
     }
     if n.contains("attn_q") || n.contains("q_proj") || n.contains(".wq.") {
@@ -597,6 +633,11 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 9: SSM / DeltaNet / linear attention. ──────────────────────────
+    // Mamba-1 is distinguished by its x_proj / D-skip / in-proj tensors (Qwen3.5
+    // DeltaNet blocks use `ssm_alpha`/`ssm_beta`/`ssm_norm`/`in_proj_qkvz` instead).
+    if n.contains("ssm_x") || n.contains("ssm_in") || n.ends_with(".ssm_d") {
+        return Ok(Mamba);
+    }
     if n.contains("delta")
         || n.contains("linear_attn")
         || n.contains("mamba")
@@ -633,6 +674,13 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 13: genuinely passive aux. ──────────────────────────────────────
+    // Compute-affecting tensors we do NOT execute must fail loudly: silently
+    // discarding them produces wrong logits with no diagnostic.
+    if n.contains("attn_sink") || n.contains("shear") {
+        return Err(format!(
+            "compute-affecting tensor not implemented in the streaming path: {name}"
+        ));
+    }
     if n.contains("bias")
         || n.contains("scale")
         || n.contains("rope")
@@ -640,10 +688,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
         || n.contains("sin")
         || n.contains("inv_freq")
         || n.contains("alibi")
-        || n.contains("shear")
-        || n.contains("attn_sink")
         || n.ends_with(".proj.weight")
-        || n.contains(".proj.bias")
     {
         return Ok(Aux);
     }
@@ -787,6 +832,46 @@ mod tests {
         assert_eq!(cls("blk.0.attn_q.weight").unwrap(), LayerOpKind::AttnQ);
         assert_eq!(cls("blk.3.ffn_down.weight").unwrap(), LayerOpKind::FfnDown);
         assert_eq!(cls("token_embd.weight").unwrap(), LayerOpKind::TokenEmbed);
+        // Fused QKV under either GGUF (`attn_qkv`) or HF (`qkv_proj`) naming.
+        assert_eq!(
+            cls("model.layers.0.self_attn.qkv_proj.weight").unwrap(),
+            LayerOpKind::AttnQkv
+        );
+        // MPT `attn.Wqkv.weight` is concat [q|k|v] — same op.
+        assert_eq!(cls("blk.0.attn.Wqkv.weight").unwrap(), LayerOpKind::AttnQkv);
+    }
+
+    #[test]
+    fn attention_biases_are_aux_unhandled_biases_fail() {
+        // Qwen2/2.5: q/k/v biases are preloaded and applied out-of-band.
+        assert_eq!(cls("blk.0.attn_q.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.attn_k.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.attn_v.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.attn_output.bias").unwrap(), LayerOpKind::Aux);
+        // FFN / output biases are compute-affecting but unimplemented: fail loudly.
+        assert!(cls("blk.0.ffn_gate.bias").is_err());
+        assert!(cls("blk.0.ffn_down.bias").is_err());
+        assert!(cls("output.bias").is_err());
+    }
+
+    #[test]
+    fn unknown_tensor_fails_loudly_never_silent() {
+        // Framework invariant (docs/adding-a-model-family.md): an unrecognized tensor
+        // role must be an error, never a silently-ignored `Aux`.
+        assert!(cls("blk.0.mystery_tensor.weight").is_err());
+        assert!(cls("blk.0.wibble.weight").is_err());
+    }
+
+    #[test]
+    fn classifies_mamba_ops() {
+        // Mamba-1 selective-scan tensors are their own op...
+        assert_eq!(cls("blk.0.ssm_in.weight").unwrap(), LayerOpKind::Mamba);
+        assert_eq!(cls("blk.0.ssm_x.weight").unwrap(), LayerOpKind::Mamba);
+        assert_eq!(cls("blk.0.ssm_d").unwrap(), LayerOpKind::Mamba);
+        // ...while Qwen3.5 DeltaNet blocks stay `DeltaNet` (shared `ssm_*` names).
+        assert_eq!(cls("blk.0.ssm_alpha.weight").unwrap(), LayerOpKind::DeltaNet);
+        assert_eq!(cls("blk.0.ssm_conv1d.weight").unwrap(), LayerOpKind::DeltaNet);
+        assert_eq!(cls("blk.0.ssm_dt.weight").unwrap(), LayerOpKind::DeltaNet);
     }
 
     #[test]

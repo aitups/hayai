@@ -95,19 +95,13 @@ pub struct StreamingMemoryBudget {
 }
 
 impl StreamingMemoryBudget {
-    /// Estimate from model dims + layer-window size + KV sinks/window.
-    ///
-    /// `k_chunk` = number of resident layer slots (1 for strict ping-pong → 2×
-    /// layer window; `n_layers` for full-resident → whole model window).
-    pub fn estimate(
+    /// KV cache + activation working set in bytes, independent of the weight
+    /// window. Used both for the budget and to reserve room in the planner.
+    pub fn kv_activation_bytes(
         config: &ModelConfig,
-        layer_pack_bytes: usize,
-        k_chunk: usize,
         num_sink_tokens: usize,
         window_size: usize,
-    ) -> Self {
-        let layer_window_bytes = (k_chunk as u64 + 1).saturating_mul(layer_pack_bytes as u64);
-
+    ) -> u64 {
         let head_dim = config
             .hidden_size
             .checked_div(config.num_attention_heads)
@@ -119,7 +113,41 @@ impl StreamingMemoryBudget {
             .saturating_mul(2)
             .saturating_add(slots.saturating_mul(8));
         let kv_bytes = per_layer.saturating_mul(config.num_layers as u64);
+        let h = config.hidden_size as u64;
+        let ff = config.intermediate_size as u64;
+        let activation_bytes = (2 * h + 2 * ff + h) * 4;
+        kv_bytes.saturating_add(activation_bytes)
+    }
 
+    /// Estimate from model dims + layer-window size + KV sinks/window.
+    ///
+    /// `k_chunk` = layers per ping-pong slot. The scratch really allocates **two**
+    /// slots of `k_chunk × layer` each (`hetero_scratch::allocate_for_pool`), so the
+    /// weight window is `2 · k_chunk · layer_pack_bytes` — a full-resident model is
+    /// `k_chunk == n_layers`.
+    pub fn estimate(
+        config: &ModelConfig,
+        layer_pack_bytes: usize,
+        k_chunk: usize,
+        num_sink_tokens: usize,
+        window_size: usize,
+    ) -> Self {
+        let layer_window_bytes = 2u64
+            .saturating_mul(k_chunk.max(1) as u64)
+            .saturating_mul(layer_pack_bytes as u64);
+
+        let kv_act = Self::kv_activation_bytes(config, num_sink_tokens, window_size);
+        let head_dim = config
+            .hidden_size
+            .checked_div(config.num_attention_heads)
+            .unwrap_or(0);
+        let kv_dim = config.num_key_value_heads.saturating_mul(head_dim);
+        let slots = num_sink_tokens.saturating_add(window_size) as u64;
+        let per_layer = slots
+            .saturating_mul(kv_dim as u64)
+            .saturating_mul(2)
+            .saturating_add(slots.saturating_mul(8));
+        let kv_bytes = per_layer.saturating_mul(config.num_layers as u64);
         let h = config.hidden_size as u64;
         let ff = config.intermediate_size as u64;
         let activation_bytes = (2 * h + 2 * ff + h) * 4;
@@ -128,8 +156,7 @@ impl StreamingMemoryBudget {
         let metadata_slack_bytes = 64 * 1024 * 1024; // 64 MiB slack
 
         let total_budget_bytes = layer_window_bytes
-            .saturating_add(kv_bytes)
-            .saturating_add(activation_bytes)
+            .saturating_add(kv_act)
             .saturating_add(metadata_slack_bytes);
 
         Self {

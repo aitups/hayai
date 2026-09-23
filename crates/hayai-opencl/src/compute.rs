@@ -64,7 +64,7 @@ impl OpenClEngine {
         }
 
         // Prefer a local size that covers the 16-entry LUT load and divides M when possible.
-        let local = preferred_local_size(m);
+        let local = preferred_local_size(m, self.device_info.max_work_group_size);
         let global = ((m + local - 1) / local) * local;
 
         let kernel_event = unsafe {
@@ -156,6 +156,7 @@ impl OpenClEngine {
     ) -> Result<(), OpenClError> {
         assert_eq!(inputs.len(), batch * n);
         assert_eq!(outputs.len(), batch * m);
+        validate_gemv_weights("q4_k", m, n, weights.len())?;
         let m_i = m as cl_int;
         let n_i = n as cl_int;
         let batch_i = batch as cl_int;
@@ -193,7 +194,7 @@ impl OpenClEngine {
                 .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
         }
 
-        let local = preferred_local_size(m);
+        let local = preferred_local_size(m, self.device_info.max_work_group_size);
         let global = (((batch * m) + local - 1) / local) * local;
 
         let kernel_event = unsafe {
@@ -258,6 +259,7 @@ impl OpenClEngine {
     ) -> Result<(), OpenClError> {
         assert_eq!(input.len(), n);
         assert_eq!(output.len(), m);
+        validate_gemv_weights(label, m, n, weights.len())?;
         let m_i = m as cl_int;
         let n_i = n as cl_int;
         let off_i = 0i64; // cl_long (kernel arg)
@@ -289,7 +291,7 @@ impl OpenClEngine {
                 .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
         }
 
-        let local = preferred_local_size(m);
+        let local = preferred_local_size(m, self.device_info.max_work_group_size);
         let global = ((m + local - 1) / local) * local;
 
         // Must match HAYAI_X_TILE in ggml_gemv_q4.cl (tiled __local input).
@@ -450,6 +452,16 @@ impl OpenClEngine {
             output.fill(0.0);
             return Ok(());
         }
+        validate_spmm_inputs(x.len(), adjs.len(), n_cands, n_pos, d_in, d_out)?;
+        let w_need = d_in
+            .checked_mul(d_out)
+            .ok_or_else(|| OpenClError::ClError("spmm_adj: d_in*d_out overflow".into()))?;
+        if w.len() < w_need {
+            return Err(OpenClError::ClError(format!(
+                "spmm_adj: weight buffer {} < {w_need} required",
+                w.len()
+            )));
+        }
 
         let mut x_buf = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
@@ -536,6 +548,8 @@ impl OpenClEngine {
             output.fill(0.0);
             return Ok(());
         }
+        validate_spmm_inputs(x.len(), adjs.len(), n_cands, n_pos, d_in, d_out)?;
+        validate_q4_k_weights(d_in, d_out, w4.len())?;
 
         let mut x_buf = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
@@ -622,6 +636,10 @@ impl OpenClEngine {
             output.fill(0.0);
             return Ok(());
         }
+        // Same validation as `spmm_adj_batched_q4`: never launch a kernel whose
+        // indexing would run past the adjacency/weight buffers.
+        validate_spmm_inputs(x.len(), adjs.len(), n_cands, n_pos, d_in, d_out)?;
+        validate_q4_k_weights(d_in, d_out, w4.len())?;
 
         let mut x_buf = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, x.len(), ptr::null_mut())
@@ -706,14 +724,150 @@ impl OpenClEngine {
     }
 }
 
-fn preferred_local_size(m: usize) -> usize {
+fn preferred_local_size(m: usize, max_work_group: usize) -> usize {
+    let cap = max_work_group.max(1);
     const CANDIDATES: [usize; 4] = [256, 128, 64, 32];
     for &ls in &CANDIDATES {
-        if m % ls == 0 {
+        if ls <= cap && m % ls == 0 {
             return ls;
         }
     }
-    64.min(m.max(16))
+    64.min(m.max(16)).min(cap)
+}
+
+/// Packed bytes per GEMV output row for `n` columns, per kernel layout. Returns
+/// `None` for an unknown label or an `n` that is not a multiple of the block
+/// size (the kernels would then read past the end of the weight buffer).
+pub(crate) fn gemv_row_bytes(label: &str, n: usize) -> Option<usize> {
+    let (block, bytes) = match label {
+        "q4_0" => (32, 18),
+        "q4_1" => (32, 20),
+        "q5_0" => (32, 22),
+        "q5_1" => (32, 24),
+        "q8_0" => (32, 34),
+        "q8_1" => (32, 36),
+        "q8_k" => (256, 292),
+        "iq4_nl" => (32, 18),
+        "q2_k" => (256, 84),
+        "q3_k" => (256, 110),
+        "q4_k" => (256, 144),
+        "q5_k" => (256, 176),
+        "q6_k" => (256, 210),
+        "iq4_xs" => (256, 136),
+        "iq3_xxs" => (256, 98),
+        "iq3_s" => (256, 110),
+        "iq2_xxs" => (256, 66),
+        "iq2_xs" => (256, 74),
+        "iq2_s" => (256, 82),
+        "f32" => return n.checked_mul(4),
+        "f16" => return n.checked_mul(2),
+        "bf16" => return n.checked_mul(2),
+        _ => return None,
+    };
+    if block == 0 || n % block != 0 {
+        return None;
+    }
+    (n / block).checked_mul(bytes)
+}
+
+/// Reject a GEMV whose weight buffer is too small for the `m × n` the kernel is
+/// launched with. Without this an inconsistent GGUF can make the device read
+/// past the end of the `cl_mem` (driver fault / garbage results).
+pub(crate) fn validate_gemv_weights(
+    label: &str,
+    m: usize,
+    n: usize,
+    weights_len: usize,
+) -> Result<(), OpenClError> {
+    let row = gemv_row_bytes(label, n).ok_or_else(|| {
+        OpenClError::ClError(format!(
+            "ggml_gemv_{label}: n={n} is not a valid column count for this layout"
+        ))
+    })?;
+    let expected = m.checked_mul(row).ok_or_else(|| {
+        OpenClError::ClError(format!("ggml_gemv_{label}: weight size overflow for {m}x{n}"))
+    })?;
+    if weights_len < expected {
+        return Err(OpenClError::ClError(format!(
+            "ggml_gemv_{label}: weight buffer {weights_len} B < {expected} B required for {m}x{n}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate only the `m`/`n` shape (no weight buffer): every block kernel derives
+/// `blocks = n / block` and silently drops a shorter tail, so a non-multiple `n`
+/// must be rejected before launch.
+pub(crate) fn validate_gemv_shape(label: &str, m: usize, n: usize) -> Result<(), OpenClError> {
+    if m == 0 || n == 0 {
+        return Err(OpenClError::ClError(format!(
+            "ggml_gemv_{label}: empty shape m={m} n={n}"
+        )));
+    }
+    if gemv_row_bytes(label, n).is_none() {
+        return Err(OpenClError::ClError(format!(
+            "ggml_gemv_{label}: n={n} is not a valid column count (multiple of the block size)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the inputs shared by every batched sparse SpMM entry point.
+fn validate_spmm_inputs(
+    x_len: usize,
+    adjs_len: usize,
+    n_cands: usize,
+    n_pos: usize,
+    d_in: usize,
+    d_out: usize,
+) -> Result<usize, OpenClError> {
+    let batch = n_cands
+        .checked_mul(n_pos)
+        .ok_or_else(|| OpenClError::ClError("spmm: n_cands*n_pos overflow".into()))?;
+    let conns = d_in
+        .checked_mul(d_out)
+        .ok_or_else(|| OpenClError::ClError("spmm: d_in*d_out overflow".into()))?;
+    if conns % 8 != 0 {
+        return Err(OpenClError::ClError(format!(
+            "spmm: d_in*d_out={conns} is not a multiple of 8"
+        )));
+    }
+    let x_need = batch
+        .checked_mul(d_in)
+        .ok_or_else(|| OpenClError::ClError("spmm: x size overflow".into()))?;
+    if x_len < x_need {
+        return Err(OpenClError::ClError(format!(
+            "spmm: x buffer {x_len} < {x_need} required"
+        )));
+    }
+    let adj_need = n_cands
+        .checked_mul(conns / 8)
+        .ok_or_else(|| OpenClError::ClError("spmm: adj size overflow".into()))?;
+    if adjs_len < adj_need {
+        return Err(OpenClError::ClError(format!(
+            "spmm: adjacency buffer {adjs_len} < {adj_need} required"
+        )));
+    }
+    Ok(batch)
+}
+
+/// Validate the Q4_K weight payload for `d_out × d_in` (144 B per 256 values).
+fn validate_q4_k_weights(d_in: usize, d_out: usize, w4_len: usize) -> Result<(), OpenClError> {
+    if d_in % 256 != 0 {
+        return Err(OpenClError::ClError(format!(
+            "spmm q4: d_in={d_in} is not a multiple of 256"
+        )));
+    }
+    let need = d_out
+        .checked_mul(d_in / 256)
+        .and_then(|b| b.checked_mul(144))
+        .ok_or_else(|| OpenClError::ClError("spmm q4: weight size overflow".into()))?;
+    if w4_len < need {
+        return Err(OpenClError::ClError(format!(
+            "spmm q4: weight buffer {w4_len} < {need} required for {d_out}x{d_in}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -733,7 +887,7 @@ mod tests {
             .any(|d| d.device_kind != DeviceKind::CpuOpenCl);
         match OpenClEngine::try_init_any() {
             Ok(eng) => Some(eng),
-            Err(e) if !has_gpu => {
+            Err(_e) if !has_gpu => {
                 eprintln!("skipping {label}: no OpenCL device");
                 None
             }
@@ -1071,6 +1225,399 @@ mod tests {
             err < 1e-5,
             "OpenCL spmm_csr vs CPU mismatch: {err} on {}",
             engine.device_info.device_name
+        );
+    }
+
+    /// Run one GEMV kernel against the CPU reference on deterministic bytes. Bytes
+    /// are masked to `0x1F` so every embedded f16 scale stays finite (no NaN/Inf),
+    /// which lets arbitrary bit patterns exercise the whole layout safely.
+    fn gemv_parity<F>(
+        engine: &OpenClEngine,
+        label: &'static str,
+        kernel: &opencl3::kernel::Kernel,
+        m: usize,
+        n: usize,
+        row_bytes: usize,
+        cpu: F,
+    ) where
+        F: Fn(&[u8], &[f32], &mut [f32]),
+    {
+        let mut weights = vec![0u8; m * row_bytes];
+        for (i, b) in weights.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) & 0x1F) as u8;
+        }
+        let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.003 - 0.2).collect();
+        let mut cpu_out = vec![0.0f32; m];
+        let mut gpu_out = vec![0.0f32; m];
+        cpu(&weights, &input, &mut cpu_out);
+        let pending = engine
+            .ggml_gemv_async(kernel, label, m, n, &weights, &input)
+            .unwrap_or_else(|e| panic!("enqueue {label}: {e}"));
+        gpu_out.copy_from_slice(&pending.wait().expect("wait"));
+        let err = max_abs_diff(&cpu_out, &gpu_out);
+        assert!(
+            err < 1e-3,
+            "OpenCL {label} vs CPU mismatch: {err} on {}",
+            engine.device_info.device_name
+        );
+    }
+
+    #[test]
+    fn opencl_gemv_remaining_quants_match_cpu_when_available() {
+        use hayai_model::iq2::{gemv_iq2_s, gemv_iq2_xs, gemv_iq2_xxs};
+        use hayai_model::iq3::{gemv_iq3_s, gemv_iq3_xxs};
+        use hayai_model::iq4::{gemv_iq4_nl, gemv_iq4_xs};
+        use hayai_model::q2k::gemv_q2_k;
+        use hayai_model::q3k::gemv_q3_k;
+        use hayai_model::q5::{gemv_q5_0, gemv_q5_1};
+        use hayai_model::q5k::gemv_q5_k;
+
+        let Some(engine) = init_engine_or_skip("OpenCL all-quants gemv test") else {
+            return;
+        };
+        let m = 32usize;
+        let n = 256usize;
+        let (b32, b256) = (n / 32, n / 256);
+
+        gemv_parity(&engine, "q5_0", &engine.gemv_q5_0, m, n, b32 * 22, |w, i, o| {
+            gemv_q5_0(m, n, w, i, o).unwrap()
+        });
+        gemv_parity(&engine, "q5_1", &engine.gemv_q5_1, m, n, b32 * 24, |w, i, o| {
+            gemv_q5_1(m, n, w, i, o).unwrap()
+        });
+        gemv_parity(&engine, "q2_k", &engine.gemv_q2_k, m, n, b256 * 84, |w, i, o| {
+            gemv_q2_k(m, n, w, i, o).unwrap()
+        });
+        gemv_parity(&engine, "q3_k", &engine.gemv_q3_k, m, n, b256 * 110, |w, i, o| {
+            gemv_q3_k(m, n, w, i, o).unwrap()
+        });
+        gemv_parity(&engine, "q5_k", &engine.gemv_q5_k, m, n, b256 * 176, |w, i, o| {
+            gemv_q5_k(m, n, w, i, o).unwrap()
+        });
+        gemv_parity(
+            &engine,
+            "iq4_nl",
+            &engine.gemv_iq4_nl,
+            m,
+            n,
+            b32 * 18,
+            |w, i, o| gemv_iq4_nl(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq4_xs",
+            &engine.gemv_iq4_xs,
+            m,
+            n,
+            b256 * 136,
+            |w, i, o| gemv_iq4_xs(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq3_xxs",
+            &engine.gemv_iq3_xxs,
+            m,
+            n,
+            b256 * 98,
+            |w, i, o| gemv_iq3_xxs(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq3_s",
+            &engine.gemv_iq3_s,
+            m,
+            n,
+            b256 * 110,
+            |w, i, o| gemv_iq3_s(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq2_xxs",
+            &engine.gemv_iq2_xxs,
+            m,
+            n,
+            b256 * 66,
+            |w, i, o| gemv_iq2_xxs(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq2_xs",
+            &engine.gemv_iq2_xs,
+            m,
+            n,
+            b256 * 74,
+            |w, i, o| gemv_iq2_xs(m, n, w, i, o).unwrap(),
+        );
+        gemv_parity(
+            &engine,
+            "iq2_s",
+            &engine.gemv_iq2_s,
+            m,
+            n,
+            b256 * 82,
+            |w, i, o| gemv_iq2_s(m, n, w, i, o).unwrap(),
+        );
+    }
+
+    #[test]
+    fn opencl_gemv_f32_f16_match_cpu_when_available() {
+        use hayai_model::gguf::f16_to_f32;
+
+        let Some(engine) = init_engine_or_skip("OpenCL f32/f16 gemv test") else {
+            return;
+        };
+        let m = 16usize;
+        let n = 64usize;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 0.3).collect();
+
+        // F32
+        let mut w32 = vec![0u8; m * n * 4];
+        for i in 0..(m * n) {
+            let v = ((i % 17) as f32 - 8.0) * 0.03;
+            w32[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut cpu = vec![0.0f32; m];
+        for r in 0..m {
+            let mut s = 0.0f32;
+            for c in 0..n {
+                let o = (r * n + c) * 4;
+                s += f32::from_le_bytes(w32[o..o + 4].try_into().unwrap()) * input[c];
+            }
+            cpu[r] = s;
+        }
+        let p = engine
+            .ggml_gemv_async(&engine.gemv_f32, "f32", m, n, &w32, &input)
+            .expect("enqueue f32");
+        let gpu = p.wait().expect("wait f32");
+        assert!(max_abs_diff(&cpu, &gpu) < 1e-3, "f32 mismatch");
+
+        // F16 (raw masked bytes; CPU uses the same f16 conversion)
+        let mut w16 = vec![0u8; m * n * 2];
+        for (i, b) in w16.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) & 0x1F) as u8;
+        }
+        let mut cpu = vec![0.0f32; m];
+        for r in 0..m {
+            let mut s = 0.0f32;
+            for c in 0..n {
+                let o = (r * n + c) * 2;
+                s += f16_to_f32(u16::from_le_bytes(w16[o..o + 2].try_into().unwrap())) * input[c];
+            }
+            cpu[r] = s;
+        }
+        let p = engine
+            .ggml_gemv_async(&engine.gemv_f16, "f16", m, n, &w16, &input)
+            .expect("enqueue f16");
+        let gpu = p.wait().expect("wait f16");
+        assert!(max_abs_diff(&cpu, &gpu) < 1e-3, "f16 mismatch");
+    }
+
+    #[test]
+    fn opencl_bf16_q8_1_q8_k_match_cpu_when_available() {
+        use hayai_model::gguf::f16_to_f32;
+        let Some(engine) = init_engine_or_skip("OpenCL bf16/q8_1/q8_k gemv test") else {
+            return;
+        };
+        let m = 16usize;
+        let input: Vec<f32> = (0..256).map(|i| (i as f32) * 0.01 - 0.7).collect();
+
+        // BF16: bits<<16.
+        let n = 64usize;
+        let inp = &input[..n];
+        let mut w = vec![0u8; m * n * 2];
+        for i in 0..(m * n) {
+            let v = ((i % 23) as f32 - 11.0) * 0.02;
+            let bits = (v.to_bits() >> 16) as u16;
+            w[i * 2..i * 2 + 2].copy_from_slice(&bits.to_le_bytes());
+        }
+        let mut cpu = vec![0.0f32; m];
+        for r in 0..m {
+            let mut s = 0.0f32;
+            for c in 0..n {
+                let o = (r * n + c) * 2;
+                let bits = (u16::from_le_bytes(w[o..o + 2].try_into().unwrap()) as u32) << 16;
+                s += f32::from_bits(bits) * inp[c];
+            }
+            cpu[r] = s;
+        }
+        let gpu = engine
+            .ggml_gemv_async(&engine.gemv_bf16, "bf16", m, n, &w, inp)
+            .expect("enqueue bf16")
+            .wait()
+            .expect("wait bf16");
+        assert!(max_abs_diff(&cpu, &gpu) < 1e-2, "bf16 mismatch");
+
+        // Q8_1: { half d; half s; int8 qs[32] } = 36 B / 32 elems.
+        let n = 64usize;
+        let blocks = n / 32;
+        let row_bytes = blocks * 36;
+        let mut w = vec![0u8; m * row_bytes];
+        for r in 0..m {
+            for bi in 0..blocks {
+                let base = r * row_bytes + bi * 36;
+                w[base..base + 2].copy_from_slice(&0x3800u16.to_le_bytes()); // f16 0.5
+                for j in 0..32 {
+                    w[base + 4 + j] = (((r + bi + j) % 11) as i8 - 5) as u8;
+                }
+            }
+        }
+        let mut cpu = vec![0.0f32; m];
+        for r in 0..m {
+            let mut s = 0.0f32;
+            for bi in 0..blocks {
+                let base = r * row_bytes + bi * 36;
+                let d = f16_to_f32(u16::from_le_bytes(w[base..base + 2].try_into().unwrap()));
+                for j in 0..32 {
+                    s += (w[base + 4 + j] as i8) as f32 * d * input[bi * 32 + j];
+                }
+            }
+            cpu[r] = s;
+        }
+        let gpu = engine
+            .ggml_gemv_async(&engine.gemv_q8_1, "q8_1", m, n, &w, &input[..n])
+            .expect("enqueue q8_1")
+            .wait()
+            .expect("wait q8_1");
+        assert!(max_abs_diff(&cpu, &gpu) < 1e-2, "q8_1 mismatch");
+
+        // Q8_K: { float d; int8 qs[256]; int16 bsums[16] } = 292 B / 256 elems.
+        let n = 256usize;
+        let row_bytes = 292;
+        let mut w = vec![0u8; m * row_bytes];
+        for r in 0..m {
+            let base = r * row_bytes;
+            w[base..base + 4].copy_from_slice(&0.013f32.to_le_bytes());
+            for j in 0..256 {
+                w[base + 4 + j] = (((r * 7 + j) % 13) as i8 - 6) as u8;
+            }
+        }
+        let mut cpu = vec![0.0f32; m];
+        for r in 0..m {
+            let base = r * row_bytes;
+            let d = f32::from_le_bytes(w[base..base + 4].try_into().unwrap());
+            let mut s = 0.0f32;
+            for j in 0..256 {
+                s += (w[base + 4 + j] as i8) as f32 * d * input[j];
+            }
+            cpu[r] = s;
+        }
+        let gpu = engine
+            .ggml_gemv_async(&engine.gemv_q8_k, "q8_k", m, n, &w, &input)
+            .expect("enqueue q8_k")
+            .wait()
+            .expect("wait q8_k");
+        assert!(max_abs_diff(&cpu, &gpu) < 1e-2, "q8_k mismatch");
+    }
+
+    #[test]
+    fn opencl_batched_q4_k_matches_cpu_when_available() {        use hayai_model::q4k::gemv_q4_k;
+
+        let Some(engine) = init_engine_or_skip("OpenCL batched q4_k test") else {
+            return;
+        };
+        let (m, n, batch) = (32usize, 256usize, 3usize);
+        let mut weights = vec![0u8; m * 144];
+        for (i, b) in weights.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) & 0x1F) as u8;
+        }
+        let inputs: Vec<f32> = (0..batch * n).map(|i| (i as f32) * 0.003 - 0.2).collect();
+        let mut outputs = vec![0.0f32; batch * m];
+        engine
+            .ggml_gemv_batched_q4_k(m, n, &weights, &inputs, &mut outputs, batch)
+            .expect("batched q4_k");
+        let mut expected = vec![0.0f32; batch * m];
+        for b in 0..batch {
+            gemv_q4_k(m, n, &weights, &inputs[b * n..(b + 1) * n], &mut expected[b * m..(b + 1) * m])
+                .unwrap();
+        }
+        assert!(max_abs_diff(&expected, &outputs) < 1e-3, "batched q4_k mismatch");
+    }
+
+    #[test]
+    fn opencl_spmm_adj_batched_matches_cpu_when_available() {
+        let Some(engine) = init_engine_or_skip("OpenCL spmm_adj test") else {
+            return;
+        };
+        let (d_in, d_out, n_cands, n_pos) = (64usize, 32usize, 2usize, 2usize);
+        let conns = d_in * d_out;
+        let mut adjs = vec![0u8; n_cands * (conns / 8)];
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        for b in adjs.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = ((rng >> 33) as u8) & 0b0101_0101;
+        }
+        let w: Vec<f32> = (0..d_out * d_in).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let x: Vec<f32> = (0..n_cands * n_pos * d_in)
+            .map(|i| (i as f32) * 0.002 - 0.1)
+            .collect();
+        let mut out = vec![0.0f32; n_cands * n_pos * d_out];
+        engine
+            .spmm_adj_batched(&x, &adjs, &w, n_cands, n_pos, d_in, d_out, &mut out)
+            .expect("spmm_adj_batched");
+        let mut exp = vec![0.0f32; out.len()];
+        for c in 0..n_cands {
+            for p in 0..n_pos {
+                let b = c * n_pos + p;
+                for j in 0..d_out {
+                    let mut acc = 0.0f32;
+                    for i in 0..d_in {
+                        let conn = i * d_out + j;
+                        if adjs[c * (conns / 8) + conn / 8] & (1 << (conn % 8)) != 0 {
+                            acc += x[b * d_in + i] * w[j * d_in + i];
+                        }
+                    }
+                    exp[b * d_out + j] = acc;
+                }
+            }
+        }
+        assert!(max_abs_diff(&exp, &out) < 1e-3, "spmm_adj_batched mismatch");
+    }
+
+    #[test]
+    fn opencl_spmm_adj_batched_q4_matches_cpu_when_available() {
+        use hayai_model::q4k::dequant_q4_k;
+
+        let Some(engine) = init_engine_or_skip("OpenCL spmm_adj_q4 test") else {
+            return;
+        };
+        let (d_in, d_out, n_cands, n_pos) = (256usize, 32usize, 1usize, 1usize);
+        let conns = d_in * d_out;
+        let mut adjs = vec![0u8; n_cands * (conns / 8)];
+        let mut rng: u64 = 0xdead_beef_1234_5678;
+        for b in adjs.iter_mut() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = ((rng >> 33) as u8) & 0b0101_0101;
+        }
+        let row_bytes = (d_in / 256) * 144;
+        let mut w4 = vec![0u8; d_out * row_bytes];
+        for (i, b) in w4.iter_mut().enumerate() {
+            *b = ((i * 131 + 17) & 0x1F) as u8;
+        }
+        let wf = dequant_q4_k(&w4, d_out * d_in).unwrap();
+        let x: Vec<f32> = (0..d_in).map(|i| (i as f32) * 0.002 - 0.1).collect();
+        let mut out = vec![0.0f32; d_out];
+        engine
+            .spmm_adj_batched_q4(&x, &adjs, &w4, n_cands, n_pos, d_in, d_out, &mut out)
+            .expect("spmm_adj_batched_q4");
+        let mut out_gpu = vec![0.0f32; d_out];
+        engine
+            .spmm_adj_batched_q4gpu(&x, &adjs, &w4, n_cands, n_pos, d_in, d_out, &mut out_gpu)
+            .expect("spmm_adj_batched_q4gpu");
+        let mut exp = vec![0.0f32; d_out];
+        for j in 0..d_out {
+            let mut acc = 0.0f32;
+            for i in 0..d_in {
+                let conn = i * d_out + j;
+                if adjs[conn / 8] & (1 << (conn % 8)) != 0 {
+                    acc += x[i] * wf[j * d_in + i];
+                }
+            }
+            exp[j] = acc;
+        }
+        assert!(max_abs_diff(&exp, &out) < 1e-3, "spmm_adj_batched_q4 mismatch");
+        assert!(
+            max_abs_diff(&exp, &out_gpu) < 1e-3,
+            "spmm_adj_batched_q4gpu mismatch"
         );
     }
 }

@@ -11,6 +11,7 @@ use crate::simd_ops::{simd_dot, simd_dot_i8_channel};
 pub const DEFAULT_RECENT_FP_TOKENS: usize = 32;
 
 /// Bounded KV with sinks + sliding window.
+#[derive(Clone)]
 pub struct BoundedKvCache {
     pub max_seq_len: usize,
     pub num_sink_tokens: usize,
@@ -248,6 +249,7 @@ impl BoundedKvCache {
 }
 
 /// Per-layer KV state: one bounded cache per KV head (GQA-friendly).
+#[derive(Clone)]
 pub struct LayerKvCache {
     pub heads: Vec<BoundedKvCache>,
 }

@@ -65,7 +65,6 @@ pub(crate) fn forward_moe(
             .units
             .iter()
             .find(|u| u.block_id == Some(layer))
-            .cloned()
             .ok_or_else(|| StreamInferError::Msg(format!("plan missing blk.{layer}")))?;
 
         // Compact non-expert (attn + router + shared expert) offsets. Expert tensors
@@ -83,35 +82,68 @@ pub(crate) fn forward_moe(
         }
 
         // Stage non-expert tensors into the layer slot (resident: preloaded once;
-        // streaming: prefetched by the previous layer or loaded here).
+        // streaming: served from the bounded non-expert RAM cache, from the
+        // prefetched slot, or read from disk on the first token of this layer).
         scratch.prepare_host_write(&orch.pool, layer)?;
         let non_expert_prefetched = prefetched_ready;
         prefetched_ready = false;
-        if !scratch.resident && !non_expert_prefetched {
-            let t_io = Instant::now();
-            {
-                let specs: Vec<(&str, usize, usize, usize)> = loaded
-                    .iter()
-                    .map(|(t, o)| (t.name.as_str(), 0, *o, t.nbytes))
-                    .collect();
-                let dst = scratch.host_slot_mut(layer);
-                gen.catalog.load_tensors_into(&specs, dst)?;
+        if !scratch.resident {
+            let cached_hit = gen
+                .moe_non_expert
+                .as_ref()
+                .and_then(|c| c.get(layer))
+                .and_then(|c| c.as_deref())
+                .is_some();
+            if cached_hit {
+                // RAM hit: memcpy the compact non-expert block, zero disk I/O.
+                let cache = gen.moe_non_expert.as_ref().expect("cache");
+                let buf = cache[layer].as_deref().expect("cached");
+                scratch.host_slot_mut(layer)[..off].copy_from_slice(buf);
+            } else {
+                if !non_expert_prefetched {
+                    let t_io = Instant::now();
+                    {
+                        let specs: Vec<(&str, usize, usize, usize)> = loaded
+                            .iter()
+                            .map(|(t, o)| (t.name.as_str(), 0, *o, t.nbytes))
+                            .collect();
+                        let dst = scratch.host_slot_mut(layer);
+                        gen.catalog.load_tensors_into(&specs, dst)?;
+                    }
+                    gen.io_secs += t_io.elapsed().as_secs_f64();
+                    gen.io_bytes += off as u64;
+                }
+                // Cache the freshly staged block if it fits the budget.
+                if gen.moe_non_expert_bytes + off <= gen.moe_non_expert_cap {
+                    let bytes = scratch.host_slot(layer)[..off].to_vec().into_boxed_slice();
+                    let cache = gen
+                        .moe_non_expert
+                        .get_or_insert_with(|| vec![None; n_layers]);
+                    if cache[layer].is_none() {
+                        cache[layer] = Some(bytes);
+                        gen.moe_non_expert_bytes += off;
+                    }
+                }
             }
-            gen.io_secs += t_io.elapsed().as_secs_f64();
-            gen.io_bytes += off as u64;
         }
 
         // ── Prefetch the NEXT layer's non-expert into the other ping-pong slot ──
         // Spawned BEFORE attention so the I/O overlaps with this layer's compute.
+        // Skipped when the next layer is already in the RAM cache.
         // Streaming (block_k<=1) only: in macro-chunk mode each layer lives at
         // `(layer % block_k) × stride` inside its block slot, so the simple
         // `(layer+1) % 2` ping-pong target is invalid.
-        if !scratch.resident && scratch.block_k <= 1 && layer + 1 < n_layers {
+        let next_cached = gen
+            .moe_non_expert
+            .as_ref()
+            .and_then(|c| c.get(layer + 1))
+            .map(|c| c.is_some())
+            .unwrap_or(false);
+        if !scratch.resident && scratch.block_k <= 1 && layer + 1 < n_layers && !next_cached {
             let next_unit = plan
                 .units
                 .iter()
-                .find(|u| u.block_id == Some(layer + 1))
-                .cloned();
+                .find(|u| u.block_id == Some(layer + 1));
             if let Some(next_unit) = next_unit {
                 let mut specs: Vec<(String, usize, usize, usize)> = Vec::new();
                 let mut noff = 0usize;
@@ -123,7 +155,7 @@ pub(crate) fn forward_moe(
                     specs.push((t.name.clone(), 0, noff, t.nbytes));
                     noff += t.nbytes;
                 }
-                let ptr = gen.prepare_prefetch_slot(orch, scratch, (layer + 1) % 2)?;
+                let mut ptr = gen.prepare_prefetch_slot(orch, scratch, (layer + 1) % 2)?;
                 let mut cat = gen.catalog.fork_reader()?;
                 prefetch = Some(std::thread::spawn(move || {
                     let refs: Vec<(&str, usize, usize, usize)> = specs
@@ -173,6 +205,8 @@ pub(crate) fn forward_moe(
             }
         }
         gen.attn_secs += t_attn.elapsed().as_secs_f64();
+        // Optional depthwise causal short-conv residual (generic `Conv` op).
+        gen.apply_conv(layer, &mut x)?;
 
         // ── Router → top-k (CPU; small hidden → n_expert GEMV) ──────────────────
         let mut xn = x.clone();
@@ -270,46 +304,40 @@ pub(crate) fn forward_moe(
                 expert_meta.push((i, *eid, base_off, gate.nrows.max(up.nrows)));
             }
             if orch.pool.is_empty() {
-                // CPU: synchronous per expert.
-                for &(i, eid, base_off, ff) in &expert_meta {
-                    let expert = unit
-                        .experts
-                        .iter()
-                        .find(|e| e.expert_id == eid)
-                        .ok_or_else(|| {
-                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
-                        })?;
-                    let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
-                    let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
-                    let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
-                    let mut g = vec![0.0f32; ff];
-                    let mut u = vec![0.0f32; ff];
-                    let mut d = vec![0.0f32; h];
-                    orch.execute_op(
-                        LayerOpKind::ExpertGate,
-                        op_binding(LayerOpKind::ExpertGate),
-                        &gate,
-                        &xn,
-                        &mut g,
-                    )?;
-                    orch.execute_op(
-                        LayerOpKind::ExpertUp,
-                        op_binding(LayerOpKind::ExpertUp),
-                        &up,
-                        &xn,
-                        &mut u,
-                    )?;
-                    for j in 0..ff {
-                        g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
-                    }
-                    orch.execute_op(
-                        LayerOpKind::ExpertDown,
-                        op_binding(LayerOpKind::ExpertDown),
-                        &down,
-                        &g,
-                        &mut d,
-                    )?;
-                    let w = weights[i];
+                // CPU: experts are independent → evaluate them in parallel (rayon).
+                use rayon::prelude::*;
+                let partials: Vec<(f32, Vec<f32>)> = expert_meta
+                    .par_iter()
+                    .map(
+                        |&(i, eid, base_off, ff)| -> Result<(f32, Vec<f32>), StreamInferError> {
+                            let expert = unit
+                                .experts
+                                .iter()
+                                .find(|e| e.expert_id == eid)
+                                .ok_or_else(|| {
+                                    StreamInferError::Msg(format!(
+                                        "top-k expert {eid} not in plan"
+                                    ))
+                                })?;
+                            let gate =
+                                expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
+                            let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
+                            let down =
+                                expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
+                            let mut g = vec![0.0f32; ff];
+                            let mut u = vec![0.0f32; ff];
+                            let mut d = vec![0.0f32; h];
+                            gate.gemv(&xn, &mut g)?;
+                            up.gemv(&xn, &mut u)?;
+                            for j in 0..ff {
+                                g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
+                            }
+                            down.gemv(&g, &mut d)?;
+                            Ok((weights[i], d))
+                        },
+                    )
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (w, d) in partials {
                     for j in 0..h {
                         acc[j] += w * d[j];
                     }
@@ -333,12 +361,18 @@ pub(crate) fn forward_moe(
                     let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
                     let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
                     gate_pending.push(crate::orchestrator::begin_gemv_engine(
-                        orch.pool.for_role(0),
+                        orch
+                            .pool
+                            .for_role(0)
+                            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?,
                         &gate,
                         &xn,
                     )?);
                     up_pending.push(crate::orchestrator::begin_gemv_engine(
-                        orch.pool.for_role(1),
+                        orch
+                            .pool
+                            .for_role(1)
+                            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?,
                         &up,
                         &xn,
                     )?);
@@ -364,7 +398,10 @@ pub(crate) fn forward_moe(
                         })?;
                     let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
                     down_pending.push(crate::orchestrator::begin_gemv_engine(
-                        orch.pool.for_role(0),
+                        orch
+                            .pool
+                            .for_role(0)
+                            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?,
                         &down,
                         &g[..],
                     )?);

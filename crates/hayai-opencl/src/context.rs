@@ -16,8 +16,6 @@ pub enum OpenClError {
     NoDeviceFound,
     #[error("OpenCL runtime error: {0}")]
     ClError(String),
-    #[error("No OpenCL GEMV kernel for GGML type: {0}")]
-    UnsupportedQuant(String),
     #[error("OpenCL 3.0 required, but device reports {0}")]
     UnsupportedPlatformVersion(String),
 }
@@ -48,6 +46,9 @@ pub struct OpenClEngine {
     pub gemv_iq2_s: Kernel,
     pub gemv_f32: Kernel,
     pub gemv_f16: Kernel,
+    pub gemv_bf16: Kernel,
+    pub gemv_q8_1: Kernel,
+    pub gemv_q8_k: Kernel,
     /// SpMM CSR del FFN disperso (DAG irregular, GGUF de `saor`).
     pub spmm_csr: Kernel,
     /// SpMM esparso batcheado desde bit-tensor + pesos F32 compartidos (Fase 2, C4).
@@ -56,6 +57,8 @@ pub struct OpenClEngine {
     pub spmm_adj_batched_q4: Kernel,
     /// Dequant Q4_K -> F32 batcheado (encadenado con `spmm_adj_batched`).
     pub dequant_q4_k_to_f32: Kernel,
+    /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
+    pub ffn_calls: std::sync::atomic::AtomicU64,
 }
 
 impl OpenClEngine {
@@ -64,10 +67,16 @@ impl OpenClEngine {
         let best = devices
             .iter()
             .find(|d| d.device_kind == DeviceKind::DiscreteGpu)
+            .or_else(|| devices.iter().find(|d| d.device_kind == DeviceKind::Apu))
             .or_else(|| {
                 devices
                     .iter()
                     .find(|d| d.device_kind == DeviceKind::IntegratedGpu)
+            })
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|d| d.device_kind == DeviceKind::Accelerator)
             })
             .or_else(|| {
                 devices
@@ -152,6 +161,12 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("f32 kernel: {}", e)))?;
         let gemv_f16 = Kernel::create(&program, "ggml_gemv_f16")
             .map_err(|e| OpenClError::ClError(format!("f16 kernel: {}", e)))?;
+        let gemv_bf16 = Kernel::create(&program, "ggml_gemv_bf16")
+            .map_err(|e| OpenClError::ClError(format!("bf16 kernel: {}", e)))?;
+        let gemv_q8_1 = Kernel::create(&program, "ggml_gemv_q8_1")
+            .map_err(|e| OpenClError::ClError(format!("q8_1 kernel: {}", e)))?;
+        let gemv_q8_k = Kernel::create(&program, "ggml_gemv_q8_k")
+            .map_err(|e| OpenClError::ClError(format!("q8_k kernel: {}", e)))?;
         let spmm_csr = Kernel::create(&program, "spmm_csr")
             .map_err(|e| OpenClError::ClError(format!("spmm_csr kernel: {}", e)))?;
         let spmm_adj_batched = Kernel::create(&program, "spmm_adj_batched")
@@ -191,10 +206,14 @@ impl OpenClEngine {
             gemv_iq2_s,
             gemv_f32,
             gemv_f16,
+            gemv_bf16,
+            gemv_q8_1,
+            gemv_q8_k,
             spmm_csr,
             spmm_adj_batched,
             spmm_adj_batched_q4,
             dequant_q4_k_to_f32,
+            ffn_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 

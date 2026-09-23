@@ -1,108 +1,88 @@
 //! Chat template rendering.
 //!
 //! Resolution chain (per model): CLI `--chat-template` override → GGUF metadata
-//! `tokenizer.chat_template` (Jinja) → built-in ChatML fallback.
+//! `tokenizer.chat_template` (Jinja) → built-in ChatML fallback. All Jinja
+//! rendering goes through [`Tokenizer::render_chat_template_override`] so the
+//! CLI and the server share exactly one implementation (including the
+//! `raise_exception` / `strftime_now` / `tools` shims).
 
 use hayai_model::Tokenizer;
 
 /// Default fallback: ChatML (SmolLM/Qwen-style).
 const DEFAULT_CHATML: &str = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
 
-/// A compiled (or fallback) chat template for one model.
+/// A chat template for one model: an optional override plus the tokenizer's own.
 pub struct ChatTemplate {
-    env: Option<minijinja::Environment<'static>>,
-    default_chatml: bool,
+    override_template: Option<String>,
 }
 
 impl ChatTemplate {
-    pub fn from_model(tokenizer: &Tokenizer, override_template: Option<&str>) -> Self {
-        let raw = override_template
-            .map(str::to_owned)
-            .or_else(|| tokenizer.chat_template.clone())
-            .unwrap_or_else(|| DEFAULT_CHATML.to_string());
-
-        if raw == DEFAULT_CHATML {
-            return Self {
-                env: None,
-                default_chatml: true,
-            };
-        }
-
-        let raw = hayai_model::Tokenizer::normalize_jinja_template(&raw);
-
-        let mut env = minijinja::Environment::new();
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
-        env.add_filter("startswith", |s: &str, prefix: &str| s.starts_with(prefix));
-        env.add_filter("endswith", |s: &str, suffix: &str| s.ends_with(suffix));
-        if env.add_template_owned("chat", raw.clone()).is_err() {
-            // Invalid template: fall back to ChatML rather than failing requests.
-            tracing::warn!("invalid chat template; falling back to ChatML");
-            return Self {
-                env: None,
-                default_chatml: true,
-            };
-        }
+    pub fn from_model(_tokenizer: &Tokenizer, override_template: Option<&str>) -> Self {
         Self {
-            env: Some(env),
-            default_chatml: false,
+            override_template: override_template.map(str::to_owned),
         }
     }
 
     /// Render the messages (plus optional generation prompt) to a prompt string.
     pub fn render(
         &self,
-        messages: &[(String, String)],
+        messages: &[serde_json::Value],
         add_generation_prompt: bool,
         tokenizer: &Tokenizer,
+        tools: &serde_json::Value,
     ) -> String {
-        match &self.env {
-            Some(env) => {
-                let tpl = env.get_template("chat").unwrap();
-                let msgs: Vec<serde_json::Value> = messages
-                    .iter()
-                    .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
-                    .collect();
-                let bos = tokenizer
-                    .tokens
-                    .get(tokenizer.bos_id as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                let eos = tokenizer
-                    .tokens
-                    .get(tokenizer.eos_id as usize)
-                    .cloned()
-                    .unwrap_or_default();
-                let ctx = minijinja::Value::from_serialize(&serde_json::json!({
-                    "messages": msgs,
-                    "add_generation_prompt": add_generation_prompt,
-                    "bos_token": bos,
-                    "eos_token": eos,
-                }));
-                let rendered = tpl.render(ctx).unwrap_or_default();
-                for w in tokenizer.unresolved_specials(&rendered) {
-                    tracing::warn!(
-                        "chat template references special token missing from vocab: {w}"
-                    );
+        let raw = self
+            .override_template
+            .clone()
+            .or_else(|| tokenizer.chat_template.clone());
+        if let Some(raw) = raw {
+            let mut warnings = Vec::new();
+            match tokenizer.render_chat_template_override_values(
+                &raw,
+                messages,
+                add_generation_prompt,
+                tools,
+                &mut warnings,
+            ) {
+                Ok(rendered) => {
+                    for w in warnings {
+                        tracing::warn!("chat template: {w}");
+                    }
+                    return rendered;
                 }
-                rendered
-            }
-            None => {
-                debug_assert!(self.default_chatml);
-                let mut s = String::new();
-                for (role, content) in messages {
-                    s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+                Err(e) => {
+                    tracing::warn!("{e}; using ChatML fallback");
                 }
-                if add_generation_prompt {
-                    s.push_str("<|im_start|>assistant\n");
-                }
-                s
             }
         }
+        Self::chatml_fallback(messages, add_generation_prompt)
+    }
+
+    fn chatml_fallback(messages: &[serde_json::Value], add_generation_prompt: bool) -> String {
+        let mut s = String::new();
+        for m in messages {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            s.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+        }
+        if add_generation_prompt {
+            s.push_str("<|im_start|>assistant\n");
+        }
+        s
     }
 
     /// Convenience: render without the generation prompt (used by tests).
-    pub fn render_messages(&self, messages: &[(String, String)], tokenizer: &Tokenizer) -> String {
-        self.render(messages, true, tokenizer)
+    pub fn render_messages(
+        &self,
+        messages: &[serde_json::Value],
+        tokenizer: &Tokenizer,
+    ) -> String {
+        self.render(messages, true, tokenizer, &serde_json::json!([]))
+    }
+
+    /// The built-in ChatML template (exposed so callers can detect the default).
+    pub fn default_chatml() -> &'static str {
+        DEFAULT_CHATML
     }
 }
 
@@ -111,8 +91,8 @@ mod tests {
     use super::*;
 
     fn tokenizer_with_template(tmpl: &str) -> Tokenizer {
-        use std::collections::HashMap;
         use hayai_model::MetadataValue;
+        use std::collections::HashMap;
         let mut meta = HashMap::new();
         meta.insert(
             "tokenizer.ggml.tokens".to_string(),
@@ -134,10 +114,7 @@ mod tests {
     fn chatml_default_fallback() {
         let tok = tokenizer_with_template("{% for m in messages %}{{ m['role'] }}:{{ m['content'] }}\\n{% endfor %}");
         let tpl = ChatTemplate::from_model(&tok, None);
-        let out = tpl.render_messages(
-            &[("user".into(), "hi".into())],
-            &tok,
-        );
+        let out = tpl.render_messages(&[serde_json::json!({"role":"user","content":"hi"})], &tok);
         assert_eq!(out, "user:hi\\n");
     }
 
@@ -145,7 +122,34 @@ mod tests {
     fn override_template_wins() {
         let tok = tokenizer_with_template("IGNORED");
         let tpl = ChatTemplate::from_model(&tok, Some("{{ messages[0]['content'] }}"));
-        let out = tpl.render_messages(&[("user".into(), "hi".into())], &tok);
+        let out = tpl.render_messages(&[serde_json::json!({"role":"user","content":"hi"})], &tok);
         assert_eq!(out, "hi");
+    }
+
+    #[test]
+    fn raise_exception_falls_back_to_chatml() {
+        let tok = tokenizer_with_template("{{ raise_exception('nope') }}");
+        let tpl = ChatTemplate::from_model(&tok, None);
+        let out = tpl.render_messages(&[serde_json::json!({"role":"user","content":"hi"})], &tok);
+        assert!(out.contains("<|im_start|>user"));
+    }
+
+    #[test]
+    fn tools_are_passed_to_template() {
+        // Template advertises the available function names, as tool templates do.
+        let tok = tokenizer_with_template(
+            "{% for t in tools %}{{ t['function']['name'] }};{% endfor %}",
+        );
+        let tpl = ChatTemplate::from_model(&tok, None);
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"get_weather","parameters":{}}}
+        ]);
+        let out = tpl.render(
+            &[serde_json::json!({"role":"user","content":"hi"})],
+            true,
+            &tok,
+            &tools,
+        );
+        assert_eq!(out, "get_weather;");
     }
 }

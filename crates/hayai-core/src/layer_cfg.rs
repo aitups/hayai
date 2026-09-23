@@ -105,21 +105,24 @@ pub fn resolve_full_attn_cfg(
     Ok(cfg)
 }
 
-/// KV caches sized per full-attn layer; DeltaNet/NextN get unused 1×1 placeholders.
+/// KV caches sized per full-attn layer; DeltaNet gets a 1×1 placeholder. The
+/// NextN/MTP draft block is itself a full-attention layer, so it gets a real KV
+/// cache (the main trunk skips it, but the MTP head needs it).
 pub fn build_hybrid_kv_caches(
     cat: &GgufCatalog,
     config: &ModelConfig,
     sink: usize,
     window: usize,
 ) -> Result<Vec<LayerKvCache>, GgufError> {
-    let mut out = Vec::with_capacity(config.num_layers);
-    for i in 0..config.num_layers {
+    let mut out = Vec::with_capacity(config.num_layers + 1);
+    let n_slots = config.num_layers + usize::from(is_nextn_layer(cat, config.num_layers));
+    for i in 0..n_slots {
         match hybrid_layer_kind(cat, i) {
-            HybridLayerKind::FullAttn => {
+            HybridLayerKind::FullAttn | HybridLayerKind::NextN => {
                 let cfg = resolve_full_attn_cfg(cat, i, config)?;
                 out.push(LayerKvCache::new(cfg.num_kv_heads, cfg.head_dim, sink, window));
             }
-            HybridLayerKind::DeltaNet | HybridLayerKind::NextN => {
+            HybridLayerKind::DeltaNet => {
                 out.push(LayerKvCache::new(1, 1, sink, window));
             }
         }

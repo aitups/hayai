@@ -10,5 +10,6 @@ hayai-cpu.workspace = true
 hayai-io.workspace = true
 hayai-model.workspace = true
 tokio.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

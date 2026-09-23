@@ -100,6 +100,7 @@ cargo run --release -p hayai-cli -- generate \
 | Command | Description |
 | --- | --- |
 | `info` | Discover OpenCL devices, transfer paths (SVM / pinned), CPU SIMD backend |
+| `calibrate` | Measure host/disk/device bandwidth and print 75–80% utilization targets (see `CALIBRATION.md`) |
 | `bench` | MatMul micro-benchmark (SmolLM-135M FFN layer, Q4) — OpenCL when available, else CPU |
 | `validate` | Validate Q4 LUT MatMul against an FP32 reference (CPU vs OpenCL) |
 | `bench-io` | Streaming I/O pipeline benchmark: disk → ping-pong → compute/upload (synthetic model) |
@@ -270,9 +271,7 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 | Qwen 3.5 | hybrid DeltaNet (SSM/linear attention) + full attention + MTP `nextn` draft head |
 | MoE | router (`ffn_gate_inp`) + per-expert (`ffn_exp.E.*`) and fused-3D (`ffn_*_exps.*`) experts; **sparse streaming**: only the top-k experts are read per token (~`top_k/n_expert` of the FFN disk bandwidth). Validated on OLMoE-1B-7B (64 experts / 8 active) |
 
-**Quantization formats:** F32/F16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-family (Q2_K–Q6_K, Q8_K), and IQ2/IQ3/IQ4. **IQ1/TQ** types are recognized but raise a hard unsupported-type error.
-
-**Quantization formats:** F32/F16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, the K-family (Q2_K–Q6_K, Q8_K), and IQ2/IQ3/IQ4. **IQ1/TQ** types are recognized but raise a hard unsupported-type error.
+**Quantization formats:** F32/F16, Q4_0/Q4_1, Q5_0/Q5_1, Q8_0, the K-family (Q2_K–Q6_K), and IQ2/IQ3/IQ4 (BF16 has CPU GEMV only). **Q8_K/Q8_1** are recognized but size-only; **IQ1/TQ** raise a hard unsupported-type error.
 
 ---
 
