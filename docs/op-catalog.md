@@ -56,8 +56,8 @@ Rules:
 
 | Tensor | Reason |
 |---|---|
-| `gate_up` / `gate_up_proj` / `ffn_gate_up[_exps]` | Fused gate+up FFN; needs a row split at pack load |
 | `relative_attention_bias` / `cross_attn` / `.encoder.` / `.decoder.` | T5/BART are encoder-decoder — a separate architecture class, not yet implemented |
+| `ffn_gate_up_exps` (fused experts) | Fused per-expert gate+up; needs a 3D row split |
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
 | anything unrecognized | Register a `LayerOpKind` + classifier arm + `op_binding` (see `docs/adding-a-model-family.md`) |
 
@@ -67,6 +67,8 @@ Rules:
   (LayerNorm) vs `layer_norm_rms_epsilon` (RMSNorm); norm biases (`*_norm.bias`) are
   preloaded and applied.
 - **Ungated FFN** (`up → gelu → down`, no `ffn_gate`): GPT-2 / BLOOM / OPT / Falcon.
+- **Fused gate+up** (`ffn_gate_up` / HF `gate_up_proj`, Phi-3): `FfnGateUp`, rows
+  concat `[gate | up]` split at pack load.
 - **FFN / QKV / output biases**: preloaded once and applied by the Dense path
   (fused `attn_qkv.bias` is split `[q|k|v]`).
 - **Learned positions** (`position_embd`) and **input-embedding LayerNorm**

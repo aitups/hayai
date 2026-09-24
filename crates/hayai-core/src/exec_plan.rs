@@ -46,6 +46,9 @@ pub enum LayerOpKind {
     FfnGate,
     FfnUp,
     FfnDown,
+    /// Fused gate+up (`ffn_gate_up.weight` / HF `gate_up_proj`): rows concat
+    /// `[gate | up]`, split by rows at pack load.
+    FfnGateUp,
     /// FFN sparse DAG (GGUF disperso de `saor`): bit-tensor de adyacencia
     /// (`ffn_dag_adjacency`, I8 bytes, LSB-first).
     FfnDagAdjacency,
@@ -162,7 +165,7 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         | PleProjNorm | PlePostNorm | TokenEmbedNorm => OpBinding::CPU_NORM,
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
         | DeltaNet | Mamba | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
-        FfnGate | FfnUp | FfnDown | ExpertGate | ExpertUp | ExpertDown | SharedExpert
+        FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown | SharedExpert
         | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
         LayerOutputScale | Aux => OpBinding::DISCARD,
@@ -633,12 +636,10 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 6: dense FFN. ──────────────────────────────────────────────────
-    // Fused gate+up (`gate_up_proj` / `ffn_gate_up`) is a real op but the dense
-    // loader would silently treat it as one half — fail loudly until split at load.
+    // Fused gate+up (`gate_up_proj` / `ffn_gate_up`): split into gate/up by rows
+    // at pack load (`load_layer_pack_into`).
     if n.contains("gate_up") || n.contains("gateup") {
-        return Err(format!(
-            "fused FFN gate+up tensor not implemented in the streaming path (needs split): {name}"
-        ));
+        return Ok(FfnGateUp);
     }
     if n.contains("ffn_gate") || n.contains("gate_proj") {
         return Ok(FfnGate);
@@ -1149,9 +1150,16 @@ mod tests {
     /// silently treated as an existing op or swallowed by `Aux`.
     #[test]
     fn unimplemented_ops_fail_loudly() {
-        // Fused gate+up (Phi-3 `gate_up_proj`, `ffn_gate_up`, fused experts).
-        assert!(cls("blk.0.ffn_gate_up.weight").is_err());
-        assert!(cls("model.layers.0.mlp.gate_up_proj.weight").is_err());
+        // Fused gate+up is split by rows at pack load (Phi-3 `gate_up_proj`).
+        assert_eq!(
+            cls("blk.0.ffn_gate_up.weight").unwrap(),
+            LayerOpKind::FfnGateUp
+        );
+        assert_eq!(
+            cls("model.layers.0.mlp.gate_up_proj.weight").unwrap(),
+            LayerOpKind::FfnGateUp
+        );
+        // Fused expert gate+up is still unimplemented (loud).
         assert!(cls("blk.0.ffn_gate_up_exps.weight").is_err());
         // Learned absolute position embeddings (GPT-2 `wpe`) are a cataloged op.
         assert_eq!(

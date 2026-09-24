@@ -419,7 +419,42 @@ pub fn load_ffn_matrices(
         // CSR de los bloques FFN sustituidos (D16): índice 0=gate, 1=up, 2=down.
         let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
         let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
+        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up].
+        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
+        let fused_gate_up =
+            self.tensor(&names[4]).is_err() && self.tensor(&gate_up_name).is_ok();
         for (i, name) in names.iter().enumerate() {
+            if fused_gate_up && i == 5 {
+                continue; // up is the second half of the fused tensor
+            }
+            if fused_gate_up && i == 4 {
+                let info = self.tensor(&gate_up_name).cloned().unwrap();
+                let nbytes = tensor_nbytes(&info)?;
+                if off + nbytes > dst.len() {
+                    return Err(GgufError::Msg(format!(
+                        "layer {layer} fused gate_up {nbytes}B at {off} exceeds scratch {}",
+                        dst.len()
+                    )));
+                }
+                let abs = self.tensor_abs_offset(&info);
+                ranges.push(IoRange {
+                    offset: abs,
+                    start: off,
+                    end: off + nbytes,
+                });
+                let half = nbytes / 2;
+                let half_rows = info.nrows() / 2;
+                offs[4] = off;
+                lens[4] = half;
+                dims[4] = (info.ncols(), half_rows);
+                types[4] = info.ggml_type;
+                offs[5] = off + half;
+                lens[5] = half;
+                dims[5] = (info.ncols(), half_rows);
+                types[5] = info.ggml_type;
+                off += nbytes;
+                continue;
+            }
             match self.tensor(name).cloned() {
                 Ok(info) => {
                     let nbytes = tensor_nbytes(&info)?;
@@ -714,7 +749,36 @@ pub fn load_ffn_matrices(
         let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
         let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
         let mut off = 0usize;
+        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up].
+        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
+        let fused_gate_up =
+            self.tensor(&names[2]).is_err() && self.tensor(&gate_up_name).is_ok();
         for (i, name) in names.iter().enumerate() {
+            if fused_gate_up && i == 3 {
+                continue;
+            }
+            if fused_gate_up && i == 2 {
+                let info = self.tensor(&gate_up_name).cloned().unwrap();
+                let nbytes = tensor_nbytes(&info)?;
+                if off + nbytes > base.len() {
+                    return Err(GgufError::Msg(format!(
+                        "layer {layer} fused gate_up {nbytes}B at {off} exceeds base {}",
+                        base.len()
+                    )));
+                }
+                let half = nbytes / 2;
+                let half_rows = info.nrows() / 2;
+                offs[2] = off;
+                lens[2] = half;
+                dims[2] = (info.ncols(), half_rows);
+                types[2] = info.ggml_type;
+                offs[3] = off + half;
+                lens[3] = half;
+                dims[3] = (info.ncols(), half_rows);
+                types[3] = info.ggml_type;
+                off += nbytes;
+                continue;
+            }
             match self.tensor(name).cloned() {
                 Ok(info) => {
                     let nbytes = tensor_nbytes(&info)?;
@@ -922,7 +986,31 @@ pub fn load_ffn_matrices(
         ];
         let mut ranges: Vec<IoRange> = Vec::with_capacity(6);
         let mut off = 0usize;
-        for name in &names {
+        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up] — read once.
+        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
+        let fused_gate_up =
+            self.tensor(&names[2]).is_err() && self.tensor(&gate_up_name).is_ok();
+        for (i, name) in names.iter().enumerate() {
+            if fused_gate_up && i == 3 {
+                continue;
+            }
+            if fused_gate_up && i == 2 {
+                let info = self.tensor(&gate_up_name).cloned().unwrap();
+                let nbytes = tensor_nbytes(&info)?;
+                if off + nbytes > dst.len() {
+                    return Err(GgufError::Msg(format!(
+                        "layer {layer} fused gate_up {nbytes}B at {off} exceeds scratch {}",
+                        dst.len()
+                    )));
+                }
+                ranges.push(IoRange {
+                    offset: self.tensor_abs_offset(&info),
+                    start: off,
+                    end: off + nbytes,
+                });
+                off += nbytes;
+                continue;
+            }
             match self.tensor(name).cloned() {
                 Ok(info) => {
                     let nbytes = tensor_nbytes(&info)?;
@@ -1080,6 +1168,15 @@ pub fn load_ffn_matrices(
                 total += tensor_nbytes(info)?;
             }
         }
+        // Fused `ffn_gate_up` replaces the separate gate/up tensors.
+        if self
+            .tensor(&format!("blk.{layer}.ffn_gate.weight"))
+            .is_err()
+        {
+            if let Ok(info) = self.tensor(&format!("blk.{layer}.ffn_gate_up.weight")) {
+                total += tensor_nbytes(info)?;
+            }
+        }
         Ok(total)
     }
 
@@ -1108,6 +1205,15 @@ pub fn load_ffn_matrices(
         for n in &names {
             // FFN disperso embebido (D16): el tensor denso no existe -> 0 bytes.
             if let Ok(info) = self.tensor(n) {
+                total += tensor_nbytes(info)?;
+            }
+        }
+        // Fused `ffn_gate_up` replaces the separate gate/up tensors.
+        if self
+            .tensor(&format!("blk.{layer}.ffn_gate.weight"))
+            .is_err()
+        {
+            if let Ok(info) = self.tensor(&format!("blk.{layer}.ffn_gate_up.weight")) {
                 total += tensor_nbytes(info)?;
             }
         }
@@ -1561,6 +1667,42 @@ mod tests {
     use crate::gguf::write_minimal_gguf;
     use crate::gguf_types::MetadataValue;
     use std::env::temp_dir;
+
+    #[test]
+    fn fused_gate_up_pack_splits_by_rows() {
+        let path = temp_dir().join("hayai_fused_gate_up.gguf");
+        let hidden = 4usize;
+        let inter = 3usize;
+        // Fused `ffn_gate_up`: `[2*inter, hidden]`, rows `[0..inter]` = gate, rest = up.
+        let gate_up: Vec<f32> = (0..(hidden * 2 * inter)).map(|i| i as f32).collect();
+        let down: Vec<f32> = (0..(inter * hidden)).map(|i| i as f32).collect();
+        write_minimal_gguf(
+            &path,
+            &[],
+            &[
+                ("blk.0.attn_q.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_k.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_v.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_output.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.ffn_gate_up.weight", vec![hidden as u64, (2 * inter) as u64], gate_up),
+                ("blk.0.ffn_down.weight", vec![inter as u64, hidden as u64], down),
+            ],
+        )
+        .unwrap();
+        let mut cat = GgufCatalog::open(&path).unwrap();
+        let n = cat.layer_pack_nbytes(0).unwrap();
+        let mut dst = vec![0u8; n];
+        let (pack, layout) = cat.load_layer_pack_into(0, &mut dst).unwrap();
+        assert_eq!(pack.gate.nrows, inter);
+        assert_eq!(pack.up.nrows, inter);
+        assert_eq!(pack.gate.ncols, hidden);
+        let row_bytes = hidden * 4; // F32
+        assert_eq!(layout.gate_len, inter * row_bytes);
+        assert_eq!(layout.up_len, inter * row_bytes);
+        assert_eq!(layout.up_off, layout.gate_off + inter * row_bytes);
+        assert_eq!(layout.total, n);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn catalog_reads_without_mmap_payload() {
