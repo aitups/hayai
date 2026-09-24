@@ -703,6 +703,19 @@ fn mla_attention(
     for i in 0..h {
         x[i] += proj[i];
     }
+    if std::env::var("HAYAI_MLA_DUMP").ok().as_deref() == Some("1") && layer == 0 {
+        eprintln!(
+            "MLA_DUMP layer=0 pos={} scale={:.5} c_kv[0..3]={:?} k_pe[0..3]={:?} q[0..3]={:?} q_pe[0..3]={:?} k_nope[0..3]={:?} attn[0..3]={:?}",
+            pos,
+            scale,
+            &c_kv[..3.min(c_kv.len())],
+            &k_pe_snapshot[..3.min(k_pe_snapshot.len())],
+            &q[..3],
+            &q[m.qk_nope..m.qk_nope + 3],
+            &kv[..3],
+            &attn[..3]
+        );
+    }
     Ok(())
 }
 
