@@ -9,7 +9,7 @@
 //! 5. Per-expert gate/up/down via `execute_op` (GpuAsync binding → OpenCL pool),
 //!    SiLU gating, softmax routing weights, accumulated residual.
 
-use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, TensorRef};
+use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, MoeMeta, TensorRef};
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{StreamInferError, StreamingGenerator};
 use hayai_cpu::{attention_decode_step, rms_norm};
@@ -222,8 +222,12 @@ pub(crate) fn forward_moe(
                 &xn,
                 &mut scores,
             )?;
-            let top = top_k_indices(&scores, mm.top_k);
-            let weights = softmax_weights(&scores, &top);
+            let bias = gen
+                .moe_router_bias
+                .as_ref()
+                .and_then(|v| v.get(layer))
+                .and_then(|b| b.as_deref());
+            let (top, weights) = route_experts(&scores, bias, &mm);
             (top, weights)
         };
 
@@ -640,6 +644,72 @@ fn softmax_weights(scores: &[f32], top: &[usize]) -> Vec<f32> {
     w
 }
 
+/// MoE routing (llama.cpp `build_moe_ffn`): grouped top-k selection with an optional
+/// `e_score_correction_bias` (applied to the *choice* scores only), softmax or
+/// sigmoid gating, optional top-k normalization and a routed scaling factor.
+/// Returns `(expert_ids, weights)`.
+pub(crate) fn route_experts(
+    scores: &[f32],
+    correction_bias: Option<&[f32]>,
+    meta: &MoeMeta,
+) -> (Vec<usize>, Vec<f32>) {
+    let n = scores.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    // `e_score_correction_bias` shifts the selection scores but not the weights.
+    let choice: Vec<f32> = match correction_bias {
+        Some(b) => scores.iter().zip(b.iter()).map(|(s, b)| s + b).collect(),
+        None => scores.to_vec(),
+    };
+    let grouped = meta.n_group > 0 && meta.topk_group > 0 && n % meta.n_group == 0;
+    let top: Vec<usize> = if grouped {
+        // Group score = sum of the top-2 experts in the group; keep `topk_group`.
+        let gs = n / meta.n_group;
+        let mut group_scores: Vec<(usize, f32)> = (0..meta.n_group)
+            .map(|g| {
+                let mut vals: Vec<f32> = (0..gs).map(|j| choice[g * gs + j]).collect();
+                vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                (g, vals.iter().take(2).sum())
+            })
+            .collect();
+        group_scores
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut cand: Vec<usize> = Vec::with_capacity(meta.topk_group * gs);
+        for (g, _) in group_scores.into_iter().take(meta.topk_group) {
+            cand.extend((0..gs).map(|j| g * gs + j));
+        }
+        let k = meta.top_k.max(1).min(cand.len().max(1));
+        cand.sort_by(|&a, &b| choice[b].partial_cmp(&choice[a]).unwrap_or(std::cmp::Ordering::Equal));
+        cand.truncate(k);
+        cand
+    } else {
+        top_k_indices(&choice, meta.top_k)
+    };
+    let mut weights: Vec<f32> = if meta.gating == 1 {
+        // Sigmoid gating (DeepSeek V3 / GLM): raw scores through the sigmoid.
+        top.iter()
+            .map(|&e| 1.0 / (1.0 + (-scores[e]).exp()))
+            .collect()
+    } else {
+        softmax_weights(scores, &top)
+    };
+    if meta.norm_topk_prob {
+        let sum: f32 = weights.iter().sum();
+        if sum > 0.0 {
+            for w in weights.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+    if (meta.routed_scaling_factor - 1.0).abs() > 1e-9 {
+        for w in weights.iter_mut() {
+            *w *= meta.routed_scaling_factor;
+        }
+    }
+    (top, weights)
+}
+
 /// Total bytes of one expert pack (gate + up + down).
 fn expert_pack_len(expert: &ExpertUnit) -> usize {
     expert.tensors.iter().map(|t| t.nbytes).sum()
@@ -729,6 +799,66 @@ mod tests {
         assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         // The best expert dominates the weight.
         assert!(w[0] > w[1]);
+    }
+
+    #[test]
+    fn route_experts_softmax_topk_normalized() {
+        let meta = MoeMeta {
+            expert_count: 5,
+            top_k: 2,
+            ..Default::default()
+        };
+        let scores = [0.1f32, 0.9, 0.3, 0.7, 0.2];
+        let (top, w) = route_experts(&scores, None, &meta);
+        assert_eq!(top, vec![1, 3]);
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn route_experts_correction_bias_selects_but_weights_raw_scores() {
+        let meta = MoeMeta {
+            expert_count: 4,
+            top_k: 1,
+            ..Default::default()
+        };
+        let scores = [1.0f32, 0.5, 0.0, -1.0];
+        let bias = [0.0f32, 10.0, 0.0, 0.0];
+        let (top, w) = route_experts(&scores, Some(&bias), &meta);
+        assert_eq!(top, vec![1]); // bias made expert 1 win the selection
+        assert!((w[0] - 1.0).abs() < 1e-6); // softmax over a single expert = 1
+    }
+
+    #[test]
+    fn route_experts_grouped_selects_within_kept_groups() {
+        // 4 experts, 2 groups of 2, keep 1 group, pick 1 expert.
+        let meta = MoeMeta {
+            expert_count: 4,
+            top_k: 1,
+            n_group: 2,
+            topk_group: 1,
+            gating: 1,
+            ..Default::default()
+        };
+        let scores = [0.6f32, 0.5, 0.9, 0.1];
+        // group0 top-2 sum = 1.1 > group1 = 1.0 → group0 wins → expert 0.
+        let (top, _) = route_experts(&scores, None, &meta);
+        assert_eq!(top, vec![0]);
+    }
+
+    #[test]
+    fn route_experts_sigmoid_and_scaling() {
+        let meta = MoeMeta {
+            expert_count: 3,
+            top_k: 2,
+            gating: 1, // sigmoid
+            routed_scaling_factor: 2.0,
+            ..Default::default()
+        };
+        let scores = [0.0f32, 1.0, -1.0];
+        let (top, w) = route_experts(&scores, None, &meta);
+        assert_eq!(top, vec![1, 0]);
+        assert!((w[0] - 2.0 * 0.731_058_6).abs() < 1e-4); // sigmoid(1)*2
+        assert!((w[1] - 1.0).abs() < 1e-4); // sigmoid(0)*2
     }
 
     #[test]

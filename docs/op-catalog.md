@@ -38,6 +38,9 @@ Rules:
 | `PostFfnNorm` | `post_ffw_norm`, `post_mlp_norm` | CPU_NORM | gemma4 |
 | `LayerOutputScale` | `layer_output_scale` | DISCARD (preloaded scalar) | gemma4 |
 | `Router` | `router`, `gate_inp`, `block_sparse_moe.gate`, `moe.gate`, `mlp.gate.weight` | CPU_GEMV | MoE |
+| `RouterBias` | `ffn_gate_inp.bias` — `e_score_correction_bias` (DeepSeek V3) | DISCARD (preloaded) | choice-score bias |
+| `RouterScale` | `ffn_gate_inp.scale` | DISCARD (preloaded) | router input scale |
+| `ExpertScale` | `ffn_*_exps.scale` (length `n_expert`) | DISCARD (preloaded) | per-expert scale |
 | `ExpertGate`/`ExpertUp`/`ExpertDown` | `ffn_exp.E.ffn_*`, `experts.E.{w1,w2,w3,gate/up/down_proj}` | GPU_ASYNC | MoE (fused 3D slices) |
 | `SharedExpert` | `shared_expert`, `ffn_shexp` | GPU_ASYNC | MoE |
 | `DeltaNet` | `delta`, `linear_attn`, `ssm*`, `conv1d`, `in_proj_qkv(z)`, `in_proj_ba`, `shortconv.out_proj` | CPU_GEMV | hybrid (Qwen3.5) |
@@ -80,6 +83,20 @@ Rules:
   `apply_rope_partial_factors_scaled`.
 - Validated: `gpt2-small-danish` → "København er hovedstaden i **Danmark**";
   tiny-random BLOOM reproduces llama.cpp's greedy output exactly (`orldorld…`).
+
+## MoE routing (modern)
+
+`route_experts(scores, correction_bias, meta)` (`crates/hayai-core/src/moe_infer.rs`)
+implements llama.cpp `build_moe_ffn`:
+
+- **Grouped top-k**: `{arch}.expert_group_count` / `expert_group_used_count`; the
+  group score is the sum of its top-2 experts (DeepSeek V3).
+- **Gating**: `{arch}.expert_gating_func` 0 = softmax (Mixtral/Qwen-MoE) or 1 =
+  sigmoid (DeepSeek V3 / GLM).
+- **`e_score_correction_bias`**: `ffn_gate_inp.bias` shifts the *selection* scores
+  but not the weights.
+- **`norm_topk_prob`** (`expert_weights_norm`) and **`routed_scaling_factor`**
+  (`expert_weights_scale`).
 
 ## Adding an op
 

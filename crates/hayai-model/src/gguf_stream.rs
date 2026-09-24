@@ -232,6 +232,13 @@ impl GgufCatalog {
         self.metadata.get(key).and_then(|v| v.as_bool_array())
     }
 
+    pub fn meta_bool(&self, key: &str) -> Option<bool> {
+        match self.metadata.get(key) {
+            Some(crate::gguf_types::MetadataValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
     /// Number of interleave blocks (attention heads) for a head-interleaved fused
     /// QKV tensor (`hayai.attn_qkv_interleave_repeats`). `None`/1 → concat layout.
     pub fn qkv_interleave_repeats(&self) -> Option<usize> {

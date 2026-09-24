@@ -61,6 +61,13 @@ pub enum LayerOpKind {
     LayerOutputScale,
     /// MoE router — `ffn_gate_inp.weight` / HF `block_sparse_moe.gate.weight`.
     Router,
+    /// MoE router selection bias (`ffn_gate_inp.bias`, DeepSeek V3
+    /// `e_score_correction_bias`): preloaded, applied to the choice scores.
+    RouterBias,
+    /// MoE router input scale (`ffn_gate_inp.scale`): preloaded (passive here).
+    RouterScale,
+    /// Per-expert scale (`ffn_*_exps.scale`, length `n_expert`): preloaded.
+    ExpertScale,
     /// Per-expert FFN matrices — `ffn_exp.E.ffn_gate/up/down` / HF `experts.E.w1/w2/w3`.
     ExpertGate,
     ExpertUp,
@@ -168,7 +175,7 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown | SharedExpert
         | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
-        LayerOutputScale | Aux => OpBinding::DISCARD,
+        LayerOutputScale | Aux | RouterBias | RouterScale | ExpertScale => OpBinding::DISCARD,
     }
 }
 
@@ -199,10 +206,34 @@ pub struct TensorRef {
 
 /// MoE metadata from GGUF keys (`{arch}.expert_count` /
 /// `{arch}.attention.expert_used_count`), with llama.cpp/HF fallbacks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoeMeta {
     pub expert_count: usize,
     pub top_k: usize,
+    /// Grouped routing (`{arch}.expert_group_count` / `expert_group_used_count`);
+    /// 0 = no grouping (Mixtral/Qwen-MoE).
+    pub n_group: usize,
+    pub topk_group: usize,
+    /// `{arch}.expert_gating_func`: 0 = softmax, 1 = sigmoid (DeepSeek V3/GLM).
+    pub gating: u32,
+    /// `{arch}.expert_weights_norm` (`norm_topk_prob`).
+    pub norm_topk_prob: bool,
+    /// `{arch}.expert_weights_scale` (`routed_scaling_factor`).
+    pub routed_scaling_factor: f32,
+}
+
+impl Default for MoeMeta {
+    fn default() -> Self {
+        Self {
+            expert_count: 0,
+            top_k: 1,
+            n_group: 0,
+            topk_group: 0,
+            gating: 0,
+            norm_topk_prob: false,
+            routed_scaling_factor: 1.0,
+        }
+    }
 }
 
 /// One MoE expert's tensor group. Offsets are relative to the expert pack start.
@@ -575,6 +606,17 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 3: MoE router — before dense FFN (`ffn_gate_inp` ⊃ `ffn_gate`). ─
+    // Router bias/scale and per-expert scales are preloaded out-of-band (they are
+    // not expert matrices) — classify them before the generic router/expert arms.
+    if n.ends_with("ffn_gate_inp.bias") {
+        return Ok(RouterBias);
+    }
+    if n.ends_with("ffn_gate_inp.scale") {
+        return Ok(RouterScale);
+    }
+    if n.ends_with("_exps.scale") || n.ends_with("exps.scale") {
+        return Ok(ExpertScale);
+    }
     if n.contains("router")
         || n.contains("gate_inp")
         || n.contains("block_sparse_moe.gate")
@@ -841,10 +883,37 @@ pub fn detect_moe_meta(cat: &GgufCatalog) -> Option<MoeMeta> {
         .or_else(|| cat.meta_u32("llama.attention.expert_used_count"))
         .map(|v| v as usize);
     match (expert_count, top_k) {
-        (Some(n), Some(k)) if n > 0 && k > 0 => Some(MoeMeta {
-            expert_count: n,
-            top_k: k,
-        }),
+        (Some(n), Some(k)) if n > 0 && k > 0 => {
+            let n_group = cat
+                .meta_u32(&format!("{arch}.expert_group_count"))
+                .or_else(|| cat.meta_u32("llama.expert_group_count"))
+                .unwrap_or(0) as usize;
+            let topk_group = cat
+                .meta_u32(&format!("{arch}.expert_group_used_count"))
+                .or_else(|| cat.meta_u32("llama.expert_group_used_count"))
+                .unwrap_or(0) as usize;
+            let gating = cat
+                .meta_u32(&format!("{arch}.expert_gating_func"))
+                .or_else(|| cat.meta_u32("llama.expert_gating_func"))
+                .unwrap_or(0);
+            let norm_topk_prob = cat
+                .meta_bool(&format!("{arch}.expert_weights_norm"))
+                .or_else(|| cat.meta_bool("llama.expert_weights_norm"))
+                .unwrap_or(false);
+            let routed_scaling_factor = cat
+                .meta_f32(&format!("{arch}.expert_weights_scale"))
+                .or_else(|| cat.meta_f32("llama.expert_weights_scale"))
+                .unwrap_or(1.0);
+            Some(MoeMeta {
+                expert_count: n,
+                top_k: k,
+                n_group,
+                topk_group,
+                gating,
+                norm_topk_prob,
+                routed_scaling_factor,
+            })
+        }
         _ => None,
     }
 }
@@ -1030,6 +1099,19 @@ mod tests {
         assert_eq!(
             cls("blk.0.ffn_gate_inp.weight").unwrap(),
             LayerOpKind::Router
+        );
+        // Router bias / scales are preloaded out-of-band, not expert matrices.
+        assert_eq!(
+            cls("blk.0.ffn_gate_inp.bias").unwrap(),
+            LayerOpKind::RouterBias
+        );
+        assert_eq!(
+            cls("blk.0.ffn_gate_inp.scale").unwrap(),
+            LayerOpKind::RouterScale
+        );
+        assert_eq!(
+            cls("blk.0.ffn_down_exps.scale").unwrap(),
+            LayerOpKind::ExpertScale
         );
         assert_eq!(
             cls("blk.0.ffn_exp.0.ffn_gate.weight").unwrap(),
@@ -1256,13 +1338,9 @@ mod tests {
         let plan = build_exec_plan(&cat, 0, false).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(
-            plan.moe,
-            Some(MoeMeta {
-                expert_count: 4,
-                top_k: 2
-            })
-        );
+        let moe = plan.moe.expect("moe meta");
+        assert_eq!(moe.expert_count, 4);
+        assert_eq!(moe.top_k, 2);
         let unit = plan.units.iter().find(|u| u.block_id == Some(0)).unwrap();
         assert_eq!(unit.experts.len(), 4);
         assert_eq!(unit.experts[0].expert_id, 0);

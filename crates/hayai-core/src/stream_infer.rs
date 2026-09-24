@@ -439,6 +439,8 @@ pub struct StreamingGenerator {
     pub(crate) deltanet_states: Option<Vec<Option<crate::deltanet::DeltaNetState>>>,
     /// MoE expert LRU cache (colibri-style) — host RAM, sized at session start.
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
+    /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
+    pub(crate) moe_router_bias: Option<Vec<Option<Vec<f32>>>>,
 }
 
 impl StreamingGenerator {
@@ -743,6 +745,18 @@ impl StreamingGenerator {
         if n_attn_bias > 0 {
             info!("Attention biases: {n_attn_bias} layer(s) with q/k/v/o bias");
         }
+        // MoE router `e_score_correction_bias` (`ffn_gate_inp.bias`), preloaded once.
+        let moe_router_bias = if ModelKind::from_catalog(&catalog) == ModelKind::MoE {
+            let v: Vec<Option<Vec<f32>>> = (0..n_slots)
+                .map(|l| catalog.dequant_f32(&format!("blk.{l}.ffn_gate_inp.bias")).ok())
+                .collect();
+            if v.iter().any(|b| b.is_some()) {
+                info!("MoE: router correction bias loaded for {} layer(s)", v.iter().filter(|b| b.is_some()).count());
+            }
+            Some(v)
+        } else {
+            None
+        };
         let conv_activation = catalog
             .meta_str("hayai.conv_activation")
             .map(ConvActivation::parse)
@@ -848,6 +862,7 @@ impl StreamingGenerator {
             deltanet_weights: None,
             deltanet_states: None,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
+            moe_router_bias,
             memory_strategy: MemoryStrategy::AutoFit,
             window_plan: None,
             resident_output: None,
