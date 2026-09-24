@@ -189,14 +189,15 @@ pub(crate) fn forward_moe(
             let wo = view_of(&base, &loaded, LayerOpKind::AttnO)?;
             let mut q = vec![0.0f32; q_dim];
             wq.gemv(&xn, &mut q)?;
-            // Per-head Q/K RMSNorm (Gemma/OLMoE-style) when present.
+            // Q/K RMSNorm: per-head (`weight.len()==head_dim`, Gemma) or over the whole
+            // projection (`weight.len()==q_dim`, OLMoE).
             if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
-                crate::gemma_infer::apply_head_rmsnorm(&mut q, qn, cfg.num_heads, cfg.head_dim);
+                apply_qk_norm(&mut q, qn, cfg.num_heads, cfg.head_dim, eps);
             }
             let mut k = vec![0.0f32; kv_dim];
             wk.gemv(&xn, &mut k)?;
             if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
-                crate::gemma_infer::apply_head_rmsnorm(&mut k, kn, cfg.num_kv_heads, cfg.head_dim);
+                apply_qk_norm(&mut k, kn, cfg.num_kv_heads, cfg.head_dim, eps);
             }
             let mut v = vec![0.0f32; kv_dim];
             wv.gemv(&xn, &mut v)?;
@@ -566,6 +567,16 @@ fn dump_top_logits(logits: &[f32], k: usize) {
 }
 
 /// View over a non-expert tensor of the block (compact offset).
+/// Q/K RMSNorm: flat over the whole projection when the weight matches `x`
+/// (OLMoE `attn_q_norm` has dim `n_embd`), else per-head (Gemma).
+fn apply_qk_norm(x: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    if weight.len() == x.len() && weight.len() != head_dim {
+        rms_norm(x, weight, eps);
+    } else {
+        crate::gemma_infer::apply_head_rmsnorm(x, weight, n_heads, head_dim);
+    }
+}
+
 /// MLA (non-absorbed) attention for one layer. `attn_q` (lite) or `q_a`→`q_b`,
 /// `attn_kv_a_mqa` → latent, `attn_kv_b` → per-head `[k_nope | v]`, RoPE on the
 /// trailing `qk_rope` dims, against the compressed K/V cache. DeepSeek-V2-Lite.
