@@ -448,7 +448,25 @@ pub fn load_ffn_matrices(
                     dims[i] = (0, 0);
                     types[i] = crate::gguf_types::GgmlType::F32;
                 }
-                Err(_) if i >= 4 => {
+                Err(_) if i == 4 => {
+                    // Sparse DAG replacement, or ungated FFN (GPT-2/BLOOM: no gate).
+                    match load_embedded_csr(self, &format!("blk.{layer}.ffn_gate"))? {
+                        Some((csr, cdim)) => {
+                            offs[4] = off;
+                            lens[4] = 0;
+                            dims[4] = cdim;
+                            types[4] = crate::gguf_types::GgmlType::F32;
+                            ffn_csrs[0] = Some(csr);
+                        }
+                        None => {
+                            offs[4] = off;
+                            lens[4] = 0;
+                            dims[4] = (0, 0);
+                            types[4] = crate::gguf_types::GgmlType::F32;
+                        }
+                    }
+                }
+                Err(_) if i >= 5 => {
                     // Tensor denso ausente: bloque disperso embebido (D16).
                     let base = format!("blk.{layer}.{}", ffn_blocks[i - 4]);
                     let (csr, cdim) = load_embedded_csr(self, &base)?
@@ -712,7 +730,25 @@ pub fn load_ffn_matrices(
                     types[i] = info.ggml_type;
                     off += nbytes;
                 }
-                Err(_) if i >= 2 => {
+                Err(_) if i == 2 => {
+                    // Sparse DAG replacement, or ungated FFN (GPT-2/BLOOM: no gate).
+                    match load_embedded_csr(self, &format!("blk.{layer}.ffn_gate"))? {
+                        Some((csr, cdim)) => {
+                            offs[2] = off;
+                            lens[2] = 0;
+                            dims[2] = cdim;
+                            types[2] = crate::gguf_types::GgmlType::F32;
+                            ffn_csrs[0] = Some(csr);
+                        }
+                        None => {
+                            offs[2] = off;
+                            lens[2] = 0;
+                            dims[2] = (0, 0);
+                            types[2] = crate::gguf_types::GgmlType::F32;
+                        }
+                    }
+                }
+                Err(_) if i >= 3 => {
                     let base_name = format!("blk.{layer}.{}", ffn_blocks[i - 2]);
                     let (csr, cdim) = load_embedded_csr(self, &base_name)?
                         .ok_or_else(|| GgufError::MissingTensor(name.clone()))?;
@@ -903,10 +939,12 @@ pub fn load_ffn_matrices(
                     });
                     off += nbytes;
                 }
-                // Missing dense FFN -> embedded sparse CSR (nothing to read here).
+                // Missing dense FFN -> embedded sparse CSR, or an ungated FFN gate.
                 Err(_) if name.contains("ffn_") => {
                     let base_name = format!("blk.{layer}.{}", name.split('.').nth(2).unwrap_or(""));
-                    if load_embedded_csr(self, &base_name)?.is_none() {
+                    if load_embedded_csr(self, &base_name)?.is_none()
+                        && !name.ends_with("ffn_gate.weight")
+                    {
                         return Err(GgufError::MissingTensor(name.clone()));
                     }
                 }

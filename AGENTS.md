@@ -97,7 +97,11 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
 - Adding a model family = register a `LayerOpKind` + HW binding in `exec_plan.rs`, then an
   `*_infer.rs`. Per `layer_cfg.rs`, **never bake model-size constants** — head counts, SSM
   ranks, etc. must be resolved from tensor shapes so every size of a family works.
-  Step-by-step guide + checklist: `docs/adding-a-model-family.md`.
+  Step-by-step guide + checklist: `docs/adding-a-model-family.md`; the complete op→tensor
+  catalog (F2.11) is `docs/op-catalog.md`. The classifier is op-by-op with **safe aliases
+  only** and no `other` bucket: a real op that is not executed fails loudly
+  (`gate_up`/`gateup` fused FFN, `wpe`/`position_embd` learned positions), and a compute
+  `.proj.weight` is no longer swallowed by `Aux`.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
   `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a

@@ -142,6 +142,25 @@ impl BoundedKvCache {
         slots
     }
 
+    /// Absolute token position of each entry of [`Self::attention_slots`] (same order).
+    /// Used by ALiBi (BLOOM/Falcon/MPT), whose score bias depends on `q_pos - k_pos`.
+    pub fn attention_slot_positions(&self) -> Vec<usize> {
+        let resident = self.resident_len();
+        if resident == 0 {
+            return Vec::new();
+        }
+        if self.current_len <= self.max_seq_len {
+            return (0..resident).collect();
+        }
+        let mut pos = Vec::with_capacity(self.max_seq_len);
+        pos.extend(0..self.num_sink_tokens);
+        let win_start = self.current_len - self.window_size;
+        for i in 0..self.window_size {
+            pos.push(win_start + i);
+        }
+        pos
+    }
+
     fn recent_fp_for_slot(&self, slot: usize) -> Option<usize> {
         for i in 0..self.recent_len {
             let idx = if self.recent_len < self.recent_fp_tokens {
@@ -210,21 +229,34 @@ impl BoundedKvCache {
     }
 
     /// Softmax attention over resident slots (FP for recent, INT8 channel-wise otherwise).
+    ///
+    /// `alibi`: optional `(slope, query_position)` — adds `-slope * (q_pos - k_pos)`
+    /// to every score before softmax (BLOOM/Falcon/MPT).
     pub fn attend(
         &self,
         query: &[f32],
         scale: f32,
         scores_out: &mut Vec<f32>,
         acc: &mut [f32],
+        alibi: Option<(f32, usize)>,
     ) {
         assert_eq!(query.len(), self.dim);
         assert_eq!(acc.len(), self.dim);
         acc.fill(0.0);
         let slots = self.attention_slots();
+        let positions = if alibi.is_some() {
+            Some(self.attention_slot_positions())
+        } else {
+            None
+        };
         scores_out.clear();
         scores_out.reserve(slots.len());
-        for &slot in &slots {
-            scores_out.push(self.score_key(slot, query) * scale);
+        for (idx, &slot) in slots.iter().enumerate() {
+            let mut s = self.score_key(slot, query) * scale;
+            if let (Some((slope, q_pos)), Some(pos)) = (alibi, positions.as_ref()) {
+                s -= slope * (q_pos as f32 - pos[idx] as f32);
+            }
+            scores_out.push(s);
         }
         if scores_out.is_empty() {
             return;

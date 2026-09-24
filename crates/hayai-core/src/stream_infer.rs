@@ -8,7 +8,9 @@
 //!    (macro-pipeline: GPU FFN(N) overlaps CPU/I/O prep for N+1; Attn(N+1) follows
 //!    immediately — residual deps prevent Attn(N+1) before FFN(N) completes).
 
-use hayai_cpu::{attention_decode_step, rms_norm, AttentionConfig, LayerKvCache};
+use hayai_cpu::{
+    attention_decode_step, attention_decode_step_alibi, rms_norm, AttentionConfig, LayerKvCache,
+};
 use hayai_model::{
     sample_with, GgmlType, GgufCatalog, GgufError, LayerPackLayout, LayerWeightPack, ModelConfig,
     Penalties, QuantMatrix, SamplerConfig, Tokenizer,
@@ -126,6 +128,9 @@ pub enum StreamInferError {
 pub(crate) struct LayerNorms {
     pub(crate) attn_norm: Vec<f32>,
     pub(crate) ffn_norm: Vec<f32>,
+    /// LayerNorm biases (GPT-2/BLOOM/OPT): present only for LayerNorm models.
+    pub(crate) attn_norm_bias: Option<Vec<f32>>,
+    pub(crate) ffn_norm_bias: Option<Vec<f32>>,
     /// Gemma4 extra per-block norms/scales — preloaded once at session open so the
     /// decode hot path never issues per-token norm disk reads.
     pub(crate) attn_q_norm: Option<Vec<f32>>,
@@ -133,6 +138,80 @@ pub(crate) struct LayerNorms {
     pub(crate) post_attn_norm: Option<Vec<f32>>,
     pub(crate) post_ffw_norm: Option<Vec<f32>>,
     pub(crate) layer_output_scale: Option<f32>,
+}
+
+/// Dense FFN biases (`ffn_gate/up/down.bias`), preloaded once per model.
+#[derive(Clone, Default)]
+pub(crate) struct LayerFfnBias {
+    pub(crate) gate: Option<Vec<f32>>,
+    pub(crate) up: Option<Vec<f32>>,
+    pub(crate) down: Option<Vec<f32>>,
+}
+
+/// LayerNorm *in place* (mean/variance + weight + optional bias). GPT-2/BLOOM/OPT.
+pub(crate) fn layernorm_inplace(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    eps: f32,
+) {
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let inv = 1.0 / (var + eps).sqrt();
+    for i in 0..x.len() {
+        let w = weight.get(i).copied().unwrap_or(1.0);
+        let b = bias.and_then(|b| b.get(i)).copied().unwrap_or(0.0);
+        x[i] = (x[i] - mean) * inv * w + b;
+    }
+}
+
+/// Apply a norm with the model's norm kind (RMSNorm or LayerNorm).
+pub(crate) fn apply_norm(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: &Option<Vec<f32>>,
+    eps: f32,
+    layernorm: bool,
+) {
+    if layernorm {
+        layernorm_inplace(x, weight, bias.as_deref(), eps);
+    } else {
+        rms_norm(x, weight, eps);
+    }
+}
+
+/// GELU (tanh approximation) — classic ungated FFNs (GPT-2/BLOOM/OPT/Falcon).
+#[inline]
+pub(crate) fn gelu(x: f32) -> f32 {
+    const K: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (K * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+/// ALiBi slopes (HF `get_alibi_slopes`): `2^(-8*(h+1)/n)` for power-of-two head
+/// counts, interleaved otherwise (BLOOM/Falcon/MPT).
+pub(crate) fn alibi_slopes(n_head: usize) -> Vec<f32> {
+    fn pow2(n: usize) -> Vec<f32> {
+        let start = 2f64.powf(-(2f64.powf(-((n as f64).log2() - 3.0))));
+        (0..n)
+            .map(|i| (start * start.powi(i as i32)) as f32)
+            .collect()
+    }
+    if n_head == 0 {
+        return Vec::new();
+    }
+    let log2 = (n_head as f64).log2();
+    if log2.fract() == 0.0 {
+        pow2(n_head)
+    } else {
+        let closest = 2f64.powf(log2.floor()) as usize;
+        let mut slopes = pow2(closest);
+        let extra = alibi_slopes(2 * closest);
+        for &s in extra.iter().step_by(2).take(n_head - closest) {
+            slopes.push(s);
+        }
+        slopes
+    }
 }
 
 /// Attention projection biases (`attn_q/k/v/o.bias`), preloaded once per model.
@@ -250,6 +329,22 @@ pub struct StreamingGenerator {
     /// Cached Mamba selective-scan weights + recurrent state (op-driven SSM).
     pub(crate) mamba_cache: Option<crate::mamba_infer::MambaCache>,
     pub(crate) output_norm: Vec<f32>,
+    /// LayerNorm bias for the final norm (GPT-2/BLOOM/OPT), if any.
+    pub(crate) output_norm_bias: Option<Vec<f32>>,
+    /// Input-embedding LayerNorm (BLOOM `token_embd_norm`): `(weight, bias)`.
+    pub(crate) token_embed_norm: Option<(Vec<f32>, Vec<f32>)>,
+    /// Learned absolute position embeddings (`position_embd.weight`), flattened
+    /// `[max_pos × hidden]` (GPT-2). `None` for RoPE models.
+    pub(crate) learned_pos: Option<Vec<f32>>,
+    /// Per-layer dense FFN biases (`ffn_gate/up/down.bias`).
+    pub(crate) ffn_bias: Vec<LayerFfnBias>,
+    /// True when the model uses LayerNorm (mean+variance) instead of RMSNorm.
+    pub(crate) use_layernorm: bool,
+    /// Classic-transformer Dense features (LayerNorm / learned positions / input
+    /// LayerNorm): prefill falls back to the per-token Dense path.
+    pub(crate) simple_dense: bool,
+    /// ALiBi slopes (one per query head) for BLOOM/Falcon/MPT; `None` otherwise.
+    pub(crate) alibi_slopes: Option<Vec<f32>>,
     pub(crate) has_output_weight: bool,
     pub sampler: SamplerConfig,
     /// Repetition/presence/frequency/logit-bias adjustments applied at sampling time.
@@ -502,6 +597,14 @@ impl StreamingGenerator {
                 .dequant_f32(&format!("blk.{i}.ffn_norm.weight"))
                 .or_else(|_| catalog.dequant_f32(&format!("blk.{i}.post_attention_norm.weight")))
                 .unwrap_or_else(|_| ones(h));
+            // LayerNorm biases (GPT-2/BLOOM): present only for LayerNorm models.
+            let attn_norm_bias = catalog
+                .dequant_f32(&format!("blk.{i}.attn_norm.bias"))
+                .or_else(|_| catalog.dequant_f32(&format!("blk.{i}.attention_norm.bias")))
+                .ok();
+            let ffn_norm_bias = catalog
+                .dequant_f32(&format!("blk.{i}.ffn_norm.bias"))
+                .ok();
             // Gemma4 extra per-block norms/scales: read once here so the decode
             // hot path never issues per-token norm disk reads.
             let attn_q_norm = catalog
@@ -523,6 +626,8 @@ impl StreamingGenerator {
             layer_norms.push(LayerNorms {
                 attn_norm,
                 ffn_norm,
+                attn_norm_bias,
+                ffn_norm_bias,
                 attn_q_norm,
                 attn_k_norm,
                 post_attn_norm,
@@ -533,7 +638,47 @@ impl StreamingGenerator {
         let output_norm = catalog
             .dequant_f32("output_norm.weight")
             .unwrap_or_else(|_| ones(h));
+        let output_norm_bias = catalog.dequant_f32("output_norm.bias").ok();
+        // LayerNorm (`attention.layer_norm_epsilon`) vs RMSNorm (`..._rms_epsilon`).
+        let arch = config.architecture.clone();
+        let use_layernorm = catalog
+            .meta_f32(&format!("{arch}.attention.layer_norm_epsilon"))
+            .is_some()
+            && catalog
+                .meta_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .is_none();
+        // BLOOM input-embedding LayerNorm (`token_embd_norm` / `word_embeddings_layernorm`).
+        let token_embed_norm = match (
+            catalog
+                .dequant_f32("token_embd_norm.weight")
+                .or_else(|_| catalog.dequant_f32("word_embeddings_layernorm.weight")),
+            catalog
+                .dequant_f32("token_embd_norm.bias")
+                .or_else(|_| catalog.dequant_f32("word_embeddings_layernorm.bias")),
+        ) {
+            (Ok(w), Ok(b)) => Some((w, b)),
+            _ => None,
+        };
+        // Learned absolute position embeddings (GPT-2 `position_embd.weight`).
+        let learned_pos = catalog.dequant_f32("position_embd.weight").ok();
+        let ffn_bias: Vec<LayerFfnBias> = (0..n_slots)
+            .map(|l| LayerFfnBias {
+                gate: catalog.dequant_f32(&format!("blk.{l}.ffn_gate.bias")).ok(),
+                up: catalog.dequant_f32(&format!("blk.{l}.ffn_up.bias")).ok(),
+                down: catalog.dequant_f32(&format!("blk.{l}.ffn_down.bias")).ok(),
+            })
+            .collect();
         let has_output_weight = catalog.tensor("output.weight").is_ok();
+        let simple_dense = use_layernorm || learned_pos.is_some() || token_embed_norm.is_some();
+        // ALiBi (BLOOM/Falcon/MPT): score bias from absolute q/k positions.
+        let alibi_slopes = if matches!(
+            arch.as_str(),
+            "bloom" | "falcon" | "mpt" | "starcoder" | "refact" | "jais"
+        ) {
+            Some(alibi_slopes(config.num_attention_heads))
+        } else {
+            None
+        };
 
         let kv_slots = config
             .hrm
@@ -568,14 +713,30 @@ impl StreamingGenerator {
         };
         // Gemma4 proportional RoPE factors — loaded once, not per token.
         let gemma_rope_freqs = catalog.dequant_f32("rope_freqs.weight").ok();
-        // Attention biases (Qwen2/2.5 `attention_bias=true`, some Phi): small
-        // F32 vectors, loaded once for all layers so the hot path only adds them.
+        // Attention biases (Qwen2/2.5 `attention_bias=true`, GPT-2/BLOOM fused QKV):
+        // small F32 vectors, loaded once for all layers so the hot path only adds them.
+        let q_dim_b = attn_cfg.hidden_size();
+        let kv_dim_b = attn_cfg.kv_dim();
         let attn_bias: Vec<LayerAttnBias> = (0..n_slots)
-            .map(|l| LayerAttnBias {
-                q: catalog.dequant_f32(&format!("blk.{l}.attn_q.bias")).ok(),
-                k: catalog.dequant_f32(&format!("blk.{l}.attn_k.bias")).ok(),
-                v: catalog.dequant_f32(&format!("blk.{l}.attn_v.bias")).ok(),
-                o: catalog.dequant_f32(&format!("blk.{l}.attn_output.bias")).ok(),
+            .map(|l| {
+                let o = catalog.dequant_f32(&format!("blk.{l}.attn_output.bias")).ok();
+                let q = catalog.dequant_f32(&format!("blk.{l}.attn_q.bias")).ok();
+                let k = catalog.dequant_f32(&format!("blk.{l}.attn_k.bias")).ok();
+                let v = catalog.dequant_f32(&format!("blk.{l}.attn_v.bias")).ok();
+                // Fused `attn_qkv.bias` (concat [q|k|v]) → split per projection.
+                if q.is_none() && k.is_none() && v.is_none() {
+                    if let Ok(b) = catalog.dequant_f32(&format!("blk.{l}.attn_qkv.bias")) {
+                        if b.len() == q_dim_b + 2 * kv_dim_b {
+                            return LayerAttnBias {
+                                q: Some(b[..q_dim_b].to_vec()),
+                                k: Some(b[q_dim_b..q_dim_b + kv_dim_b].to_vec()),
+                                v: Some(b[q_dim_b + kv_dim_b..].to_vec()),
+                                o,
+                            };
+                        }
+                    }
+                }
+                LayerAttnBias { q, k, v, o }
             })
             .collect();
         let n_attn_bias = attn_bias.iter().filter(|b| !b.is_empty()).count();
@@ -622,6 +783,13 @@ impl StreamingGenerator {
             mtp_cache: None,
             mamba_cache: None,
             output_norm,
+            output_norm_bias,
+            token_embed_norm,
+            learned_pos,
+            ffn_bias,
+            use_layernorm,
+            simple_dense,
+            alibi_slopes,
             has_output_weight,
             sampler,
             penalties: Penalties::default(),
@@ -1088,11 +1256,24 @@ impl StreamingGenerator {
         self.act_pp[0].fill(0.0);
         let mut embed_buf = vec![0.0f32; h];
         self.embed_row("token_embd.weight", token, h, &mut embed_buf)?;
+        // GPT-2: add the learned absolute position embedding for this position.
+        if let Some(pos_emb) = &self.learned_pos {
+            let base = self.position * h;
+            if base + h <= pos_emb.len() {
+                for i in 0..h {
+                    embed_buf[i] += pos_emb[base + i];
+                }
+            }
+        }
+        // BLOOM: LayerNorm the input embeddings before the first block.
+        if let Some((w, b)) = &self.token_embed_norm {
+            layernorm_inplace(&mut embed_buf, w, Some(b.as_slice()), self.config.rms_norm_eps);
+        }
         self.act_pp[0].copy_from_slice(&embed_buf);
 
         // Macro-chunk decode: blocks of `block_k` layers per I/O batch.
         if let Some(sc) = scratch.as_mut() {
-            if sc.block_k > 1 && !sc.resident && override_ffn.is_none() {
+            if sc.block_k > 1 && !sc.resident && override_ffn.is_none() && !self.simple_dense {
                 return self.forward_macro_chunk(orch, sc);
             }
         }
@@ -1186,7 +1367,13 @@ impl StreamingGenerator {
             let sel = self.act_sel;
             self.scratch_xn.resize(h, 0.0);
             self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
-            rms_norm(&mut self.scratch_xn, &self.layer_norms[layer_idx].attn_norm, eps);
+            apply_norm(
+                &mut self.scratch_xn,
+                &self.layer_norms[layer_idx].attn_norm,
+                &self.layer_norms[layer_idx].attn_norm_bias,
+                eps,
+                self.use_layernorm,
+            );
 
             let q_dim = self.attn_cfg.hidden_size();
             let kv_dim = self.attn_cfg.kv_dim();
@@ -1201,15 +1388,28 @@ impl StreamingGenerator {
             }
 
             self.scratch_attn.resize(q_dim, 0.0);
-            attention_decode_step(
-                &self.attn_cfg,
-                &mut self.kv[layer_idx],
-                &mut self.scratch_q,
-                &mut self.scratch_k,
-                &self.scratch_v,
-                pos,
-                &mut self.scratch_attn,
-            );
+            if let Some(slopes) = &self.alibi_slopes {
+                attention_decode_step_alibi(
+                    &self.attn_cfg,
+                    &mut self.kv[layer_idx],
+                    &mut self.scratch_q,
+                    &mut self.scratch_k,
+                    &self.scratch_v,
+                    pos,
+                    &mut self.scratch_attn,
+                    slopes,
+                );
+            } else {
+                attention_decode_step(
+                    &self.attn_cfg,
+                    &mut self.kv[layer_idx],
+                    &mut self.scratch_q,
+                    &mut self.scratch_k,
+                    &self.scratch_v,
+                    pos,
+                    &mut self.scratch_attn,
+                );
+            }
             if let Some(ref gate_w) = current.attn_gate {
                 self.scratch_gate.resize(q_dim, 0.0);
                 gate_w.gemv(&self.scratch_xn, &mut self.scratch_gate)?;
@@ -1254,7 +1454,13 @@ impl StreamingGenerator {
 
             // --- FFN: unmap after Attn, then enqueue async ---
             self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
-            rms_norm(&mut self.scratch_xn, &self.layer_norms[layer_idx].ffn_norm, eps);
+            apply_norm(
+                &mut self.scratch_xn,
+                &self.layer_norms[layer_idx].ffn_norm,
+                &self.layer_norms[layer_idx].ffn_norm_bias,
+                eps,
+                self.use_layernorm,
+            );
 
             self.ws_gate.fill(0.0);
             self.ws_up.fill(0.0);
@@ -1273,7 +1479,9 @@ impl StreamingGenerator {
                 Some(o) => o.gate.is_some() || o.up.is_some() || o.down.is_some(),
                 None => false,
             };
-            let inflight = if has_ov || sparse_ffn {
+            // Ungated FFN (GPT-2/BLOOM/Falcon: `up → act → down`, no gate).
+            let ungated = current.gate.nrows == 0 && current.up.nrows > 0;
+            let inflight = if has_ov || sparse_ffn || ungated {
                 None
             } else {
                 Some(ffn_begin_gate_up_scratch(
@@ -1323,6 +1531,21 @@ impl StreamingGenerator {
                     layer_idx,
                     Some(&layout),
                 )?;
+            } else if ungated {
+                // CPU ungated FFN: `down(act(up(x) + b_up)) + b_down`.
+                let mut up = vec![0.0f32; current.up.nrows];
+                current.up.gemv(&self.scratch_xn, &mut up)?;
+                if let Some(lb) = self.ffn_bias.get(layer_idx) {
+                    add_bias(&mut up, &lb.up);
+                }
+                for v in up.iter_mut() {
+                    *v = gelu(*v);
+                }
+                self.ws_down.resize(current.down.nrows, 0.0);
+                current.down.gemv(&up, &mut self.ws_down)?;
+                if let Some(lb) = self.ffn_bias.get(layer_idx) {
+                    add_bias(&mut self.ws_down, &lb.down);
+                }
             } else {
                 // FFN disperso embebido (D16) u override de evolución: CSR en GPU/CPU.
                 let xn = self.scratch_xn.clone();
@@ -1362,7 +1585,7 @@ impl StreamingGenerator {
         }
 
         let mut xn = self.act().to_vec();
-        rms_norm(&mut xn, &self.output_norm, eps);
+        apply_norm(&mut xn, &self.output_norm, &self.output_norm_bias, eps, self.use_layernorm);
         self.last_hidden_nextn.clear();
         self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
@@ -1581,7 +1804,7 @@ impl StreamingGenerator {
 
         // Final projection (resident cache or on-demand).
         let mut xn = self.act().to_vec();
-        rms_norm(&mut xn, &self.output_norm, eps);
+        apply_norm(&mut xn, &self.output_norm, &self.output_norm_bias, eps, self.use_layernorm);
         self.last_hidden_nextn.clear();
         self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
@@ -2044,9 +2267,15 @@ impl StreamingGenerator {
                     crate::mamba_infer::prefill_mamba(self, orch, prompt_ids, scratch)
                 }
                 ModelKind::Dense => {
-                    // Prefill with Attn∥FFN wavefront (PRD §3.3), or the batched
-                    // layer-major path when `HAYAI_PREFILL_BATCH=1`.
-                    if std::env::var("HAYAI_PREFILL_BATCH").ok().as_deref() == Some("1") {
+                    // Classic-transformer Dense features (LayerNorm/positions/ungated
+                    // FFN) run through the per-token Dense path.
+                    if self.simple_dense {
+                        let mut last = Vec::new();
+                        for &tok in prompt_ids {
+                            last = self.forward_inner(orch, tok, Some(scratch), None)?;
+                        }
+                        Ok(last)
+                    } else if std::env::var("HAYAI_PREFILL_BATCH").ok().as_deref() == Some("1") {
                         self.prefill_batched(orch, prompt_ids, scratch)
                     } else {
                         self.prefill_wavefront(orch, prompt_ids, scratch)
@@ -3153,6 +3382,45 @@ fn build_attn_config(
         if rd > 0 && rd <= head_dim {
             cfg.rope_dim = rd;
         }
+    }
+    // RoPE scaling: linear (`freq_scale = 1/factor`) and YaRN (`ext_factor`/mscale).
+    let arch = &config.architecture;
+    let rs_type = cat
+        .meta_str(&format!("{arch}.rope.scaling.type"))
+        .or_else(|| cat.meta_str("llama.rope.scaling.type"))
+        .unwrap_or("none");
+    let rs_factor = cat
+        .meta_f32(&format!("{arch}.rope.scaling.factor"))
+        .or_else(|| cat.meta_f32("llama.rope.scaling.factor"))
+        .unwrap_or(1.0);
+    match rs_type {
+        "linear" => {
+            cfg.rope = hayai_cpu::RopeScaling {
+                freq_scale: 1.0 / rs_factor,
+                ..hayai_cpu::RopeScaling::NONE
+            };
+        }
+        "yarn" => {
+            let n_ctx_orig = cat
+                .meta_u32(&format!("{arch}.rope.scaling.original_context_length"))
+                .or_else(|| cat.meta_u32(&format!("{arch}.context_length")))
+                .unwrap_or(0) as usize;
+            cfg.rope = hayai_cpu::RopeScaling {
+                freq_scale: 1.0 / rs_factor,
+                ext_factor: 1.0,
+                attn_factor: cat
+                    .meta_f32(&format!("{arch}.rope.scaling.attn_factor"))
+                    .unwrap_or(1.0),
+                beta_fast: cat
+                    .meta_f32(&format!("{arch}.rope.scaling.beta_fast"))
+                    .unwrap_or(32.0),
+                beta_slow: cat
+                    .meta_f32(&format!("{arch}.rope.scaling.beta_slow"))
+                    .unwrap_or(1.0),
+                n_ctx_orig,
+            };
+        }
+        _ => {}
     }
     Ok(cfg)
 }

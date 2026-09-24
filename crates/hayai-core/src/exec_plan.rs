@@ -16,6 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum LayerOpKind {
     /// `token_embd.weight` — embedding lookup (host row read).
     TokenEmbed,
+    /// `token_embd_norm.weight/bias` — LayerNorm applied to the input embeddings
+    /// (BLOOM `word_embeddings_layernorm`), before the first block.
+    TokenEmbedNorm,
+    /// `position_embd.weight` / `wpe` — learned absolute position embeddings (GPT-2).
+    PositionEmbed,
     /// `output_norm.weight` — final norm before the LM head.
     OutputNorm,
     /// `output.weight` / `lm_head.weight` — vocabulary projection.
@@ -152,8 +157,9 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
     use LayerOpKind::*;
     match kind {
         TokenEmbed | PleEmbed => OpBinding::HOST_ROW,
+        PositionEmbed => OpBinding::HOST_ROW,
         OutputNorm | AttnNorm | AttnQNorm | AttnKNorm | PostAttnNorm | FfnNorm | PostFfnNorm
-        | PleProjNorm | PlePostNorm => OpBinding::CPU_NORM,
+        | PleProjNorm | PlePostNorm | TokenEmbedNorm => OpBinding::CPU_NORM,
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
         | DeltaNet | Mamba | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
         FfnGate | FfnUp | FfnDown | ExpertGate | ExpertUp | ExpertDown | SharedExpert
@@ -479,24 +485,21 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     let n = name.to_ascii_lowercase();
 
     // ── Bias tensors ─────────────────────────────────────────────────────────
-    // Attention q/k/v/o biases are executed out-of-band: `StreamingGenerator`
-    // preloads `blk.N.attn_q/k/v/output.bias` into `attn_bias`. Unhandled
-    // compute-affecting biases (FFN / output projection) must fail loudly instead
-    // of being silently dropped (that bug made Qwen2.5 produce garbage). Other
-    // biases (e.g. `ssm_dt.bias`) are consumed by their family path below.
+    // Compute biases are preloaded once per model and applied by the execution
+    // paths (attention q/k/v/qkv/o, FFN gate/up/down, output). Norm biases
+    // (`*_norm.bias`) fall through to their norm op below (LayerNorm).
     if n.contains("bias") {
-        let handled_attn = n.ends_with("attn_q.bias")
+        let is_compute_bias = n.ends_with("attn_q.bias")
             || n.ends_with("attn_k.bias")
             || n.ends_with("attn_v.bias")
             || n.ends_with("attn_output.bias")
+            || n.ends_with("attn_qkv.bias")
             || n.ends_with("q_proj.bias")
             || n.ends_with("k_proj.bias")
             || n.ends_with("v_proj.bias")
-            || n.ends_with("o_proj.bias");
-        if handled_attn {
-            return Ok(Aux);
-        }
-        let unhandled = n.ends_with("ffn_gate.bias")
+            || n.ends_with("o_proj.bias")
+            || n.ends_with("qkv_proj.bias")
+            || n.ends_with("ffn_gate.bias")
             || n.ends_with("ffn_up.bias")
             || n.ends_with("ffn_down.bias")
             || n.ends_with("gate_proj.bias")
@@ -505,10 +508,8 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
             || n.ends_with("output.bias")
             || n.ends_with("lm_head.bias")
             || n.ends_with("token_embd.bias");
-        if unhandled {
-            return Err(format!(
-                "compute-affecting bias tensor not implemented in the streaming path: {name}"
-            ));
+        if is_compute_bias {
+            return Ok(Aux);
         }
     }
 
@@ -532,15 +533,42 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 2: global embeddings / output head. ────────────────────────────
-    if n.contains("token_embd") || n.ends_with("embed_tokens.weight") || n.contains("tok_embeddings")
+    // Input-embedding LayerNorm (BLOOM `token_embd_norm`/`word_embeddings_layernorm`).
+    if n.contains("token_embd_norm")
+        || n.contains("word_embeddings_layernorm")
+        || n.contains("embed_norm")
+    {
+        return Ok(TokenEmbedNorm);
+    }
+    if n.contains("token_embd")
+        || n.ends_with("embed_tokens.weight")
+        || n.contains("tok_embeddings")
+        || n.contains("word_embeddings")
+        || n.contains("embed_in")
+        || n.ends_with("wte.weight")
     {
         return Ok(TokenEmbed);
     }
-    if n.contains("output_norm") || n.ends_with("model.norm.weight") || n == "norm.weight" {
+    if n.contains("output_norm")
+        || n.ends_with("model.norm.weight")
+        || n == "norm.weight"
+        || n.contains("final_layer_norm")
+        || n.contains("final_layernorm")
+        || n.ends_with("ln_f.weight")
+    {
         return Ok(OutputNorm);
     }
-    if n == "output.weight" || n.ends_with("lm_head.weight") {
+    if n == "output.weight" || n.ends_with("lm_head.weight") || n.ends_with("embed_out.weight") {
         return Ok(OutputProj);
+    }
+    // Learned absolute position embeddings (GPT-2 `position_embd` / `wpe`): added to
+    // the input embeddings by row `position`.
+    if n.ends_with("wpe.weight")
+        || n.contains("position_embd")
+        || n.contains("position_embedding")
+        || n.ends_with("pos_embd.weight")
+    {
+        return Ok(PositionEmbed);
     }
 
     // ── Phase 3: MoE router — before dense FFN (`ffn_gate_inp` ⊃ `ffn_gate`). ─
@@ -558,6 +586,11 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
         return Ok(SharedExpert);
     }
     if n.contains("ffn_exp") || n.contains("experts.") || n.contains("exps") {
+        if n.contains("gate_up") || n.contains("gateup") {
+            return Err(format!(
+                "fused expert gate+up tensor not implemented in the streaming path (needs split): {name}"
+            ));
+        }
         return Ok(expert_kind(&n));
     }
 
@@ -565,6 +598,8 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     if n.contains("post_attention_norm")
         || n.contains("post_attention_layernorm")
         || n.contains("ffn_norm")
+        || n.ends_with("norm_2.weight")
+        || n.ends_with("ln_2.weight")
     {
         return Ok(FfnNorm);
     }
@@ -574,7 +609,12 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     if n.contains("post_norm") {
         return Ok(if has_ple { PlePostNorm } else { PostFfnNorm });
     }
-    if n.contains("attn_norm") || n.contains("input_layernorm") || n.contains("attention_norm") {
+    if n.contains("attn_norm")
+        || n.contains("input_layernorm")
+        || n.contains("attention_norm")
+        || n.ends_with("norm_1.weight")
+        || n.ends_with("ln_1.weight")
+    {
         return Ok(AttnNorm);
     }
     if n.contains("q_norm") {
@@ -593,18 +633,30 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 6: dense FFN. ──────────────────────────────────────────────────
+    // Fused gate+up (`gate_up_proj` / `ffn_gate_up`) is a real op but the dense
+    // loader would silently treat it as one half — fail loudly until split at load.
+    if n.contains("gate_up") || n.contains("gateup") {
+        return Err(format!(
+            "fused FFN gate+up tensor not implemented in the streaming path (needs split): {name}"
+        ));
+    }
     if n.contains("ffn_gate") || n.contains("gate_proj") {
         return Ok(FfnGate);
     }
-    if n.contains("ffn_up") || n.contains("up_proj") {
+    if n.contains("ffn_up") || n.contains("up_proj") || n.contains("dense_h_to_4h") {
         return Ok(FfnUp);
     }
-    if n.contains("ffn_down") || n.contains("down_proj") {
+    if n.contains("ffn_down") || n.contains("down_proj") || n.contains("dense_4h_to_h") {
         return Ok(FfnDown);
     }
 
     // ── Phase 7: attention projections. ──────────────────────────────────────
-    if n.contains("attn_qkv") || n.contains("qkv_proj") || n.contains("wqkv") {
+    if n.contains("attn_qkv")
+        || n.contains("qkv_proj")
+        || n.contains("wqkv")
+        || n.contains("query_key_value")
+        || n.contains("c_attn")
+    {
         return Ok(AttnQkv);
     }
     if n.contains("attn_q") || n.contains("q_proj") || n.contains(".wq.") {
@@ -616,7 +668,20 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     if n.contains("attn_v") || n.contains("v_proj") || n.contains(".wv.") {
         return Ok(AttnV);
     }
-    if n.contains("attn_output") || n.contains("o_proj") || n.contains("attn_out") || n.contains(".wo.")
+    // `out_proj` is an attention-output alias (MPT `attn.out_proj`) — but linear
+    // attention (`linear_attn.out_proj`) belongs to DeltaNet, so guard it.
+    let delta_like = n.contains("linear_attn")
+        || n.contains("ssm")
+        || n.contains("shortconv")
+        || n.contains("delta")
+        || n.contains("mamba");
+    if n.contains("attn_output")
+        || n.contains("o_proj")
+        || n.contains("attn_out")
+        || n.contains(".wo.")
+        || n.contains("self_attention.dense")
+        || n.contains("attention.dense")
+        || (n.contains("out_proj") && !delta_like)
     {
         return Ok(AttnO);
     }
@@ -644,6 +709,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
         || n.contains("ssm")
         || n.contains("conv1d")
         || n.contains("in_proj_qkv")
+        || n.contains("in_proj_ba")
         || (n.contains("out_proj") && n.contains("shortconv"))
     {
         return Ok(DeltaNet);
@@ -681,19 +747,33 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
             "compute-affecting tensor not implemented in the streaming path: {name}"
         ));
     }
-    if n.contains("bias")
-        || n.contains("scale")
+    if n.ends_with(".bias")
+        || n.ends_with("_bias")
+        || n.ends_with(".scale")
+        || n.ends_with("_scale")
         || n.contains("rope")
         || n.contains("cos")
         || n.contains("sin")
         || n.contains("inv_freq")
         || n.contains("alibi")
-        || n.ends_with(".proj.weight")
     {
         return Ok(Aux);
     }
 
     // ── Phase 14: hard failures (the only arch-block reasons). ────────────────
+    // Encoder-decoder (T5/BART) relative position bias + cross-attention are a
+    // separate architecture class; fail loudly instead of an opaque "unknown".
+    if n.contains("relative_attention_bias")
+        || n.contains("rel_attn_bias")
+        || n.contains("cross_attn")
+        || n.contains("cross_attention")
+        || n.contains(".encoder.")
+        || n.contains(".decoder.")
+    {
+        return Err(format!(
+            "encoder-decoder / relative-position tensor not implemented yet: {name}"
+        ));
+    }
     if n.contains("mmproj") || n.contains("vision") || n.contains("clip") {
         return Err(format!(
             "vision/multimodal tensor not in text streaming registry yet: {name}"
@@ -848,10 +928,16 @@ mod tests {
         assert_eq!(cls("blk.0.attn_k.bias").unwrap(), LayerOpKind::Aux);
         assert_eq!(cls("blk.0.attn_v.bias").unwrap(), LayerOpKind::Aux);
         assert_eq!(cls("blk.0.attn_output.bias").unwrap(), LayerOpKind::Aux);
-        // FFN / output biases are compute-affecting but unimplemented: fail loudly.
-        assert!(cls("blk.0.ffn_gate.bias").is_err());
-        assert!(cls("blk.0.ffn_down.bias").is_err());
-        assert!(cls("output.bias").is_err());
+        // QKV / FFN / output biases are preloaded and applied by the Dense path.
+        assert_eq!(cls("blk.0.attn_qkv.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.ffn_gate.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.ffn_up.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("blk.0.ffn_down.bias").unwrap(), LayerOpKind::Aux);
+        assert_eq!(cls("output.bias").unwrap(), LayerOpKind::Aux);
+        // Norm biases map to their norm op (LayerNorm), not `Aux`.
+        assert_eq!(cls("blk.0.attn_norm.bias").unwrap(), LayerOpKind::AttnNorm);
+        assert_eq!(cls("blk.0.ffn_norm.bias").unwrap(), LayerOpKind::FfnNorm);
+        assert_eq!(cls("output_norm.bias").unwrap(), LayerOpKind::OutputNorm);
     }
 
     #[test]
@@ -1028,6 +1114,65 @@ mod tests {
     fn unknown_vision_blocked() {
         assert!(cls("mmproj.weight").is_err());
         assert!(cls("blk.0.unknown_op.weight").is_err());
+    }
+
+    /// F2.11: safe aliases for existing families (Falcon / GPT-NeoX / Pythia /
+    /// MPT / GPT-2 / Qwen3-Next) map to already-implemented ops.
+    #[test]
+    fn classifies_safe_aliases_for_existing_families() {
+        for (name, expected) in [
+            ("transformer.h.0.self_attention.query_key_value.weight", LayerOpKind::AttnQkv),
+            ("gpt_neox.layers.0.attention.query_key_value.weight", LayerOpKind::AttnQkv),
+            ("blk.0.attn.Wqkv.weight", LayerOpKind::AttnQkv),
+            ("transformer.h.0.self_attention.dense.weight", LayerOpKind::AttnO),
+            ("blk.0.attn.out_proj.weight", LayerOpKind::AttnO),
+            ("transformer.h.0.mlp.dense_h_to_4h.weight", LayerOpKind::FfnUp),
+            ("transformer.h.0.mlp.dense_4h_to_h.weight", LayerOpKind::FfnDown),
+            ("transformer.ln_f.weight", LayerOpKind::OutputNorm),
+            ("gpt_neox.final_layer_norm.weight", LayerOpKind::OutputNorm),
+            ("transformer.word_embeddings.weight", LayerOpKind::TokenEmbed),
+            ("gpt_neox.embed_in.weight", LayerOpKind::TokenEmbed),
+            ("embed_out.weight", LayerOpKind::OutputProj),
+            ("blk.0.norm_1.weight", LayerOpKind::AttnNorm),
+            ("blk.0.norm_2.weight", LayerOpKind::FfnNorm),
+            ("blk.0.ln_1.weight", LayerOpKind::AttnNorm),
+            ("blk.0.ln_2.weight", LayerOpKind::FfnNorm),
+            ("blk.0.in_proj_ba.weight", LayerOpKind::DeltaNet),
+            // `linear_attn.out_proj` is DeltaNet, not attention output.
+            ("model.layers.0.linear_attn.out_proj.weight", LayerOpKind::DeltaNet),
+        ] {
+            assert_eq!(cls(name).unwrap(), expected, "tensor {name}");
+        }
+    }
+
+    /// F2.11: ops that are real but not implemented must fail loudly, never be
+    /// silently treated as an existing op or swallowed by `Aux`.
+    #[test]
+    fn unimplemented_ops_fail_loudly() {
+        // Fused gate+up (Phi-3 `gate_up_proj`, `ffn_gate_up`, fused experts).
+        assert!(cls("blk.0.ffn_gate_up.weight").is_err());
+        assert!(cls("model.layers.0.mlp.gate_up_proj.weight").is_err());
+        assert!(cls("blk.0.ffn_gate_up_exps.weight").is_err());
+        // Learned absolute position embeddings (GPT-2 `wpe`) are a cataloged op.
+        assert_eq!(
+            cls("transformer.wpe.weight").unwrap(),
+            LayerOpKind::PositionEmbed
+        );
+        assert_eq!(
+            cls("blk.0.position_embd.weight").unwrap(),
+            LayerOpKind::PositionEmbed
+        );
+        // Input-embedding LayerNorm (BLOOM) is its own op, not `TokenEmbed`.
+        assert_eq!(
+            cls("token_embd_norm.weight").unwrap(),
+            LayerOpKind::TokenEmbedNorm
+        );
+        assert_eq!(
+            cls("token_embd_norm.bias").unwrap(),
+            LayerOpKind::TokenEmbedNorm
+        );
+        // A compute `.proj.weight` is no longer silently `Aux`.
+        assert!(cls("blk.0.mystery.proj.weight").is_err());
     }
 
     #[test]

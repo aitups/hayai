@@ -54,6 +54,71 @@ pub fn apply_rope_partial_factors(
     }
 }
 
+/// RoPE with linear / YaRN scaling (llama.cpp `ggml_rope_ext`). Falls back to
+/// [`apply_rope_partial_factors`] when `rope.is_none()`.
+pub fn apply_rope_partial_factors_scaled(
+    vec: &mut [f32],
+    position: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    base_freq: f32,
+    freq_factors: Option<&[f32]>,
+    rope: RopeScaling,
+) {
+    if rope.is_none() {
+        return apply_rope_partial_factors(
+            vec,
+            position,
+            head_dim,
+            rope_dim,
+            base_freq,
+            freq_factors,
+        );
+    }
+    assert_eq!(vec.len(), head_dim);
+    let rd = rope_dim.min(head_dim);
+    if rd < 2 {
+        return;
+    }
+    let half_dim = rd / 2;
+    // ggml `rope_yarn_corr_dims`: corrected dims for the YaRN ramp.
+    let n_ctx_orig = rope.n_ctx_orig.max(1) as f32;
+    let corr = |beta: f32| -> f32 {
+        rd as f32 * (n_ctx_orig / (beta * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * base_freq.ln())
+    };
+    let (corr_low, corr_high) = if rope.ext_factor != 0.0 {
+        (corr(rope.beta_fast).floor(), corr(rope.beta_slow).ceil())
+    } else {
+        (0.0, 0.0)
+    };
+    for i in 0..half_dim {
+        let mut freq = 1.0 / base_freq.powf((2 * i) as f32 / rd as f32);
+        if let Some(ff) = freq_factors.and_then(|f| f.get(i)).copied() {
+            if ff != 0.0 {
+                freq /= ff;
+            }
+        }
+        let theta_extrap = position as f32 * freq;
+        let theta_interp = rope.freq_scale * theta_extrap;
+        let mut theta = theta_interp;
+        let mut mscale = rope.attn_factor;
+        if rope.ext_factor != 0.0 {
+            let i0 = (2 * i) as f32;
+            let y = (i0 / 2.0 - corr_low) / (corr_high - corr_low).max(0.001);
+            let ramp = 1.0 - y.clamp(0.0, 1.0);
+            let ramp_mix = ramp * rope.ext_factor;
+            theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0 + 0.1 * (1.0 / rope.freq_scale).ln();
+        }
+        let (sin_val, cos_val) = (theta.sin() * mscale, theta.cos() * mscale);
+        let v0 = vec[i];
+        let v1 = vec[i + half_dim];
+        vec[i] = v0 * cos_val - v1 * sin_val;
+        vec[i + half_dim] = v0 * sin_val + v1 * cos_val;
+    }
+}
+
 /// Numerically stable Softmax in-place.
 pub fn softmax(slice: &mut [f32]) {
     if slice.is_empty() {
@@ -87,6 +152,35 @@ pub fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
     crate::simd_ops::simd_dot(a, b)
 }
 
+/// RoPE scaling (llama.cpp `ggml_rope_ext`): linear (`freq_scale`) and YaRN
+/// (`ext_factor`/`attn_factor`/`beta_*`/`n_ctx_orig`).
+#[derive(Debug, Clone, Copy)]
+pub struct RopeScaling {
+    pub freq_scale: f32,
+    pub ext_factor: f32,
+    pub attn_factor: f32,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+    pub n_ctx_orig: usize,
+}
+
+impl RopeScaling {
+    pub const NONE: Self = Self {
+        freq_scale: 1.0,
+        ext_factor: 0.0,
+        attn_factor: 1.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        n_ctx_orig: 0,
+    };
+
+    pub fn is_none(&self) -> bool {
+        self.ext_factor == 0.0
+            && (self.freq_scale - 1.0).abs() < 1e-9
+            && self.attn_factor == 1.0
+    }
+}
+
 /// GQA / MHA configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct AttentionConfig {
@@ -98,6 +192,8 @@ pub struct AttentionConfig {
     pub rope_dim: usize,
     /// If `Some`, use this attention scale instead of `1/sqrt(head_dim)`. Gemma4 uses `1.0`.
     pub scale_override: Option<f32>,
+    /// Linear / YaRN RoPE scaling.
+    pub rope: RopeScaling,
 }
 
 impl AttentionConfig {
@@ -117,6 +213,7 @@ impl AttentionConfig {
             rope_theta,
             rope_dim: head_dim,
             scale_override: None,
+            rope: RopeScaling::NONE,
         }
     }
 
@@ -147,7 +244,32 @@ pub fn attention_decode_step(
     position: usize,
     out: &mut [f32],
 ) {
-    attention_decode_step_ex(cfg, cache, q, k, v, position, out, true, None);
+    attention_decode_step_ex(cfg, cache, q, k, v, position, out, true, None, None);
+}
+
+/// Like [`attention_decode_step`] but with ALiBi slopes (one per query head).
+pub fn attention_decode_step_alibi(
+    cfg: &AttentionConfig,
+    cache: &mut LayerKvCache,
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &[f32],
+    position: usize,
+    out: &mut [f32],
+    alibi_slopes: &[f32],
+) {
+    attention_decode_step_ex(
+        cfg,
+        cache,
+        q,
+        k,
+        v,
+        position,
+        out,
+        true,
+        None,
+        Some(alibi_slopes),
+    );
 }
 
 /// Like [`attention_decode_step`], but when `write_kv` is false only Q is RoPE'd and
@@ -165,6 +287,7 @@ pub fn attention_decode_step_ex(
     out: &mut [f32],
     write_kv: bool,
     freq_factors: Option<&[f32]>,
+    alibi_slopes: Option<&[f32]>,
 ) {
     assert_eq!(q.len(), cfg.hidden_size());
     assert_eq!(out.len(), cfg.hidden_size());
@@ -174,13 +297,14 @@ pub fn attention_decode_step_ex(
     let rd = cfg.rope_dim.max(1).min(cfg.head_dim);
     for h in 0..cfg.num_heads {
         let s = h * cfg.head_dim;
-        apply_rope_partial_factors(
+        apply_rope_partial_factors_scaled(
             &mut q[s..s + cfg.head_dim],
             position,
             cfg.head_dim,
             rd,
             cfg.rope_theta,
             freq_factors,
+            cfg.rope,
         );
     }
     if write_kv {
@@ -188,13 +312,14 @@ pub fn attention_decode_step_ex(
         assert_eq!(v.len(), cfg.kv_dim());
         for h in 0..cfg.num_kv_heads {
             let s = h * cfg.head_dim;
-            apply_rope_partial_factors(
+            apply_rope_partial_factors_scaled(
                 &mut k[s..s + cfg.head_dim],
                 position,
                 cfg.head_dim,
                 rd,
                 cfg.rope_theta,
                 freq_factors,
+                cfg.rope,
             );
         }
         // Append K/V into INT8 cache (post-RoPE keys).
@@ -215,7 +340,8 @@ pub fn attention_decode_step_ex(
         let kv_head = q_head / groups;
         let q_slice = &q[q_head * cfg.head_dim..(q_head + 1) * cfg.head_dim];
         let kv = &cache.heads[kv_head];
-        kv.attend(q_slice, scale, &mut scores, &mut acc);
+        let alibi = alibi_slopes.map(|s| (s[q_head], position));
+        kv.attend(q_slice, scale, &mut scores, &mut acc, alibi);
         out[q_head * cfg.head_dim..(q_head + 1) * cfg.head_dim].copy_from_slice(&acc);
     }
 }
@@ -270,6 +396,28 @@ mod tests {
     }
 
     #[test]
+    fn rope_scaling_none_matches_base_and_linear_matches_position_scale() {
+        // NONE must be bit-identical to the unscaled RoPE.
+        let mut a = [0.5f32, -0.3, 0.8, 0.1];
+        let mut b = a;
+        apply_rope_partial_factors(&mut a, 7, 4, 4, 10000.0, None);
+        apply_rope_partial_factors_scaled(&mut b, 7, 4, 4, 10000.0, None, RopeScaling::NONE);
+        assert_eq!(a, b);
+
+        // Linear scaling by `factor` == RoPE at position/factor.
+        let rope = RopeScaling {
+            freq_scale: 0.5,
+            ..RopeScaling::NONE
+        };
+        let mut scaled = [1.0f32, 0.0, 1.0, 0.0];
+        let mut manual = [1.0f32, 0.0, 1.0, 0.0];
+        apply_rope_partial_factors_scaled(&mut scaled, 8, 4, 4, 10000.0, None, rope);
+        apply_rope_partial_factors(&mut manual, 4, 4, 4, 10000.0, None);
+        assert_eq!(scaled, manual);
+    }
+
+
+    #[test]
     fn gqa_decode_matches_fp32_short_context() {
         let cfg = AttentionConfig {
             num_heads: 4,
@@ -278,6 +426,7 @@ mod tests {
             rope_theta: 10000.0,
             rope_dim: 8,
             scale_override: None,
+            rope: RopeScaling::NONE,
         };
         let mut cache = LayerKvCache::new(cfg.num_kv_heads, cfg.head_dim, 2, 8);
 
@@ -338,3 +487,4 @@ mod tests {
         assert!(err < 0.15, "INT8 attn too far from FP32: {err}");
     }
 }
+

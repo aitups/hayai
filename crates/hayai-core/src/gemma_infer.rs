@@ -158,6 +158,7 @@ impl GemmaMeta {
             rope_theta: rope,
             rope_dim: head_dim,
             scale_override: Some(1.0), // Gemma4: no 1/sqrt(d)
+            rope: hayai_cpu::RopeScaling::NONE,
         }
     }
 
@@ -337,6 +338,7 @@ fn forward_gemma_inner(
             &mut attn_out,
             write_kv,
             factors,
+            None,
         );
 
         let mut attn_proj = vec![0.0f32; h];
