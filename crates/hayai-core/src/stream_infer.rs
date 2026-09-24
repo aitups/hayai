@@ -204,11 +204,24 @@ pub(crate) fn apply_norm(
     }
 }
 
-/// GELU (tanh approximation) — classic ungated FFNs (GPT-2/BLOOM/OPT/Falcon).
+/// GELU (exact, `erf`-based) — matches llama.cpp `LLM_FFN_GELU` (`ggml_gelu`) for
+/// the classic ungated FFNs (GPT-2 / BLOOM / OPT).
 #[inline]
 pub(crate) fn gelu(x: f32) -> f32 {
-    const K: f32 = 0.797_884_6; // sqrt(2/pi)
-    0.5 * x * (1.0 + (K * (x + 0.044_715 * x * x * x)).tanh())
+    0.5 * x * (1.0 + erf(x * 0.707_106_77))
+}
+
+/// `erf` via Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
+fn erf(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t) + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 /// ALiBi slopes (HF `get_alibi_slopes`): `2^(-8*(h+1)/n)` for power-of-two head
@@ -699,6 +712,17 @@ impl StreamingGenerator {
         };
         // Learned absolute position embeddings (GPT-2 `position_embd.weight`).
         let learned_pos = catalog.dequant_f32("position_embd.weight").ok();
+        if std::env::var("HAYAI_DUMP_POS").ok().as_deref() == Some("1") {
+            if let Ok(t) = catalog.tensor("position_embd.weight") {
+                eprintln!("POS_EMBD dims={:?} type={:?} len={}", t.dims, t.ggml_type, learned_pos.as_ref().map(|v| v.len()).unwrap_or(0));
+            }
+            eprintln!(
+                "DENSE_FLAGS use_layernorm={} learned_pos={} token_embed_norm={}",
+                use_layernorm,
+                learned_pos.is_some(),
+                token_embed_norm.is_some(),
+            );
+        }
         let ffn_bias: Vec<LayerFfnBias> = (0..n_slots)
             .map(|l| LayerFfnBias {
                 gate: catalog.dequant_f32(&format!("blk.{l}.ffn_gate.bias")).ok(),
@@ -1719,6 +1743,18 @@ impl StreamingGenerator {
         }
 
         self.position += 1;
+        if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
+            let at = std::env::var("HAYAI_DUMP_AT_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+            if self.position == at {
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+                let top: Vec<String> = idx[..8].iter().map(|&i| format!("{}:{:.3}", i, logits[i])).collect();
+                eprintln!("DENSE_DUMP_TOP pos={}: {}", self.position, top.join(" "));
+            }
+        }
         Ok(logits)
     }
 
