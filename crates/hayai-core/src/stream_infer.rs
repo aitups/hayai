@@ -148,6 +148,29 @@ pub(crate) struct LayerFfnBias {
     pub(crate) down: Option<Vec<f32>>,
 }
 
+/// MLA (DeepSeek-V2/V3, Kimi) attention config resolved from GGUF metadata.
+#[derive(Clone, Copy)]
+pub(crate) struct MlaMeta {
+    pub(crate) n_heads: usize,
+    pub(crate) kv_lora_rank: usize,
+    pub(crate) qk_nope: usize,
+    pub(crate) qk_rope: usize,
+    pub(crate) v_head_dim: usize,
+}
+
+impl MlaMeta {
+    pub(crate) fn qk_head(&self) -> usize {
+        self.qk_nope + self.qk_rope
+    }
+}
+
+/// MLA compressed cache: K is `[n_heads × (qk_nope + qk_rope)]`, V is
+/// `[n_heads × v_head_dim]` (the fused `attn_kv_b` decompression is non-absorbed).
+pub(crate) struct MlaKvCache {
+    pub(crate) k: LayerKvCache,
+    pub(crate) v: LayerKvCache,
+}
+
 /// LayerNorm *in place* (mean/variance + weight + optional bias). GPT-2/BLOOM/OPT.
 pub(crate) fn layernorm_inplace(
     x: &mut [f32],
@@ -260,6 +283,8 @@ pub enum ModelKind {
     MoE,
     /// Mamba-1 selective-scan SSM blocks (no attention / no KV cache).
     Mamba,
+    /// MLA (DeepSeek-V2/V3, Kimi): latent attention + dense-lead / MoE FFN.
+    Mla,
 }
 
 /// One item of a multimodal prompt: a text token, or a media embedding row
@@ -290,6 +315,9 @@ impl ModelKind {
         if has_any("ssm_x.weight") || has_any("ssm_d") {
             // Mamba-1 selective scan: x_proj (`ssm_x`) + skip (`ssm_d`) are unique.
             ModelKind::Mamba
+        } else if has_any("attn_kv_a_mqa.weight") {
+            // MLA latent attention (DeepSeek-V2/V3, Kimi).
+            ModelKind::Mla
         } else if has_any("ssm_out.weight") || has_any("ssm_a") {
             ModelKind::Hybrid
         } else if has_any("ffn_gate_inp.weight")
@@ -441,6 +469,14 @@ pub struct StreamingGenerator {
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
     /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
     pub(crate) moe_router_bias: Option<Vec<Option<Vec<f32>>>>,
+    /// MLA attention config (DeepSeek-V2/V3, Kimi); `None` otherwise.
+    pub(crate) mla: Option<MlaMeta>,
+    /// MLA compressed KV caches (one per layer).
+    pub(crate) mla_kv: Option<Vec<MlaKvCache>>,
+    /// MLA `attn_kv_a_norm` (dim `kv_lora_rank`) per layer.
+    pub(crate) mla_kv_a_norm: Option<Vec<Option<Vec<f32>>>>,
+    /// MLA `attn_q_a_norm` (dim `q_lora_rank`) per layer (full MLA only).
+    pub(crate) mla_q_a_norm: Option<Vec<Option<Vec<f32>>>>,
 }
 
 impl StreamingGenerator {
@@ -699,6 +735,10 @@ impl StreamingGenerator {
                 // Selective-scan SSM: recurrent state only, no KV cache.
                 Vec::new()
             }
+            ModelKind::Mla => {
+                // MLA uses its own compressed latent cache (`gen.mla_kv`).
+                Vec::new()
+            }
             _ => (0..kv_slots)
                 .map(|_| LayerKvCache::new(attn_cfg.num_kv_heads, attn_cfg.head_dim, sink, window))
                 .collect(),
@@ -746,7 +786,9 @@ impl StreamingGenerator {
             info!("Attention biases: {n_attn_bias} layer(s) with q/k/v/o bias");
         }
         // MoE router `e_score_correction_bias` (`ffn_gate_inp.bias`), preloaded once.
-        let moe_router_bias = if ModelKind::from_catalog(&catalog) == ModelKind::MoE {
+        let model_kind = ModelKind::from_catalog(&catalog);
+        let moe_like = matches!(model_kind, ModelKind::MoE | ModelKind::Mla);
+        let moe_router_bias = if moe_like {
             let v: Vec<Option<Vec<f32>>> = (0..n_slots)
                 .map(|l| catalog.dequant_f32(&format!("blk.{l}.ffn_gate_inp.bias")).ok())
                 .collect();
@@ -756,6 +798,50 @@ impl StreamingGenerator {
             Some(v)
         } else {
             None
+        };
+        // MLA attention config + compressed KV caches (DeepSeek-V2/V3, Kimi).
+        let (mla, mla_kv, mla_kv_a_norm, mla_q_a_norm) = if model_kind == ModelKind::Mla {
+            let arch = &config.architecture;
+            let cat_u32 = |key: &str| {
+                catalog
+                    .meta_u32(&format!("{arch}.{key}"))
+                    .or_else(|| catalog.meta_u32(&format!("llama.{key}")))
+            };
+            let kv_lora_rank = cat_u32("attention.kv_lora_rank").unwrap_or(512) as usize;
+            let key_length = cat_u32("attention.key_length")
+                .or_else(|| cat_u32("attention.key_length_mla"))
+                .unwrap_or(128 + 64) as usize;
+            let qk_rope = cat_u32("rope.dimension_count").unwrap_or(64) as usize;
+            let v_head_dim = cat_u32("attention.value_length")
+                .or_else(|| cat_u32("attention.value_length_mla"))
+                .unwrap_or(128) as usize;
+            let n_heads = config.num_attention_heads;
+            let meta = MlaMeta {
+                n_heads,
+                kv_lora_rank,
+                qk_nope: key_length.saturating_sub(qk_rope),
+                qk_rope,
+                v_head_dim,
+            };
+            let caches: Vec<MlaKvCache> = (0..n_slots)
+                .map(|_| MlaKvCache {
+                    k: LayerKvCache::new(n_heads, meta.qk_head(), sink, window),
+                    v: LayerKvCache::new(n_heads, v_head_dim, sink, window),
+                })
+                .collect();
+            let kv_norms: Vec<Option<Vec<f32>>> = (0..n_slots)
+                .map(|l| catalog.dequant_f32(&format!("blk.{l}.attn_kv_a_norm.weight")).ok())
+                .collect();
+            let q_norms: Vec<Option<Vec<f32>>> = (0..n_slots)
+                .map(|l| catalog.dequant_f32(&format!("blk.{l}.attn_q_a_norm.weight")).ok())
+                .collect();
+            info!(
+                "MLA: n_heads={} kv_lora_rank={} qk_nope={} qk_rope={} v_head_dim={}",
+                n_heads, kv_lora_rank, meta.qk_nope, qk_rope, v_head_dim
+            );
+            (Some(meta), Some(caches), Some(kv_norms), Some(q_norms))
+        } else {
+            (None, None, None, None)
         };
         let conv_activation = catalog
             .meta_str("hayai.conv_activation")
@@ -863,6 +949,10 @@ impl StreamingGenerator {
             deltanet_states: None,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
+            mla,
+            mla_kv,
+            mla_kv_a_norm,
+            mla_q_a_norm,
             memory_strategy: MemoryStrategy::AutoFit,
             window_plan: None,
             resident_output: None,
@@ -2156,6 +2246,8 @@ impl StreamingGenerator {
             let has = |op: crate::LayerOpKind| p.known_ops.contains(&op);
             if has(crate::LayerOpKind::Mamba) {
                 ModelKind::Mamba
+            } else if has(crate::LayerOpKind::MlaKvA) || has(crate::LayerOpKind::MlaQa) {
+                ModelKind::Mla
             } else if has(crate::LayerOpKind::DeltaNet) {
                 ModelKind::Hybrid
             } else if has(crate::LayerOpKind::Router)
@@ -2281,6 +2373,9 @@ impl StreamingGenerator {
                 ModelKind::Mamba => {
                     crate::mamba_infer::prefill_mamba(self, orch, prompt_ids, scratch)
                 }
+                ModelKind::Mla => {
+                    crate::moe_infer::prefill_moe(self, orch, prompt_ids, scratch)
+                }
                 ModelKind::Dense => {
                     // Classic-transformer Dense features (LayerNorm/positions/ungated
                     // FFN) run through the per-token Dense path.
@@ -2316,6 +2411,7 @@ impl StreamingGenerator {
                 ModelKind::Gemma => crate::gemma_infer::forward_gemma(self, orch, token, scratch),
                 ModelKind::MoE => crate::moe_infer::forward_moe(self, orch, token, scratch),
                 ModelKind::Mamba => self.forward_mamba(orch, token),
+                ModelKind::Mla => crate::moe_infer::forward_moe(self, orch, token, scratch),
                 ModelKind::Dense => self.forward_staged(orch, token, scratch),
             }
         }
@@ -3433,6 +3529,11 @@ fn build_attn_config(
                     .meta_f32(&format!("{arch}.rope.scaling.beta_slow"))
                     .unwrap_or(1.0),
                 n_ctx_orig,
+                // Convert-script stores `yarn_log_multiplier * 0.1`; llama.cpp cancels it.
+                yarn_log_mul: cat
+                    .meta_f32(&format!("{arch}.rope.scaling.yarn_log_multiplier"))
+                    .map(|v| v / 0.1)
+                    .unwrap_or(0.0),
             };
         }
         _ => {}

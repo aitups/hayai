@@ -162,6 +162,8 @@ pub struct RopeScaling {
     pub beta_fast: f32,
     pub beta_slow: f32,
     pub n_ctx_orig: usize,
+    /// DeepSeek-V2 `rope.scaling.yarn_log_multiplier` (pre-scales `kq_scale`).
+    pub yarn_log_mul: f32,
 }
 
 impl RopeScaling {
@@ -172,6 +174,7 @@ impl RopeScaling {
         beta_fast: 32.0,
         beta_slow: 1.0,
         n_ctx_orig: 0,
+        yarn_log_mul: 0.0,
     };
 
     pub fn is_none(&self) -> bool {

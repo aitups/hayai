@@ -29,9 +29,9 @@ Rules:
 | `AttnO` | `attn_output`, `o_proj`, `attn_out`, `.wo.`, `out_proj`\*, `self_attention.dense`, `attention.dense` | CPU_GEMV | all attention paths |
 | `AttnGate` | `attn_gate`, `inp_gate` (no PLE) | CPU_GEMV | hybrid/Qwen3.5 |
 | `AttnQkv` | `attn_qkv`, `qkv_proj`, `wqkv`, `query_key_value`, `c_attn` | CPU_GEMV | split `[q\|k\|v]` at load |
-| `MlaQa`/`MlaQaNorm`/`MlaQb` | `attn_q_a[_norm]`, `attn_q_b` (DeepSeek-V2/V3, Kimi) | CPU_GEMV/NORM | cataloged (execution pending) |
-| `MlaKvA`/`MlaKvANorm` | `attn_kv_a_mqa`, `attn_kv_a_norm` | CPU_GEMV/NORM | cataloged (execution pending) |
-| `MlaKb`/`MlaVb`/`MlaKvB` | `attn_k_b`, `attn_v_b`, `attn_kv_b` (legacy fused) | CPU_GEMV | cataloged (execution pending) |
+| `MlaQa`/`MlaQaNorm`/`MlaQb` | `attn_q_a[_norm]`, `attn_q_b` (DeepSeek-V2/V3, Kimi) | CPU_GEMV/NORM | MLA forward (full path) |
+| `MlaKvA`/`MlaKvANorm` | `attn_kv_a_mqa`, `attn_kv_a_norm` | CPU_GEMV/NORM | MLA forward |
+| `MlaKb`/`MlaVb`/`MlaKvB` | `attn_k_b`, `attn_v_b`, `attn_kv_b` (fused lite) | CPU_GEMV | `MlaKvB` (DeepSeek-V2-Lite) implemented |
 | `AttnQNorm` / `AttnKNorm` | `attn_q_norm` / `q_norm`; `attn_k_norm` / `k_norm` | CPU_NORM | gemma4 |
 | `PostAttnNorm` | `post_attention_norm` | CPU_NORM | gemma4 |
 | `FfnNorm` | `ffn_norm`, `post_attention_layernorm`, `norm_2`, `ln_2` | CPU_NORM | all FFN paths |
@@ -62,7 +62,7 @@ Rules:
 
 | Tensor | Reason |
 |---|---|
-| MLA forward (`attn_q_a`/`attn_kv_a_mqa`/...) | Ops cataloged (`MlaQa`…) but the absorbed forward + compressed latent KV cache are still pending (needs a DeepSeek GGUF to validate) |
+| MLA (full/absorbed `wk_b`/`wv_b`) | Non-absorbed DeepSeek-V2-Lite forward is implemented; the absorbed `is_mla` path (split 3D `wk_b`/`wv_b`) is pending |
 | `relative_attention_bias` / `cross_attn` / `.encoder.` / `.decoder.` | T5/BART are encoder-decoder — a separate architecture class, not yet implemented |
 | `ffn_gate_up_exps` (fused experts) | Fused per-expert gate+up; needs a 3D row split |
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |

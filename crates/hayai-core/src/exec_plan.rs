@@ -644,7 +644,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 4: MoE experts / shared expert — before dense FFN. ─────────────
-    if n.contains("shared_expert") || n.contains("ffn_shexp") {
+    if n.contains("shared_expert") || n.contains("ffn_shexp") || n.contains("shexp") {
         return Ok(SharedExpert);
     }
     if n.contains("ffn_exp") || n.contains("experts.") || n.contains("exps") {

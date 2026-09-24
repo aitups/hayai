@@ -12,7 +12,7 @@
 use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, MoeMeta, TensorRef};
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{StreamInferError, StreamingGenerator};
-use hayai_cpu::{attention_decode_step, rms_norm};
+use hayai_cpu::{apply_rope_partial_factors_scaled, attention_decode_step, rms_norm, softmax};
 use hayai_model::QuantMatrix;
 use hayai_opencl::StreamingScratch;
 use std::collections::{HashMap, VecDeque};
@@ -172,7 +172,11 @@ pub(crate) fn forward_moe(
 
         let t_attn = Instant::now();
         // ── Attention (CPU per binding) ─────────────────────────────────────────
+        if gen.mla.is_some()
+            && view_of(scratch.host_slot(layer), &loaded, LayerOpKind::MlaKvA).is_ok()
         {
+            mla_attention(gen, layer, scratch.host_slot(layer), &loaded, pos, &mut x)?;
+        } else {
             let base = scratch.host_slot(layer);
             let mut xn = x.clone();
             rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
@@ -211,6 +215,29 @@ pub(crate) fn forward_moe(
         // ── Router → top-k (CPU; small hidden → n_expert GEMV) ──────────────────
         let mut xn = x.clone();
         rms_norm(&mut xn, &gen.layer_norms[layer].ffn_norm, eps);
+        // DeepSeek leading dense blocks have no router: dense SwiGLU FFN.
+        let base_ffn = scratch.host_slot(layer);
+        let dense_lead = view_of(base_ffn, &loaded, LayerOpKind::Router).is_err()
+            && view_of(base_ffn, &loaded, LayerOpKind::FfnGate).is_ok();
+        let t_ffn = Instant::now();
+        if dense_lead {
+            let gate = view_of(base_ffn, &loaded, LayerOpKind::FfnGate)?;
+            let up = view_of(base_ffn, &loaded, LayerOpKind::FfnUp)?;
+            let down = view_of(base_ffn, &loaded, LayerOpKind::FfnDown)?;
+            let ff = gate.nrows;
+            let mut g = vec![0.0f32; ff];
+            let mut u = vec![0.0f32; ff];
+            let mut d = vec![0.0f32; h];
+            gate.gemv(&xn, &mut g)?;
+            up.gemv(&xn, &mut u)?;
+            for j in 0..ff {
+                g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
+            }
+            down.gemv(&g, &mut d)?;
+            for j in 0..h {
+                x[j] += d[j];
+            }
+        } else {
         let (top, weights) = {
             let base = scratch.host_slot(layer);
             let router = view_of(&base, &loaded, LayerOpKind::Router)?;
@@ -282,7 +309,6 @@ pub(crate) fn forward_moe(
         }
 
         // ── Per-expert FFN (GpuAsync binding → OpenCL pool) ─────────────────────
-        let t_ffn = Instant::now();
         {
             let base = scratch.host_slot(layer);
             let mut acc = vec![0.0f32; h];
@@ -464,6 +490,7 @@ pub(crate) fn forward_moe(
                 x[j] += acc[j];
             }
         }
+        }
         gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
 
         // ── Join the prefetch → next layer's non-expert is ready in its slot ──
@@ -539,6 +566,135 @@ fn dump_top_logits(logits: &[f32], k: usize) {
 }
 
 /// View over a non-expert tensor of the block (compact offset).
+/// MLA (non-absorbed) attention for one layer. `attn_q` (lite) or `q_a`→`q_b`,
+/// `attn_kv_a_mqa` → latent, `attn_kv_b` → per-head `[k_nope | v]`, RoPE on the
+/// trailing `qk_rope` dims, against the compressed K/V cache. DeepSeek-V2-Lite.
+fn mla_attention(
+    gen: &mut StreamingGenerator,
+    layer: usize,
+    base: &[u8],
+    loaded: &[(TensorRef, usize)],
+    pos: usize,
+    x: &mut [f32],
+) -> Result<(), StreamInferError> {
+    let m = gen
+        .mla
+        .ok_or_else(|| StreamInferError::Msg("MLA layer without MlaMeta".into()))?;
+    let h = gen.config.hidden_size;
+    let eps = gen.config.rms_norm_eps;
+    let theta = gen.attn_cfg.rope_theta;
+    let qk_head = m.qk_head();
+
+    let mut xn = x.to_vec();
+    rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
+
+    // Q: lite models use `attn_q`; full MLA uses `attn_q_a` → norm → `attn_q_b`.
+    let mut q = vec![0.0f32; m.n_heads * qk_head];
+    if let Ok(wq) = view_of(base, loaded, LayerOpKind::AttnQ) {
+        wq.gemv(&xn, &mut q)?;
+    } else {
+        let wq_a = view_of(base, loaded, LayerOpKind::MlaQa)?;
+        let mut q_a = vec![0.0f32; wq_a.nrows];
+        wq_a.gemv(&xn, &mut q_a)?;
+        if let Some(qn) = gen.mla_q_a_norm.as_ref().and_then(|v| v[layer].as_ref()) {
+            rms_norm(&mut q_a, qn, eps);
+        }
+        let wq_b = view_of(base, loaded, LayerOpKind::MlaQb)?;
+        q.resize(wq_b.nrows, 0.0);
+        wq_b.gemv(&q_a, &mut q)?;
+    }
+    for hd in 0..m.n_heads {
+        let s = hd * qk_head + m.qk_nope;
+        apply_rope_partial_factors_scaled(
+            &mut q[s..s + m.qk_rope],
+            pos,
+            m.qk_rope,
+            m.qk_rope,
+            theta,
+            None,
+            gen.attn_cfg.rope,
+        );
+    }
+
+    // KV latent: `[kv_lora_rank | k_pe]`.
+    let wkv_a = view_of(base, loaded, LayerOpKind::MlaKvA)?;
+    let mut kv_pe = vec![0.0f32; m.kv_lora_rank + m.qk_rope];
+    wkv_a.gemv(&xn, &mut kv_pe)?;
+    let (c_kv, k_pe) = kv_pe.split_at_mut(m.kv_lora_rank);
+    apply_rope_partial_factors_scaled(
+        k_pe,
+        pos,
+        m.qk_rope,
+        m.qk_rope,
+        theta,
+        None,
+        gen.attn_cfg.rope,
+    );
+    let k_pe_snapshot = k_pe.to_vec();
+    if let Some(kn) = gen.mla_kv_a_norm.as_ref().and_then(|v| v[layer].as_ref()) {
+        rms_norm(c_kv, kn, eps);
+    }
+
+    // Fused decompression: `attn_kv_b` → per head `[k_nope | v]`.
+    let wkv_b = view_of(base, loaded, LayerOpKind::MlaKvB)?;
+    let ph = m.qk_nope + m.v_head_dim;
+    let mut kv = vec![0.0f32; m.n_heads * ph];
+    wkv_b.gemv(c_kv, &mut kv)?;
+
+    // DeepSeek pre-scales `kq_scale` so YaRN's `mscale²` is applied once here
+    // (the RoPE itself scales q/k by `attn_factor_org`).
+    let rope = gen.attn_cfg.rope;
+    let inv = if rope.freq_scale > 0.0 {
+        1.0 / rope.freq_scale
+    } else {
+        1.0
+    };
+    let attn_factor_org = rope.attn_factor * (1.0 + 0.1 * inv.ln());
+    let mscale = if rope.ext_factor != 0.0 {
+        attn_factor_org * (1.0 + 0.1 * rope.yarn_log_mul * inv.ln())
+    } else {
+        attn_factor_org
+    };
+    let scale = mscale * mscale / (qk_head as f32).sqrt();
+    let mut attn = vec![0.0f32; m.n_heads * m.v_head_dim];
+    {
+        let caches = gen
+            .mla_kv
+            .as_mut()
+            .ok_or_else(|| StreamInferError::Msg("MLA without cache".into()))?;
+        let cache = &mut caches[layer];
+        for hd in 0..m.n_heads {
+            let mut k = vec![0.0f32; qk_head];
+            k[..m.qk_nope].copy_from_slice(&kv[hd * ph..hd * ph + m.qk_nope]);
+            k[m.qk_nope..].copy_from_slice(&k_pe_snapshot);
+            let v = kv[hd * ph + m.qk_nope..hd * ph + ph].to_vec();
+            // K cache stores the full `[k_nope | k_pe]`; its value slot is unused.
+            cache.k.heads[hd].append(&k, &k);
+            cache.v.heads[hd].append(&v, &v);
+            let qh = &q[hd * qk_head..(hd + 1) * qk_head];
+            let slots = cache.k.heads[hd].attention_slots();
+            let mut scores: Vec<f32> = slots
+                .iter()
+                .map(|&s| cache.k.heads[hd].score_key(s, qh) * scale)
+                .collect();
+            softmax(&mut scores);
+            let mut acc = vec![0.0f32; m.v_head_dim];
+            for (i, &s) in slots.iter().enumerate() {
+                cache.v.heads[hd].accumulate_value(s, scores[i], &mut acc);
+            }
+            attn[hd * m.v_head_dim..(hd + 1) * m.v_head_dim].copy_from_slice(&acc);
+        }
+    }
+
+    let wo = view_of(base, loaded, LayerOpKind::AttnO)?;
+    let mut proj = vec![0.0f32; h];
+    wo.gemv(&attn, &mut proj)?;
+    for i in 0..h {
+        x[i] += proj[i];
+    }
+    Ok(())
+}
+
 fn view_of<'a>(
     base: &'a [u8],
     loaded: &[(TensorRef, usize)],
@@ -623,27 +779,6 @@ fn top_k_indices(scores: &[f32], k: usize) -> Vec<usize> {
     idx
 }
 
-/// Softmax routing weights over the selected top-k experts.
-fn softmax_weights(scores: &[f32], top: &[usize]) -> Vec<f32> {
-    let max = top
-        .iter()
-        .map(|&i| scores[i])
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut w: Vec<f32> = top.iter().map(|&i| (scores[i] - max).exp()).collect();
-    let sum: f32 = w.iter().sum();
-    if sum <= 0.0 {
-        let n = w.len() as f32;
-        for v in w.iter_mut() {
-            *v = 1.0 / n;
-        }
-    } else {
-        for v in w.iter_mut() {
-            *v /= sum;
-        }
-    }
-    w
-}
-
 /// MoE routing (llama.cpp `build_moe_ffn`): grouped top-k selection with an optional
 /// `e_score_correction_bias` (applied to the *choice* scores only), softmax or
 /// sigmoid gating, optional top-k normalization and a routed scaling factor.
@@ -686,13 +821,19 @@ pub(crate) fn route_experts(
     } else {
         top_k_indices(&choice, meta.top_k)
     };
+    // Weights: sigmoid per expert, or softmax over **all** experts then take the
+    // selected values (llama.cpp `build_moe_ffn`). `norm_topk_prob` renormalizes.
     let mut weights: Vec<f32> = if meta.gating == 1 {
         // Sigmoid gating (DeepSeek V3 / GLM): raw scores through the sigmoid.
         top.iter()
             .map(|&e| 1.0 / (1.0 + (-scores[e]).exp()))
             .collect()
     } else {
-        softmax_weights(scores, &top)
+        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        top.iter().map(|&e| exps[e] * inv).collect()
     };
     if meta.norm_topk_prob {
         let sum: f32 = weights.iter().sum();
@@ -792,17 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn softmax_weights_sum_to_one() {
-        let scores = [0.1, 0.9, 0.5, -0.2, 0.7];
-        let top = top_k_indices(&scores, 2);
-        let w = softmax_weights(&scores, &top);
-        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        // The best expert dominates the weight.
-        assert!(w[0] > w[1]);
-    }
-
-    #[test]
-    fn route_experts_softmax_topk_normalized() {
+    fn route_experts_softmax_topk_uses_full_softmax() {
         let meta = MoeMeta {
             expert_count: 5,
             top_k: 2,
@@ -811,6 +942,25 @@ mod tests {
         let scores = [0.1f32, 0.9, 0.3, 0.7, 0.2];
         let (top, w) = route_experts(&scores, None, &meta);
         assert_eq!(top, vec![1, 3]);
+        // Softmax over all 5 experts, then take the top-2 values (no renormalization).
+        let max = 0.9f32;
+        let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        assert!((w[0] - exps[1] / sum).abs() < 1e-5);
+        assert!((w[1] - exps[3] / sum).abs() < 1e-5);
+        assert!(w.iter().sum::<f32>() < 1.0);
+    }
+
+    #[test]
+    fn route_experts_norm_topk_prob_renormalizes() {
+        let meta = MoeMeta {
+            expert_count: 5,
+            top_k: 2,
+            norm_topk_prob: true,
+            ..Default::default()
+        };
+        let scores = [0.1f32, 0.9, 0.3, 0.7, 0.2];
+        let (_, w) = route_experts(&scores, None, &meta);
         assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
     }
 
@@ -825,7 +975,10 @@ mod tests {
         let bias = [0.0f32, 10.0, 0.0, 0.0];
         let (top, w) = route_experts(&scores, Some(&bias), &meta);
         assert_eq!(top, vec![1]); // bias made expert 1 win the selection
-        assert!((w[0] - 1.0).abs() < 1e-6); // softmax over a single expert = 1
+        // Weight is the full-softmax value of the raw score of expert 1.
+        let exps: Vec<f32> = scores.iter().map(|s| s.exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        assert!((w[0] - exps[1] / sum).abs() < 1e-5);
     }
 
     #[test]
@@ -882,4 +1035,5 @@ mod tests {
         assert!(off.get(0, 1).is_none());
     }
 }
+
 
