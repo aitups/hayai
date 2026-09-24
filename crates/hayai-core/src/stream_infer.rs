@@ -625,7 +625,7 @@ impl StreamingGenerator {
         let path = path.as_ref().to_path_buf();
         let mut catalog = GgufCatalog::open(&path)?;
         let config = load_config(&catalog)?;
-        let attn_cfg = build_attn_config(&catalog, &config)?;
+        let mut attn_cfg = build_attn_config(&catalog, &config)?;
 
         // HRM / some hybrids use parameterless RMSNorm (no weight tensors).
         let ones = |n: usize| vec![1.0f32; n];
@@ -741,6 +741,11 @@ impl StreamingGenerator {
         } else {
             None
         };
+        // Models with learned positions (GPT-2) or ALiBi (BLOOM/Falcon/MPT) do not
+        // rotate Q/K — disable RoPE in the shared attention path.
+        if learned_pos.is_some() || alibi_slopes.is_some() {
+            attn_cfg.use_rope = false;
+        }
 
         let kv_slots = config
             .hrm

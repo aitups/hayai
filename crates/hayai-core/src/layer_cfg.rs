@@ -93,6 +93,7 @@ pub fn resolve_full_attn_cfg(
         rope_dim: head_dim,
         scale_override: None,
         rope: hayai_cpu::RopeScaling::NONE,
+        use_rope: true,
     };
     if let Some(rd) = cat
         .meta_u32(&format!("{}.rope.dimension_count", config.architecture))

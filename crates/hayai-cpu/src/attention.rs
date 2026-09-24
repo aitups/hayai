@@ -197,6 +197,9 @@ pub struct AttentionConfig {
     pub scale_override: Option<f32>,
     /// Linear / YaRN RoPE scaling.
     pub rope: RopeScaling,
+    /// `false` for models with learned positions (GPT-2) or ALiBi (BLOOM/Falcon/MPT),
+    /// which do not rotate Q/K.
+    pub use_rope: bool,
 }
 
 impl AttentionConfig {
@@ -217,6 +220,7 @@ impl AttentionConfig {
             rope_dim: head_dim,
             scale_override: None,
             rope: RopeScaling::NONE,
+            use_rope: true,
         }
     }
 
@@ -297,26 +301,13 @@ pub fn attention_decode_step_ex(
     assert_eq!(cache.heads.len(), cfg.num_kv_heads);
 
     // RoPE on all Q heads and KV heads (partial when rope_dim < head_dim).
+    // Skipped for learned-position (GPT-2) / ALiBi (BLOOM/Falcon/MPT) models.
     let rd = cfg.rope_dim.max(1).min(cfg.head_dim);
-    for h in 0..cfg.num_heads {
-        let s = h * cfg.head_dim;
-        apply_rope_partial_factors_scaled(
-            &mut q[s..s + cfg.head_dim],
-            position,
-            cfg.head_dim,
-            rd,
-            cfg.rope_theta,
-            freq_factors,
-            cfg.rope,
-        );
-    }
-    if write_kv {
-        assert_eq!(k.len(), cfg.kv_dim());
-        assert_eq!(v.len(), cfg.kv_dim());
-        for h in 0..cfg.num_kv_heads {
+    if cfg.use_rope {
+        for h in 0..cfg.num_heads {
             let s = h * cfg.head_dim;
             apply_rope_partial_factors_scaled(
-                &mut k[s..s + cfg.head_dim],
+                &mut q[s..s + cfg.head_dim],
                 position,
                 cfg.head_dim,
                 rd,
@@ -324,6 +315,24 @@ pub fn attention_decode_step_ex(
                 freq_factors,
                 cfg.rope,
             );
+        }
+    }
+    if write_kv {
+        assert_eq!(k.len(), cfg.kv_dim());
+        assert_eq!(v.len(), cfg.kv_dim());
+        if cfg.use_rope {
+            for h in 0..cfg.num_kv_heads {
+                let s = h * cfg.head_dim;
+                apply_rope_partial_factors_scaled(
+                    &mut k[s..s + cfg.head_dim],
+                    position,
+                    cfg.head_dim,
+                    rd,
+                    cfg.rope_theta,
+                    freq_factors,
+                    cfg.rope,
+                );
+            }
         }
         // Append K/V into INT8 cache (post-RoPE keys).
         for h in 0..cfg.num_kv_heads {
@@ -430,6 +439,7 @@ mod tests {
             rope_dim: 8,
             scale_override: None,
             rope: RopeScaling::NONE,
+            use_rope: true,
         };
         let mut cache = LayerKvCache::new(cfg.num_kv_heads, cfg.head_dim, 2, 8);
 
