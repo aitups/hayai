@@ -33,6 +33,22 @@ pub enum LayerOpKind {
     AttnO,
     /// Gated attention (`attn_gate`, or `inp_gate` on non-PLE models).
     AttnGate,
+    /// MLA (DeepSeek-V2/V3, Kimi): `attn_q_a` (down-proj to q LoRA rank).
+    MlaQa,
+    /// MLA q LoRA norm (`attn_q_a_norm`).
+    MlaQaNorm,
+    /// MLA `attn_q_b` (up-proj from q LoRA rank to heads).
+    MlaQb,
+    /// MLA `attn_kv_a_mqa` (down-proj to `kv_lora_rank + qk_rope`).
+    MlaKvA,
+    /// MLA kv LoRA norm (`attn_kv_a_norm`).
+    MlaKvANorm,
+    /// MLA `attn_k_b` (absorbed K up-proj; also `attn_kv_b` legacy fused).
+    MlaKb,
+    /// MLA `attn_v_b` (absorbed V up-proj).
+    MlaVb,
+    /// MLA legacy fused `attn_kv_b` (unsplit `k_b`+`v_b`).
+    MlaKvB,
     /// Fused QKV projection (`attn_qkv.weight` / `qkv_proj.weight`).
     AttnQkv,
     /// `attn_q_norm.weight` — per-head query norm (Gemma4).
@@ -169,9 +185,10 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         TokenEmbed | PleEmbed => OpBinding::HOST_ROW,
         PositionEmbed => OpBinding::HOST_ROW,
         OutputNorm | AttnNorm | AttnQNorm | AttnKNorm | PostAttnNorm | FfnNorm | PostFfnNorm
-        | PleProjNorm | PlePostNorm | TokenEmbedNorm => OpBinding::CPU_NORM,
+        | PleProjNorm | PlePostNorm | TokenEmbedNorm | MlaQaNorm | MlaKvANorm => OpBinding::CPU_NORM,
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
-        | DeltaNet | Mamba | NextN | Recurrence | Conv => OpBinding::CPU_GEMV,
+        | DeltaNet | Mamba | NextN | Recurrence | Conv | MlaQa | MlaQb | MlaKvA | MlaKb
+        | MlaVb | MlaKvB => OpBinding::CPU_GEMV,
         FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown | SharedExpert
         | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
@@ -637,6 +654,32 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
             ));
         }
         return Ok(expert_kind(&n));
+    }
+
+    // ── Phase 4b: MLA (DeepSeek-V2/V3, Kimi) — before generic attn/norm names. ─
+    if n.contains("attn_q_a_norm") {
+        return Ok(MlaQaNorm);
+    }
+    if n.contains("attn_kv_a_norm") {
+        return Ok(MlaKvANorm);
+    }
+    if n.contains("attn_q_a") || n.contains("wq_a.weight") {
+        return Ok(MlaQa);
+    }
+    if n.contains("attn_q_b") || n.contains("wq_b.weight") {
+        return Ok(MlaQb);
+    }
+    if n.contains("attn_kv_a_mqa") {
+        return Ok(MlaKvA);
+    }
+    if n.contains("attn_kv_b") {
+        return Ok(MlaKvB);
+    }
+    if n.contains("attn_k_b") {
+        return Ok(MlaKb);
+    }
+    if n.contains("attn_v_b") {
+        return Ok(MlaVb);
     }
 
     // ── Phase 5: norms — before projections (`attn_q_norm` ⊃ `attn_q`). ───────
@@ -1190,6 +1233,28 @@ mod tests {
         assert_eq!(
             cls("ffn_dag_weights").unwrap(),
             LayerOpKind::FfnDagWeights
+        );
+    }
+
+    /// MLA (DeepSeek-V2/V3, Kimi): latent projections + q/kv LoRA norms.
+    #[test]
+    fn classifies_mla_ops() {
+        for (name, expected) in [
+            ("blk.0.attn_q_a.weight", LayerOpKind::MlaQa),
+            ("blk.0.attn_q_a_norm.weight", LayerOpKind::MlaQaNorm),
+            ("blk.0.attn_q_b.weight", LayerOpKind::MlaQb),
+            ("blk.0.attn_kv_a_mqa.weight", LayerOpKind::MlaKvA),
+            ("blk.0.attn_kv_a_norm.weight", LayerOpKind::MlaKvANorm),
+            ("blk.0.attn_k_b.weight", LayerOpKind::MlaKb),
+            ("blk.0.attn_v_b.weight", LayerOpKind::MlaVb),
+            ("blk.0.attn_kv_b.weight", LayerOpKind::MlaKvB),
+        ] {
+            assert_eq!(cls(name).unwrap(), expected, "tensor {name}");
+        }
+        // MLA norms must not be confused with the gemma per-head q/k norms.
+        assert_eq!(
+            cls("blk.0.attn_q_norm.weight").unwrap(),
+            LayerOpKind::AttnQNorm
         );
     }
 
