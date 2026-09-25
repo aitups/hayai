@@ -160,6 +160,20 @@ impl MetadataValue {
         }
     }
 
+    /// `[u32]` array (accepts U32/I32 elements); `None` for scalars / other types.
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    out.push(it.as_u32()?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     pub fn as_bool_array(&self) -> Option<Vec<bool>> {
         match self {
             Self::Array(items) => {

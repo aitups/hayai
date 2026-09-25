@@ -120,6 +120,14 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   `attn_qkv` (already split) and **partial RoPE** (`rope.dimension_count=32` of 80).
   Validated vs `llama-server` on `phi-2.Q4_K_M` (20-token greedy identical; top-4
   pos-0 logits identical).
+- **Architecture scalars** (Granite): `{arch}.embedding_scale` (×embedding),
+  `residual_scale` (×each sublayer output before the residual add),
+  `logit_scale` (÷final logits) and `attention.scale` → `AttentionConfig::scale_override`
+  are read in `open`/`build_attn_config` and applied in the Dense paths
+  (`embed_row`, the residual adds, `apply_logit_scale`). Granite's
+  `attention.head_count_kv` is a **per-layer array**; `load_config` takes the first
+  element for the generic Dense path. Validated on `granite-4.0-1b-Q4_K_M` (greedy
+  identical to `llama.cpp`).
 - Fused 3D experts (`ffn_gate_up_exps`, per-expert rows `[gate|up]`) are split into
   `ExpertGate`/`ExpertUp` slices at plan time (`build_exec_plan`); only `is_expert_op`
   3-D tensors feed the fused path, so per-head MLA `attn_k_b`/`attn_v_b` are never

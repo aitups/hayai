@@ -191,7 +191,7 @@ impl StreamingGenerator {
                         add_bias(&mut attn_proj, &b.o);
                     }
                     for i in 0..h {
-                        xs[t][i] += attn_proj[i];
+                        xs[t][i] += self.residual_scale * attn_proj[i];
                     }
                     // Depthwise causal short-conv residual (generic `Conv` op).
                     self.apply_conv(layer_idx, &mut xs[t])?;
@@ -209,7 +209,7 @@ impl StreamingGenerator {
                         finish_pending_ffn(self, orch, p, &current.down, scratch, layer_idx, &layout)?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                     for i in 0..h {
-                        xs[token_idx][i] += down_out[i];
+                        xs[token_idx][i] += self.residual_scale * down_out[i];
                     }
                 }
 
@@ -359,7 +359,7 @@ impl StreamingGenerator {
                         add_bias(&mut attn_proj, &b.o);
                     }
                     for i in 0..h {
-                        xs[0][i] += attn_proj[i];
+                        xs[0][i] += self.residual_scale * attn_proj[i];
                     }
                     let attn_dt = t_attn.elapsed().as_secs_f64();
                     self.attn_secs += attn_dt;
@@ -378,7 +378,7 @@ impl StreamingGenerator {
                     )?;
                     self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                     for i in 0..h {
-                        xs[token_idx][i] += down_out[i];
+                        xs[token_idx][i] += self.residual_scale * down_out[i];
                     }
 
                     // Layer i+1 already has DMA in flight; unmap when first FFN of that layer runs.
@@ -412,7 +412,7 @@ impl StreamingGenerator {
                     finish_pending_ffn(self, orch, p, &current.down, scratch, layer_idx, &layout)?;
                 self.ffn_secs += t_ffn.elapsed().as_secs_f64();
                 for i in 0..h {
-                    xs[token_idx][i] += down_out[i];
+                    xs[token_idx][i] += self.residual_scale * down_out[i];
                 }
             }
         }
@@ -444,6 +444,7 @@ impl StreamingGenerator {
                 orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
             }
         }
+        self.apply_logit_scale(&mut logits);
         Ok(logits)
     }
 
@@ -512,7 +513,7 @@ impl StreamingGenerator {
                     add_bias(&mut attn_proj, &b.o);
                 }
                 for i in 0..h {
-                    xs[t][i] += attn_proj[i];
+                    xs[t][i] += self.residual_scale * attn_proj[i];
                 }
             }
             self.attn_secs += t_attn.elapsed().as_secs_f64();
@@ -527,7 +528,7 @@ impl StreamingGenerator {
                     rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
                     self.run_ffn_block(orch, &pack, &xn, None)?;
                     for i in 0..h {
-                        xs[t][i] += self.ws_down[i];
+                        xs[t][i] += self.residual_scale * self.ws_down[i];
                     }
                 }
             } else {
@@ -549,7 +550,7 @@ impl StreamingGenerator {
                 orch.execute_quant_gemv_batched(&pack.down, &gate_all, &mut down_all, t_count)?;
                 for t in 0..t_count {
                     for i in 0..h {
-                        xs[t][i] += down_all[t * h + i];
+                        xs[t][i] += self.residual_scale * down_all[t * h + i];
                     }
                 }
             }
@@ -581,6 +582,7 @@ impl StreamingGenerator {
             self.io_bytes += emb.nbytes() as u64;
             orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
         }
+        self.apply_logit_scale(&mut logits);
         Ok(logits)
     }
 }

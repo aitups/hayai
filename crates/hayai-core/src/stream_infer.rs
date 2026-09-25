@@ -389,6 +389,11 @@ pub struct StreamingGenerator {
     /// Parallel residual + single shared norm (Phi-2/GPT-J/PaLM): `x = x + attn(ln(x))
     /// + ffn(ln(x))` — the block has `attn_norm` but no `ffn_norm`.
     pub(crate) parallel_residual: bool,
+    /// Architecture scalars (Granite `embedding_multiplier` / `residual_multiplier`
+    /// / `logits_scaling`); 1.0 for every other family.
+    pub(crate) embedding_scale: f32,
+    pub(crate) residual_scale: f32,
+    pub(crate) logit_scale: f32,
     /// ALiBi slopes (one per query head) for BLOOM/Falcon/MPT; `None` otherwise.
     pub(crate) alibi_slopes: Option<Vec<f32>>,
     pub(crate) has_output_weight: bool,
@@ -749,6 +754,24 @@ impl StreamingGenerator {
         // no `ffn_norm`; both sublayers read the same normed input and add to the
         // residual together.
         let parallel_residual = detect_parallel_residual(&catalog);
+        // Architecture scalars (Granite): embedding / residual / logit multipliers.
+        let meta_scale = |keys: &[&str]| -> f32 {
+            for k in keys {
+                if let Some(v) = catalog.meta_f32(&format!("{arch}.{k}")) {
+                    return v;
+                }
+            }
+            1.0
+        };
+        let embedding_scale = meta_scale(&["embedding_scale", "embedding_multiplier"]);
+        let residual_scale = meta_scale(&["residual_scale", "residual_multiplier"]);
+        let logit_scale = meta_scale(&["logit_scale", "logits_scaling"]);
+        // `AttentionConfig` already supports a scale override (Gemma4 uses 1.0).
+        if residual_scale != 1.0 || embedding_scale != 1.0 || logit_scale != 1.0 {
+            info!(
+                "arch={arch}: embedding_scale={embedding_scale} residual_scale={residual_scale} logit_scale={logit_scale}"
+            );
+        }
         let simple_dense = use_layernorm
             || learned_pos.is_some()
             || token_embed_norm.is_some()
@@ -954,6 +977,9 @@ impl StreamingGenerator {
             use_layernorm,
             simple_dense,
             parallel_residual,
+            embedding_scale,
+            residual_scale,
+            logit_scale,
             alibi_slopes,
             has_output_weight,
             sampler,
@@ -1210,15 +1236,38 @@ impl StreamingGenerator {
         if embd_name == "token_embd.weight" {
             if let Some(emb) = &self.resident_embed {
                 emb.embed_row(token, dst)?;
+                self.scale_embed(dst);
                 // No disk I/O: resident embedding. Do not inflate `io_bytes`.
                 return Ok(());
             }
         }
         let t0 = Instant::now();
         self.catalog.read_embed_row(embd_name, token, h, dst)?;
+        self.scale_embed(dst);
         self.io_secs += t0.elapsed().as_secs_f64();
         self.io_bytes += (h * 2) as u64;
         Ok(())
+    }
+
+    /// Granite `embedding_multiplier` (`embedding_scale`); no-op for other families.
+    #[inline]
+    fn scale_embed(&self, dst: &mut [f32]) {
+        if self.embedding_scale != 1.0 {
+            for v in dst.iter_mut() {
+                *v *= self.embedding_scale;
+            }
+        }
+    }
+
+    /// Granite `logits_scaling` (`logit_scale`): divide the final logits; no-op otherwise.
+    #[inline]
+    pub(crate) fn apply_logit_scale(&self, logits: &mut [f32]) {
+        if self.logit_scale != 1.0 {
+            let inv = 1.0 / self.logit_scale;
+            for v in logits.iter_mut() {
+                *v *= inv;
+            }
+        }
     }
 
     /// Disk → host/SVM slot as views (host-mapped). DMA overlaps Attn; unmap before FFN.
@@ -1595,7 +1644,7 @@ impl StreamingGenerator {
             if !self.parallel_residual {
                 let x = &mut self.act_pp[sel];
                 for i in 0..h {
-                    x[i] += self.scratch_proj[i];
+                    x[i] += self.residual_scale * self.scratch_proj[i];
                 }
             }
             self.attn_secs += t_attn.elapsed().as_secs_f64();
@@ -1730,11 +1779,12 @@ impl StreamingGenerator {
                 if self.parallel_residual {
                     // `x = x + attn(ln(x)) + ffn(ln(x))` (both from the shared norm).
                     for i in 0..h {
-                        self.act_pp[sel][i] += self.scratch_proj[i] + self.ws_down[i];
+                        self.act_pp[sel][i] +=
+                            self.residual_scale * (self.scratch_proj[i] + self.ws_down[i]);
                     }
                 } else {
                     for i in 0..h {
-                        self.act_pp[sel][i] += self.ws_down[i];
+                        self.act_pp[sel][i] += self.residual_scale * self.ws_down[i];
                     }
                 }
             }
@@ -1805,6 +1855,7 @@ impl StreamingGenerator {
                 eprintln!("DENSE_DUMP_TOP pos={}: {}", self.position, top.join(" "));
             }
         }
+        self.apply_logit_scale(&mut logits);
         Ok(logits)
     }
 
@@ -1917,9 +1968,10 @@ impl StreamingGenerator {
                     add_bias(&mut attn_proj, &b.o);
                 }
                 {
+                    let rs = self.residual_scale;
                     let x = self.act_mut();
                     for i in 0..h {
-                        x[i] += attn_proj[i];
+                        x[i] += rs * attn_proj[i];
                     }
                 }
                 self.attn_secs += t_attn.elapsed().as_secs_f64();
@@ -1973,7 +2025,7 @@ impl StreamingGenerator {
                 {
                     let sel = self.act_sel;
                     for i in 0..h {
-                        self.act_pp[sel][i] += self.ws_down[i];
+                        self.act_pp[sel][i] += self.residual_scale * self.ws_down[i];
                     }
                 }
             }
@@ -2023,6 +2075,7 @@ impl StreamingGenerator {
         }
 
         self.position += 1;
+        self.apply_logit_scale(&mut logits);
         Ok(logits)
     }
 
@@ -3580,6 +3633,14 @@ fn build_attn_config(
             cfg.rope_dim = rd;
         }
     }
+    // Architecture attention scale (`attention_multiplier`, Granite): replaces the
+    // default `1/sqrt(head_dim)`.
+    if let Some(s) = cat
+        .meta_f32(&format!("{}.attention.scale", config.architecture))
+        .or_else(|| cat.meta_f32(&format!("{}.attention_multiplier", config.architecture)))
+    {
+        cfg.scale_override = Some(s);
+    }
     // RoPE scaling: linear (`freq_scale = 1/factor`) and YaRN (`ext_factor`/mscale).
     let arch = &config.architecture;
     let rs_type = cat
@@ -3704,11 +3765,19 @@ pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
         .or_else(|| cat.meta_u32("llama.attention.head_count"))
         .or_else(|| cat.meta_u32("qwen2.attention.head_count"))
         .unwrap_or(8) as usize;
+    // `head_count_kv` may be a scalar OR a per-layer array (Granite: `[4,4,...]`);
+    // take the first element for the generic Dense path (per-layer families resolve
+    // it themselves, e.g. `GemmaMeta`).
     let n_kv = cat
-        .meta_u32(&format!("{arch}.attention.head_count_kv"))
-        .or_else(|| cat.meta_u32(&format!("{prefix}.attention.head_count_kv")))
-        .or_else(|| cat.meta_u32("llama.attention.head_count_kv"))
-        .or_else(|| cat.meta_u32("qwen2.attention.head_count_kv"))
+        .metadata
+        .get(&format!("{arch}.attention.head_count_kv"))
+        .or_else(|| cat.metadata.get(&format!("{prefix}.attention.head_count_kv")))
+        .or_else(|| cat.metadata.get("llama.attention.head_count_kv"))
+        .or_else(|| cat.metadata.get("qwen2.attention.head_count_kv"))
+        .and_then(|v| {
+            v.as_u32()
+                .or_else(|| v.as_u32_array().and_then(|a| a.first().copied()))
+        })
         .unwrap_or(n_heads as u32) as usize;
     // HRM detection is op/tensor-driven: the recurrence marker tensor is authoritative,
     // the architecture name is only a fallback (another name with the same ops works).
@@ -3893,6 +3962,33 @@ mod tests {
         let cat2 = GgufCatalog::open(&seq).unwrap();
         assert!(!detect_parallel_residual(&cat2));
         let _ = std::fs::remove_file(&seq);
+    }
+
+    /// `head_count_kv` may be a per-layer array (Granite): `load_config` takes the
+    /// first element so the generic Dense path gets the right `n_kv`.
+    #[test]
+    fn load_config_head_count_kv_array() {
+        let path = temp_dir().join("hayai_kv_array.gguf");
+        write_minimal_gguf(
+            &path,
+            &[
+                ("general.architecture", MetadataValue::String("granite".into())),
+                ("granite.embedding_length", MetadataValue::U32(8)),
+                ("granite.block_count", MetadataValue::U32(1)),
+                ("granite.attention.head_count", MetadataValue::U32(4)),
+                (
+                    "granite.attention.head_count_kv",
+                    MetadataValue::Array(vec![MetadataValue::U32(1), MetadataValue::U32(1)]),
+                ),
+            ],
+            &[("token_embd.weight", vec![8, 8], vec![1.0f32; 64])],
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let cfg = load_config(&cat).unwrap();
+        assert_eq!(cfg.num_key_value_heads, 1);
+        assert_eq!(cfg.num_attention_heads, 4);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
