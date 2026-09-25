@@ -122,9 +122,12 @@ T5 is a separate architecture **class** (two stacks), handled by
   in `BoundedKvCache::attend`; absolute key positions from `attention_slot_positions`.
   Falcon is split by `falcon.tensor_data_layout`: the new multiquery architecture
   (`"jploski"`, falcon-7B/40B) uses **RoPE**, only the old arch (falcon-rw-1b) ALiBi.
-- **RoPE scaling** (linear / YaRN): `{arch}.rope.scaling.{type,factor,beta_*,
-  original_context_length,attn_factor}` → `AttentionConfig.rope` /
-  `apply_rope_partial_factors_scaled`.
+- **RoPE scaling** (linear / YaRN / **LongRoPE**): `{arch}.rope.scaling.{type,factor,
+  beta_*,original_context_length,attn_factor}` → `AttentionConfig.rope` /
+  `apply_rope_partial_factors_scaled`. LongRoPE (Phi-3-128k) is detected by the
+  `rope_factors_{short,long}.weight` tensors: `short`/`long` are selected by sequence
+  length (`> original_context_length`) and passed as per-dim `freq_factors`, with
+  `attn_factor` as the cos/sin mscale.
 - **Architecture scalars** (Granite): `{arch}.embedding_scale`, `residual_scale`,
   `logit_scale` and `attention.scale` (→ `AttentionConfig::scale_override`) applied in
   the Dense paths; `head_count_kv` may be a per-layer array (first element used).

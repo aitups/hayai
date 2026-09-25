@@ -10,7 +10,7 @@ use crate::stream_infer::{
     add_bias, add_qkv_bias, ffn_begin_gate_up_scratch, ffn_finish_scratch, GateUpInflight,
     StreamInferError, StreamingGenerator,
 };
-use hayai_cpu::{attention_decode_step, rms_norm};
+use hayai_cpu::{attention_decode_step_ex, rms_norm};
 use hayai_model::{LayerPackLayout, LayerWeightPack, QuantMatrix};
 use hayai_opencl::StreamingScratch;
 use std::thread;
@@ -176,7 +176,7 @@ impl StreamingGenerator {
                         add_qkv_bias(b, &mut q, &mut k, &mut v);
                     }
                     let mut attn_out = vec![0.0f32; q_dim];
-                    attention_decode_step(
+                    attention_decode_step_ex(
                         &self.attn_cfg,
                         &mut self.kv[layer_idx],
                         &mut q,
@@ -184,6 +184,9 @@ impl StreamingGenerator {
                         &v,
                         pos,
                         &mut attn_out,
+                        true,
+                        self.longrope_sel.as_deref(),
+                        self.alibi_slopes.as_deref(),
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
@@ -344,7 +347,7 @@ impl StreamingGenerator {
                         add_qkv_bias(b, &mut q, &mut k, &mut v);
                     }
                     let mut attn_out = vec![0.0f32; q_dim];
-                    attention_decode_step(
+                    attention_decode_step_ex(
                         &self.attn_cfg,
                         &mut self.kv[next_layer],
                         &mut q,
@@ -352,6 +355,9 @@ impl StreamingGenerator {
                         &v,
                         self.position,
                         &mut attn_out,
+                        true,
+                        self.longrope_sel.as_deref(),
+                        self.alibi_slopes.as_deref(),
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
@@ -515,7 +521,7 @@ impl StreamingGenerator {
                     add_qkv_bias(b, &mut q, &mut k, &mut v);
                 }
                 let mut attn_out = vec![0.0f32; q_dim];
-                attention_decode_step(
+                attention_decode_step_ex(
                     &self.attn_cfg,
                     &mut self.kv[layer_idx],
                     &mut q,
@@ -523,6 +529,9 @@ impl StreamingGenerator {
                     &v,
                     base_pos + t,
                     &mut attn_out,
+                    true,
+                    self.longrope_sel.as_deref(),
+                    self.alibi_slopes.as_deref(),
                 );
                 let mut attn_proj = vec![0.0f32; h];
                 pack.wo.gemv(&attn_out, &mut attn_proj)?;

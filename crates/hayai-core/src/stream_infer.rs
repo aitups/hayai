@@ -9,7 +9,7 @@
 //!    immediately — residual deps prevent Attn(N+1) before FFN(N) completes).
 
 use hayai_cpu::{
-    attention_decode_step, attention_decode_step_alibi, rms_norm, AttentionConfig, LayerKvCache,
+    attention_decode_step_ex, rms_norm, AttentionConfig, LayerKvCache,
 };
 use hayai_model::{
     sample_with, GgmlType, GgufCatalog, GgufError, LayerPackLayout, LayerWeightPack, ModelConfig,
@@ -450,6 +450,10 @@ pub struct StreamingGenerator {
     pub(crate) z_l_init: Option<Vec<f32>>,
     /// Gemma4 proportional RoPE factors (`rope_freqs.weight`), cached once.
     pub(crate) gemma_rope_freqs: Option<Vec<f32>>,
+    /// LongRoPE (Phi-3-128k): `(short_factors, long_factors, original_ctx_len)`.
+    pub(crate) longrope: Option<(Vec<f32>, Vec<f32>, usize)>,
+    /// LongRoPE per-dim factors selected for the current sequence length.
+    pub(crate) longrope_sel: Option<Vec<f32>>,
     /// Gemma4 per-layer-embedding projection (`per_layer_model_proj.weight`): a
     /// single global tensor, loaded once on first use instead of once per token.
     pub(crate) ple_model_proj: Option<QuantMatrix>,
@@ -837,6 +841,19 @@ impl StreamingGenerator {
         };
         // Gemma4 proportional RoPE factors — loaded once, not per token.
         let gemma_rope_freqs = catalog.dequant_f32("rope_freqs.weight").ok();
+        // LongRoPE (Phi-3-128k): `short`/`long` per-dim factors + original ctx length.
+        let longrope = match (
+            catalog.dequant_f32("rope_factors_short.weight").ok(),
+            catalog.dequant_f32("rope_factors_long.weight").ok(),
+        ) {
+            (Some(s), Some(l)) => {
+                let orig = catalog
+                    .meta_u32(&format!("{arch}.rope.scaling.original_context_length"))
+                    .unwrap_or(4096) as usize;
+                Some((s, l, orig))
+            }
+            _ => None,
+        };
         // Attention biases (Qwen2/2.5 `attention_bias=true`, GPT-2/BLOOM fused QKV):
         // small F32 vectors, loaded once for all layers so the hot path only adds them.
         let q_dim_b = attn_cfg.hidden_size();
@@ -1030,6 +1047,8 @@ impl StreamingGenerator {
             scratch_proj: vec![0.0; hidden],
             z_l_init,
             gemma_rope_freqs,
+            longrope,
+            longrope_sel: None,
             ple_model_proj: None,
             ple_proj_norm: None,
             moe_non_expert: None,
@@ -1616,28 +1635,18 @@ impl StreamingGenerator {
             }
 
             self.scratch_attn.resize(q_dim, 0.0);
-            if let Some(slopes) = &self.alibi_slopes {
-                attention_decode_step_alibi(
-                    &self.attn_cfg,
-                    &mut self.kv[layer_idx],
-                    &mut self.scratch_q,
-                    &mut self.scratch_k,
-                    &self.scratch_v,
-                    pos,
-                    &mut self.scratch_attn,
-                    slopes,
-                );
-            } else {
-                attention_decode_step(
-                    &self.attn_cfg,
-                    &mut self.kv[layer_idx],
-                    &mut self.scratch_q,
-                    &mut self.scratch_k,
-                    &self.scratch_v,
-                    pos,
-                    &mut self.scratch_attn,
-                );
-            }
+            attention_decode_step_ex(
+                &self.attn_cfg,
+                &mut self.kv[layer_idx],
+                &mut self.scratch_q,
+                &mut self.scratch_k,
+                &self.scratch_v,
+                pos,
+                &mut self.scratch_attn,
+                true,
+                self.longrope_sel.as_deref(),
+                self.alibi_slopes.as_deref(),
+            );
             if let Some(ref gate_w) = current.attn_gate {
                 self.scratch_gate.resize(q_dim, 0.0);
                 gate_w.gemv(&self.scratch_xn, &mut self.scratch_gate)?;
@@ -1956,7 +1965,7 @@ impl StreamingGenerator {
                 }
 
                 let mut attn_out = vec![0.0f32; q_dim];
-                attention_decode_step(
+                attention_decode_step_ex(
                     &self.attn_cfg,
                     &mut self.kv[layer],
                     &mut q,
@@ -1964,6 +1973,9 @@ impl StreamingGenerator {
                     &v,
                     pos,
                     &mut attn_out,
+                    true,
+                    self.longrope_sel.as_deref(),
+                    self.alibi_slopes.as_deref(),
                 );
                 if let Some(ref gate_w) = current.attn_gate {
                     let mut gate = vec![0.0f32; q_dim];
@@ -2501,6 +2513,14 @@ impl StreamingGenerator {
         if prompt_ids.is_empty() {
             return Err(StreamInferError::Msg("empty prompt tokenization".into()));
         }
+        // LongRoPE: pick short/long per-dim factors by sequence length (Phi-3-128k).
+        if let Some((short, long, orig)) = &self.longrope {
+            self.longrope_sel = Some(if prompt_ids.len() > *orig {
+                long.clone()
+            } else {
+                short.clone()
+            });
+        }
         if self.config.hrm.is_some() {
             // HRM: each prompt token runs H×(L+1) stack passes (ExecPlan Recurrence).
             let mut last = Vec::new();
@@ -3035,7 +3055,7 @@ impl StreamingGenerator {
             orch.execute_quant_gemv_batched(&pack.wk, &x_flat, &mut k_flat, n)?;
             orch.execute_quant_gemv_batched(&pack.wv, &x_flat, &mut v_flat, n)?;
             for c in 0..n {
-                attention_decode_step(
+                attention_decode_step_ex(
                     &self.attn_cfg,
                     &mut kv[c][layer_idx],
                     &mut q_flat[c * q_dim..(c + 1) * q_dim],
@@ -3043,6 +3063,9 @@ impl StreamingGenerator {
                     &v_flat[c * kv_dim..(c + 1) * kv_dim],
                     pos,
                     &mut attn_out_flat[c * q_dim..(c + 1) * q_dim],
+                    true,
+                    self.longrope_sel.as_deref(),
+                    self.alibi_slopes.as_deref(),
                 );
             }
             if let Some(ref gate_w) = pack.attn_gate {
@@ -3245,7 +3268,7 @@ pub fn forward_batched_seq(
         for c in 0..n {
             for t in 0..n_pos {
                 let idx = c * n_pos + t;
-                attention_decode_step(
+                attention_decode_step_ex(
                     &self.attn_cfg,
                     &mut kv[c][layer_idx],
                     &mut q_flat[idx * q_dim..(idx + 1) * q_dim],
@@ -3253,6 +3276,9 @@ pub fn forward_batched_seq(
                     &v_flat[idx * kv_dim..(idx + 1) * kv_dim],
                     t,
                     &mut attn_out_flat[idx * q_dim..(idx + 1) * q_dim],
+                    true,
+                    self.longrope_sel.as_deref(),
+                    self.alibi_slopes.as_deref(),
                 );
             }
         }
@@ -3694,6 +3720,26 @@ fn build_attn_config(
             };
         }
         _ => {}
+    }
+    // LongRoPE (Phi-3-128k): per-dim `rope_factors_{short,long}` tensors + `attn_factor`.
+    // The per-dim factors are passed to the attention call; here we set the cos/sin
+    // `attn_factor` (mscale) and the original context length.
+    if cat.tensor("rope_factors_short.weight").is_ok() {
+        let attn_factor = cat
+            .meta_f32(&format!("{arch}.rope.scaling.attn_factor"))
+            .unwrap_or(1.0);
+        let n_ctx_orig = cat
+            .meta_u32(&format!("{arch}.rope.scaling.original_context_length"))
+            .unwrap_or(4096) as usize;
+        cfg.rope = hayai_cpu::RopeScaling {
+            freq_scale: 1.0,
+            ext_factor: 0.0,
+            attn_factor,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            n_ctx_orig,
+            yarn_log_mul: 0.0,
+        };
     }
     Ok(cfg)
 }

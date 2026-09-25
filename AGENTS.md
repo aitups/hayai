@@ -106,7 +106,9 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   whose positions come from learned embeddings (GPT-2) or ALiBi (BLOOM/MPT); Falcon
   is split by `falcon.tensor_data_layout` — the new multiquery architecture
   (`"jploski"`, falcon-7B/40B) uses RoPE, only the old arch (falcon-rw-1b) ALiBi.
-  applying RoPE to them corrupts attention. Validation against a local `llama.cpp`
+  RoPE scaling covers linear/YaRN and **LongRoPE** (Phi-3-128k: `rope_factors_{short,
+  long}.weight` selected by sequence length + `attn_factor` mscale, passed as per-dim
+  `freq_factors`). applying RoPE to them corrupts attention. Validation against a local `llama.cpp`
   (`llama-server`) is done at **fixed positions** (compare top-k logits, not greedy
   text) — llama.cpp quantizes GEMV activations (Q8_K) and its `/completion` adds a
   sampler chain, so text diverges even when the forward matches. MLA
