@@ -373,14 +373,57 @@ pub fn load_ffn_matrices(
 }
 
 /// Load all weight matrices for one transformer block (deterministic reads).
+    /// Fused FFN gate+up source for `layer`, when the layer has no separate
+    /// `ffn_gate`: HF `ffn_gate_up` (`gate_up_proj`), or Phi-3's fused `ffn_up`
+    /// (`nrows == 2 * ffn_down.ncols`). Rows are `[gate | up]`.
+    fn ffn_gate_up_source(&self, layer: usize) -> Option<(String, crate::gguf_types::TensorInfo)> {
+        if self.tensor(&format!("blk.{layer}.ffn_gate.weight")).is_ok() {
+            return None;
+        }
+        let gu = format!("blk.{layer}.ffn_gate_up.weight");
+        if let Ok(t) = self.tensor(&gu) {
+            return Some((gu, t.clone()));
+        }
+        let up_name = format!("blk.{layer}.ffn_up.weight");
+        let dn_name = format!("blk.{layer}.ffn_down.weight");
+        if let (Ok(up), Ok(dn)) = (self.tensor(&up_name), self.tensor(&dn_name)) {
+            if dn.ncols() > 0 && up.nrows() == 2 * dn.ncols() {
+                return Some((up_name, up.clone()));
+            }
+        }
+        None
+    }
+
     pub fn load_layer_pack(&mut self, layer: usize) -> Result<LayerWeightPack, GgufError> {
         let attn_gate = match self.tensor(&format!("blk.{layer}.attn_gate.weight")) {
             Ok(_) => Some(self.load_quant_matrix(&format!("blk.{layer}.attn_gate.weight"))?),
             Err(_) => None,
         };
-        let (gate, gate_csr) = load_ffn_pack(self, layer, "ffn_gate")?;
-        let (up, up_csr) = load_ffn_pack(self, layer, "ffn_up")?;
+        let (mut gate, gate_csr) = load_ffn_pack(self, layer, "ffn_gate")?;
+        let (mut up, up_csr) = load_ffn_pack(self, layer, "ffn_up")?;
         let (down, down_csr) = load_ffn_pack(self, layer, "ffn_down")?;
+        // Fused gate+up (`ffn_gate_up` / Phi-3 fused `ffn_up`): split the rows into
+        // owned gate/up matrices ([gate | up]).
+        if let Some((name, info)) = self.ffn_gate_up_source(layer) {
+            let fused = self.load_quant_matrix(&name)?;
+            let bytes = fused.raw_bytes();
+            let half = bytes.len() / 2;
+            let half_rows = info.nrows() / 2;
+            gate = QuantMatrix::owned(
+                format!("{name}#gate"),
+                info.ncols(),
+                half_rows,
+                info.ggml_type,
+                bytes[..half].to_vec(),
+            );
+            up = QuantMatrix::owned(
+                format!("{name}#up"),
+                info.ncols(),
+                half_rows,
+                info.ggml_type,
+                bytes[half..].to_vec(),
+            );
+        }
         Ok(LayerWeightPack {
             wq: self.load_quant_matrix(&format!("blk.{layer}.attn_q.weight"))?,
             wk: self.load_quant_matrix(&format!("blk.{layer}.attn_k.weight"))?,
@@ -426,24 +469,21 @@ pub fn load_ffn_matrices(
         // CSR de los bloques FFN sustituidos (D16): índice 0=gate, 1=up, 2=down.
         let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
         let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
-        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up].
-        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
-        let fused_gate_up =
-            self.tensor(&names[4]).is_err() && self.tensor(&gate_up_name).is_ok();
+        // Fused gate+up (`ffn_gate_up` / Phi-3 fused `ffn_up`): rows = [gate | up].
+        let fused_gate_up = self.ffn_gate_up_source(layer);
         for (i, name) in names.iter().enumerate() {
-            if fused_gate_up && i == 5 {
+            if i == 5 && fused_gate_up.is_some() {
                 continue; // up is the second half of the fused tensor
             }
-            if fused_gate_up && i == 4 {
-                let info = self.tensor(&gate_up_name).cloned().unwrap();
-                let nbytes = tensor_nbytes(&info)?;
+            if let (Some((_, info)), 4) = (&fused_gate_up, i) {
+                let nbytes = tensor_nbytes(info)?;
                 if off + nbytes > dst.len() {
                     return Err(GgufError::Msg(format!(
                         "layer {layer} fused gate_up {nbytes}B at {off} exceeds scratch {}",
                         dst.len()
                     )));
                 }
-                let abs = self.tensor_abs_offset(&info);
+                let abs = self.tensor_abs_offset(info);
                 ranges.push(IoRange {
                     offset: abs,
                     start: off,
@@ -756,17 +796,14 @@ pub fn load_ffn_matrices(
         let mut ffn_csrs: [Option<crate::weights::CsrSparse>; 3] = [None, None, None];
         let ffn_blocks = ["ffn_gate", "ffn_up", "ffn_down"];
         let mut off = 0usize;
-        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up].
-        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
-        let fused_gate_up =
-            self.tensor(&names[2]).is_err() && self.tensor(&gate_up_name).is_ok();
+        // Fused gate+up (`ffn_gate_up` / Phi-3 fused `ffn_up`): rows = [gate | up].
+        let fused_gate_up = self.ffn_gate_up_source(layer);
         for (i, name) in names.iter().enumerate() {
-            if fused_gate_up && i == 3 {
+            if i == 3 && fused_gate_up.is_some() {
                 continue;
             }
-            if fused_gate_up && i == 2 {
-                let info = self.tensor(&gate_up_name).cloned().unwrap();
-                let nbytes = tensor_nbytes(&info)?;
+            if let (Some((_, info)), 2) = (&fused_gate_up, i) {
+                let nbytes = tensor_nbytes(info)?;
                 if off + nbytes > base.len() {
                     return Err(GgufError::Msg(format!(
                         "layer {layer} fused gate_up {nbytes}B at {off} exceeds base {}",
@@ -993,17 +1030,14 @@ pub fn load_ffn_matrices(
         ];
         let mut ranges: Vec<IoRange> = Vec::with_capacity(6);
         let mut off = 0usize;
-        // Fused `ffn_gate_up.weight` (Phi-3 HF): rows = concat [gate | up] — read once.
-        let gate_up_name = format!("blk.{layer}.ffn_gate_up.weight");
-        let fused_gate_up =
-            self.tensor(&names[2]).is_err() && self.tensor(&gate_up_name).is_ok();
+        // Fused gate+up (`ffn_gate_up` / Phi-3 fused `ffn_up`): read once.
+        let fused_gate_up = self.ffn_gate_up_source(layer);
         for (i, name) in names.iter().enumerate() {
-            if fused_gate_up && i == 3 {
+            if i == 3 && fused_gate_up.is_some() {
                 continue;
             }
-            if fused_gate_up && i == 2 {
-                let info = self.tensor(&gate_up_name).cloned().unwrap();
-                let nbytes = tensor_nbytes(&info)?;
+            if let (Some((_, info)), 2) = (&fused_gate_up, i) {
+                let nbytes = tensor_nbytes(info)?;
                 if off + nbytes > dst.len() {
                     return Err(GgufError::Msg(format!(
                         "layer {layer} fused gate_up {nbytes}B at {off} exceeds scratch {}",
@@ -1011,7 +1045,7 @@ pub fn load_ffn_matrices(
                     )));
                 }
                 ranges.push(IoRange {
-                    offset: self.tensor_abs_offset(&info),
+                    offset: self.tensor_abs_offset(info),
                     start: off,
                     end: off + nbytes,
                 });
@@ -1692,6 +1726,43 @@ mod tests {
                 ("blk.0.attn_v.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
                 ("blk.0.attn_output.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
                 ("blk.0.ffn_gate_up.weight", vec![hidden as u64, (2 * inter) as u64], gate_up),
+                ("blk.0.ffn_down.weight", vec![inter as u64, hidden as u64], down),
+            ],
+        )
+        .unwrap();
+        let mut cat = GgufCatalog::open(&path).unwrap();
+        let n = cat.layer_pack_nbytes(0).unwrap();
+        let mut dst = vec![0u8; n];
+        let (pack, layout) = cat.load_layer_pack_into(0, &mut dst).unwrap();
+        assert_eq!(pack.gate.nrows, inter);
+        assert_eq!(pack.up.nrows, inter);
+        assert_eq!(pack.gate.ncols, hidden);
+        let row_bytes = hidden * 4; // F32
+        assert_eq!(layout.gate_len, inter * row_bytes);
+        assert_eq!(layout.up_len, inter * row_bytes);
+        assert_eq!(layout.up_off, layout.gate_off + inter * row_bytes);
+        assert_eq!(layout.total, n);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phi-3 stores the fused gate+up as `ffn_up` (`[hidden, 2*inter]`, no
+    /// `ffn_gate`); the pack must split it into gate/up halves by rows.
+    #[test]
+    fn phi3_fused_up_pack_splits_by_rows() {
+        let path = temp_dir().join("hayai_phi3_fused_up.gguf");
+        let hidden = 4usize;
+        let inter = 3usize;
+        let fused_up: Vec<f32> = (0..(hidden * 2 * inter)).map(|i| i as f32).collect();
+        let down: Vec<f32> = (0..(inter * hidden)).map(|i| i as f32).collect();
+        write_minimal_gguf(
+            &path,
+            &[("general.architecture", MetadataValue::String("phi3".into()))],
+            &[
+                ("blk.0.attn_q.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_k.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_v.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.attn_output.weight", vec![hidden as u64, hidden as u64], vec![0.5f32; hidden * hidden]),
+                ("blk.0.ffn_up.weight", vec![hidden as u64, (2 * inter) as u64], fused_up),
                 ("blk.0.ffn_down.weight", vec![inter as u64, hidden as u64], down),
             ],
         )

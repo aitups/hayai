@@ -106,7 +106,9 @@ T5 is a separate architecture **class** (two stacks), handled by
   preloaded and applied.
 - **Ungated FFN** (`up → gelu → down`, no `ffn_gate`): GPT-2 / BLOOM / OPT / Falcon.
 - **Fused gate+up** (`ffn_gate_up` / HF `gate_up_proj`, Phi-3): `FfnGateUp`, rows
-  concat `[gate | up]` split at pack load.
+  concat `[gate | up]` split at pack load. Phi-3's converter stores the same fused
+  tensor under the name **`ffn_up`** (`nrows = 2·ffn_length`, no `ffn_gate`); the pack
+  loader detects that shape (`ffn_gate_up_source`) and splits it identically.
 - **FFN / QKV / output biases**: preloaded once and applied by the Dense path
   (fused `attn_qkv.bias` is split `[q|k|v]`).
 - **Learned positions** (`position_embd`) and **input-embedding LayerNorm**

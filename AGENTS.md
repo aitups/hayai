@@ -139,7 +139,10 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   (`T5Session`); the decoder-only `StreamingGenerator` rejects them explicitly.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
-  `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a
+  `hayai.attn_qkv_interleave_repeats` GGUF metadata. Phi-3 stores its fused **gate+up**
+  under the name `ffn_up` (`nrows = 2·ffn_length`, no `ffn_gate`); `GgufCatalog::ffn_gate_up_source`
+  detects that shape and splits `[gate|up]` like the `ffn_gate_up` form (validated on
+  `Phi-3-mini-4k-instruct-q4`, greedy identical to `llama.cpp`). Generic `Conv` tensors execute as a
   depthwise causal conv1d + activation residual after attention (`apply_depthwise_conv`;
   activation from `hayai.conv_activation` = `silu`(default)/`gelu`/`none`), with the conv
   weights cached and no per-token plan scan. A conv whose `channels != hidden` is applied
