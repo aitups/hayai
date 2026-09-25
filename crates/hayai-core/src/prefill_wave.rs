@@ -445,6 +445,23 @@ impl StreamingGenerator {
             }
         }
         self.apply_logit_scale(&mut logits);
+        if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
+            let at: usize = std::env::var("HAYAI_DUMP_AT_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(usize::MAX);
+            if self.position == at {
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_by(|&a, &b| {
+                    logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top: Vec<String> = idx[..8.min(idx.len())]
+                    .iter()
+                    .map(|&i| format!("{}:{:.3}", i, logits[i]))
+                    .collect();
+                eprintln!("WAVE_DUMP_TOP pos={}: {}", self.position, top.join(" "));
+            }
+        }
         Ok(logits)
     }
 
@@ -583,6 +600,23 @@ impl StreamingGenerator {
             orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
         }
         self.apply_logit_scale(&mut logits);
+        if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
+            let at: usize = std::env::var("HAYAI_DUMP_AT_POS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(usize::MAX);
+            if self.position == at {
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_by(|&a, &b| {
+                    logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top: Vec<String> = idx[..8.min(idx.len())]
+                    .iter()
+                    .map(|&i| format!("{}:{:.3}", i, logits[i]))
+                    .collect();
+                eprintln!("WAVE_DUMP_TOP pos={}: {}", self.position, top.join(" "));
+            }
+        }
         Ok(logits)
     }
 }

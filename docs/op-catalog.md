@@ -140,7 +140,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   identical), Granite-4.0-1b (architecture scalars + array `head_count_kv`, greedy
   identical), Qwen2.5-7B (attention biases, top-4 pos-0/1 identical),
   StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical), Falcon-7B (fused MQA
-  QKV + shared-norm parallel residual, greedy identical).
+  QKV + shared-norm parallel residual, greedy identical), GLM-4/`chatglm` (fused QKV
+  + bias, fused `ffn_up` gate+up, partial RoPE, prefill top-k identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 
