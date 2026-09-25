@@ -96,8 +96,13 @@ T5 is a separate architecture **class** (two stacks), handled by
   `Das Haus ist schön.`); first-step top-5 logits match (`[644,316,37,660,1122]`,
   Δ ≈ F16 rounding). Tests: `t5_first_logits_match_hf`, `t5_greedy_matches_hf`
   (auto-skip without `models/flan-t5-small.F16.gguf`).
-- BART shares the class but differs in details (learned positions, LayerNorm,
-  different FFN); only the T5 path is implemented/validated so far.
+- **BART** (`general.architecture = "bart"`, `BartModel`): **post-norm** blocks
+  (`x = ln(x + sublayer(x))`, no final norm), **learned positions** (`enc/dec.pos_embd`,
+  offset 2) + `layernorm_embedding`, standard `1/√d` scaling, non-gated `gelu` FFN,
+  attention/FFN biases, tied `lm_head` (`token_embd`) + `output.bias`
+  (`final_logits_bias`). Validated vs HF `facebook/bart-base` (top-8 logits + greedy
+  identical). llama.cpp no longer ships BART, so the GGUF is built by
+  `scripts/bart_to_gguf.py` from safetensors.
 
 ## Implemented classic-transformer Dense ops (Fase 1)
 

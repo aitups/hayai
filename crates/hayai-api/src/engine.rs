@@ -113,7 +113,7 @@ pub fn generate_text(
     Ok((decoded, finish.to_string(), prompt_tokens, completion_tokens))
 }
 
-/// Encoder-decoder (T5/BART) completion via the token-by-token [`T5Session`].
+/// Encoder-decoder (T5/BART) completion via the token-by-token [`EncDecSession`].
 fn generate_text_t5(
     handle: Arc<ModelHandle>,
     prompt: &str,
@@ -122,8 +122,8 @@ fn generate_text_t5(
     stop: &[String],
     mut on_delta: impl FnMut(&str) -> Result<(), ApiError>,
 ) -> Result<(String, String, usize, usize), ApiError> {
-    use hayai_core::encoder_decoder_infer::T5Session;
-    let mut session = T5Session::start(&handle.path, params.sampler(), params.seed)
+    use hayai_core::encoder_decoder_infer::EncDecSession;
+    let mut session = EncDecSession::start(&handle.path, params.sampler(), params.seed)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     session.set_penalties(params.penalties);
     let prompt_tokens = session

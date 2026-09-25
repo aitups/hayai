@@ -275,6 +275,7 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 | Phi | Phi-3-mini (RMSNorm, fused `attn_qkv`, fused gate+up stored as `ffn_up` with `nrows = 2·ffn_length`, silu). Validated on the official `Phi-3-mini-4k-instruct-q4` (greedy identical to `llama.cpp`) |
 | Granite | IBM Granite (RMSNorm, GQA, tied embeddings) with architecture scalars (`embedding_multiplier`, `residual_multiplier`, `logits_scaling`, `attention_multiplier`) and a per-layer `head_count_kv` array. Validated on `granite-4.0-1b-Q4_K_M` (greedy identical to `llama.cpp`) |
 | Encoder-decoder | T5/FLAN-T5 (`t5`): bidirectional encoder + causal decoder with **cross-attention** and learned **relative position bias** (no RoPE/absolute positions, no `1/√d`), gated `gelu_new` FFN, SentencePiece **unigram** tokenizer. Validated vs HF `flan-t5-small` (CLI + server) |
+| BART | `bart`: pre-LayerNorm-free **post-norm** blocks, learned positions (offset 2), `1/√d` scaling, non-gated `gelu` FFN, cross-attention, tied `lm_head` + `final_logits_bias`; byte-level BPE. Validated vs HF `facebook/bart-base` (top-8 logits + greedy). Convert with `scripts/bart_to_gguf.py` (llama.cpp no longer ships BART) |
 
 **Quantization formats:** F32/F16, Q4_0/Q4_1, Q5_0/Q5_1, Q8_0, the K-family (Q2_K–Q6_K), and IQ2/IQ3/IQ4 (BF16 has CPU GEMV only). **Q8_K/Q8_1** are recognized but size-only; **IQ1/TQ** raise a hard unsupported-type error.
 

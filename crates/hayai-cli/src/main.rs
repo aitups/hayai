@@ -1004,21 +1004,36 @@ fn cmd_generate_t5(
     prompt: &str,
     max_tokens: usize,
 ) -> anyhow::Result<()> {
-    use hayai_core::encoder_decoder_infer::{generate, T5Model};
     let cat = hayai_model::GgufCatalog::open(model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
+    let is_bart = hayai_core::encoder_decoder_infer::is_bart(&cat);
     drop(cat);
     let t0 = Instant::now();
-    let mut m = T5Model::open(model)?;
-    println!(
-        "  Ready T5 (enc {}/dec {} layers, d_model {}, heads {}) in {:.2}s",
-        m.cfg.enc_layers,
-        m.cfg.dec_layers,
-        m.cfg.d_model,
-        m.cfg.n_heads,
-        t0.elapsed().as_secs_f64()
-    );
-    let ids = generate(&mut m, &tokenizer, prompt, max_tokens)?;
+    let ids = if is_bart {
+        use hayai_core::encoder_decoder_infer::{bart_generate, BartModel};
+        let mut m = BartModel::open(model)?;
+        println!(
+            "  Ready BART (enc {}/dec {} layers, d_model {}, heads {}) in {:.2}s",
+            m.cfg.enc_layers,
+            m.cfg.dec_layers,
+            m.cfg.d_model,
+            m.cfg.n_heads,
+            t0.elapsed().as_secs_f64()
+        );
+        bart_generate(&mut m, &tokenizer, prompt, max_tokens)?
+    } else {
+        use hayai_core::encoder_decoder_infer::{generate, T5Model};
+        let mut m = T5Model::open(model)?;
+        println!(
+            "  Ready T5 (enc {}/dec {} layers, d_model {}, heads {}) in {:.2}s",
+            m.cfg.enc_layers,
+            m.cfg.dec_layers,
+            m.cfg.d_model,
+            m.cfg.n_heads,
+            t0.elapsed().as_secs_f64()
+        );
+        generate(&mut m, &tokenizer, prompt, max_tokens)?
+    };
     println!("─────────────────────────────────────────────────────────────");
     println!("{}", tokenizer.decode(&ids).trim());
     Ok(())
