@@ -389,6 +389,9 @@ pub struct StreamingGenerator {
     /// Parallel residual + single shared norm (Phi-2/GPT-J/PaLM): `x = x + attn(ln(x))
     /// + ffn(ln(x))` — the block has `attn_norm` but no `ffn_norm`.
     pub(crate) parallel_residual: bool,
+    /// Per-layer RoPE enable (Cohere2: SWA layers use RoPE, global layers NoPE).
+    /// Empty ⇒ RoPE for every layer.
+    pub(crate) layer_apply_rope: Vec<bool>,
     /// Architecture scalars (Granite `embedding_multiplier` / `residual_multiplier`
     /// / `logits_scaling`); 1.0 for every other family.
     pub(crate) embedding_scale: f32,
@@ -772,7 +775,17 @@ impl StreamingGenerator {
         };
         let embedding_scale = meta_scale(&["embedding_scale", "embedding_multiplier"]);
         let residual_scale = meta_scale(&["residual_scale", "residual_multiplier"]);
-        let logit_scale = meta_scale(&["logit_scale", "logits_scaling"]);
+        // `logit_scale` is a **multiplier** on the final logits: Cohere2 stores it
+        // directly (`ggml_scale(logits, logit_scale)`); Granite stores the divisor
+        // (`logits / logits_scaling`).
+        let raw_logit_scale = meta_scale(&["logit_scale", "logits_scaling"]);
+        let logit_scale = if raw_logit_scale == 1.0 {
+            1.0
+        } else if arch == "cohere2" {
+            raw_logit_scale
+        } else {
+            1.0 / raw_logit_scale
+        };
         // `AttentionConfig` already supports a scale override (Gemma4 uses 1.0).
         if residual_scale != 1.0 || embedding_scale != 1.0 || logit_scale != 1.0 {
             info!(
@@ -811,6 +824,20 @@ impl StreamingGenerator {
             .as_ref()
             .map(|h| h.kv_slots())
             .unwrap_or(config.num_layers);
+        // Cohere2 (Command-R7B): `is_swa(i) = i % 4 != 3`. SWA layers use RoPE + a
+        // `sliding_window` cache; global layers use **NoPE** (no RoPE) + full attention.
+        let cohere2: Option<(usize, Vec<bool>)> = if arch == "cohere2" {
+            let n_swa = catalog
+                .meta_u32("cohere2.attention.sliding_window")
+                .unwrap_or(4096) as usize;
+            Some((n_swa, (0..kv_slots).map(|i| i % 4 != 3).collect()))
+        } else {
+            None
+        };
+        let layer_apply_rope: Vec<bool> = cohere2
+            .as_ref()
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
         let kv = match ModelKind::from_catalog(&catalog) {
             ModelKind::Gemma => {
                 crate::gemma_infer::build_layer_kv_caches(&catalog, &config, sink, window)?
@@ -828,7 +855,14 @@ impl StreamingGenerator {
                 Vec::new()
             }
             _ => (0..kv_slots)
-                .map(|_| LayerKvCache::new(attn_cfg.num_kv_heads, attn_cfg.head_dim, sink, window))
+                .map(|i| {
+                    let w = match &cohere2 {
+                        Some((n_swa, swa)) if swa[i] => (*n_swa).max(1),
+                        Some(_) => config.max_position_embeddings.max(1),
+                        None => window,
+                    };
+                    LayerKvCache::new(attn_cfg.num_kv_heads, attn_cfg.head_dim, sink, w)
+                })
                 .collect(),
         };
 
@@ -1005,6 +1039,7 @@ impl StreamingGenerator {
             use_layernorm,
             simple_dense,
             parallel_residual,
+            layer_apply_rope,
             embedding_scale,
             residual_scale,
             logit_scale,
@@ -1289,13 +1324,12 @@ impl StreamingGenerator {
         }
     }
 
-    /// Granite `logits_scaling` (`logit_scale`): divide the final logits; no-op otherwise.
+    /// Final-logit multiplier (Granite `logits_scaling` ÷, Cohere2 `logit_scale` ×).
     #[inline]
     pub(crate) fn apply_logit_scale(&self, logits: &mut [f32]) {
         if self.logit_scale != 1.0 {
-            let inv = 1.0 / self.logit_scale;
             for v in logits.iter_mut() {
-                *v *= inv;
+                *v *= self.logit_scale;
             }
         }
     }
@@ -1648,6 +1682,7 @@ impl StreamingGenerator {
                 true,
                 self.rope_freq_factors.as_deref(),
                 self.alibi_slopes.as_deref(),
+                self.layer_apply_rope.get(layer_idx).copied().unwrap_or(true),
             );
             if let Some(ref gate_w) = current.attn_gate {
                 self.scratch_gate.resize(q_dim, 0.0);
@@ -1978,6 +2013,7 @@ impl StreamingGenerator {
                     true,
                     self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
+                    self.layer_apply_rope.get(layer).copied().unwrap_or(true),
                 );
                 if let Some(ref gate_w) = current.attn_gate {
                     let mut gate = vec![0.0f32; q_dim];
@@ -3068,6 +3104,7 @@ impl StreamingGenerator {
                     true,
                     self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
+                    self.layer_apply_rope.get(layer_idx).copied().unwrap_or(true),
                 );
             }
             if let Some(ref gate_w) = pack.attn_gate {
@@ -3281,6 +3318,7 @@ pub fn forward_batched_seq(
                     true,
                     self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
+                    self.layer_apply_rope.get(layer_idx).copied().unwrap_or(true),
                 );
             }
         }

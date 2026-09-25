@@ -187,6 +187,7 @@ impl StreamingGenerator {
                         true,
                         self.rope_freq_factors.as_deref(),
                         self.alibi_slopes.as_deref(),
+                        self.layer_apply_rope.get(layer_idx).copied().unwrap_or(true),
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
@@ -358,6 +359,7 @@ impl StreamingGenerator {
                         true,
                         self.rope_freq_factors.as_deref(),
                         self.alibi_slopes.as_deref(),
+                        self.layer_apply_rope.get(next_layer).copied().unwrap_or(true),
                     );
                     let mut attn_proj = vec![0.0f32; h];
                     current.wo.gemv(&attn_out, &mut attn_proj)?;
@@ -532,6 +534,7 @@ impl StreamingGenerator {
                     true,
                     self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
+                    self.layer_apply_rope.get(layer_idx).copied().unwrap_or(true),
                 );
                 let mut attn_proj = vec![0.0f32; h];
                 pack.wo.gemv(&attn_out, &mut attn_proj)?;

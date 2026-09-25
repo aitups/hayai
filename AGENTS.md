@@ -136,6 +136,13 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   `attention.head_count_kv` is a **per-layer array**; `load_config` takes the first
   element for the generic Dense path. Validated on `granite-4.0-1b-Q4_K_M` (greedy
   identical to `llama.cpp`).
+- **Cohere2** (Command-R7B): alternating SWA/global layers (`is_swa(i) = i % 4 != 3`,
+  via GGUF debug log). SWA layers apply RoPE + a `sliding_window` cache; global layers
+  apply **NoPE** (no RoPE) + full attention — handled by `StreamingGenerator::layer_apply_rope`
+  (per-layer `apply_rope` arg to `attention_decode_step_ex`) and per-layer KV windows.
+  `logit_scale` is a **multiplier** here (Granite divides). Single shared norm parallel
+  residual (`attn_norm` only). Validated on `c4ai-command-r7b-12-2024-Q2_K` (tokenization
+  + top-1 logits identical to `llama.cpp`).
 - Fused 3D experts (`ffn_gate_up_exps`, per-expert rows `[gate|up]`) are split into
   `ExpertGate`/`ExpertUp` slices at plan time (`build_exec_plan`); only `is_expert_op`
   3-D tensors feed the fused path, so per-head MLA `attn_k_b`/`attn_v_b` are never

@@ -68,7 +68,6 @@ Rules:
 | Tensor | Reason |
 |---|---|
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
-| `cohere2` per-layer SWA + NoPE | Command-R7B: `load_swa_pattern(4)` — SWA layers use RoPE + a 4096 sliding window, global layers use **NoPE** (no RoPE) + full attention, plus a multiplicative `logit_scale`. Parallel residual is already handled. |
 | anything unrecognized | Register a `LayerOpKind` + classifier arm + `op_binding` (see `docs/adding-a-model-family.md`) |
 
 ## Encoder-decoder (T5 / BART) — `encoder_decoder_infer`
@@ -135,6 +134,10 @@ T5 is a separate architecture **class** (two stacks), handled by
 - **Architecture scalars** (Granite): `{arch}.embedding_scale`, `residual_scale`,
   `logit_scale` and `attention.scale` (→ `AttentionConfig::scale_override`) applied in
   the Dense paths; `head_count_kv` may be a per-layer array (first element used).
+- **Per-layer SWA / NoPE** (Cohere2, Command-R7B): `is_swa(i) = i % 4 != 3`; SWA layers
+  apply RoPE (with a `sliding_window` cache), global layers apply **no RoPE** (NoPE) +
+  full attention. `logit_scale` is a **multiplier** here (`ggml_scale(logits, logit_scale)`),
+  unlike Granite's divisor; `layer_apply_rope` + per-layer KV windows handle it.
 - **`AttentionConfig::use_rope`**: `false` for learned-position (GPT-2) / ALiBi
   (BLOOM/Falcon/MPT) models, which must not rotate Q/K.
 - **Parallel residual + single shared norm** (Phi-2/GPT-J/PaLM): when block 0 has
@@ -150,7 +153,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   QKV + shared-norm parallel residual, greedy identical), GLM-4/`chatglm` (fused QKV
   + bias, fused `ffn_up` gate+up, partial RoPE, prefill top-k identical), MPT-7B (ALiBi
   + `max_alibi_bias` clamp + fused QKV, greedy identical), MiniCPM5-2B (`llama` arch,
-  top-1 identical).
+  top-1 identical), Cohere2/Command-R7B (per-layer SWA + NoPE global layers + shared-norm
+  parallel residual + multiply `logit_scale`, top-1 identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 

@@ -255,7 +255,7 @@ pub fn attention_decode_step(
     position: usize,
     out: &mut [f32],
 ) {
-    attention_decode_step_ex(cfg, cache, q, k, v, position, out, true, None, None);
+    attention_decode_step_ex(cfg, cache, q, k, v, position, out, true, None, None, true);
 }
 
 /// Like [`attention_decode_step`] but with ALiBi slopes (one per query head).
@@ -280,6 +280,7 @@ pub fn attention_decode_step_alibi(
         true,
         None,
         Some(alibi_slopes),
+        true,
     );
 }
 
@@ -299,15 +300,17 @@ pub fn attention_decode_step_ex(
     write_kv: bool,
     freq_factors: Option<&[f32]>,
     alibi_slopes: Option<&[f32]>,
+    apply_rope: bool,
 ) {
     assert_eq!(q.len(), cfg.hidden_size());
     assert_eq!(out.len(), cfg.hidden_size());
     assert_eq!(cache.heads.len(), cfg.num_kv_heads);
 
     // RoPE on all Q heads and KV heads (partial when rope_dim < head_dim).
-    // Skipped for learned-position (GPT-2) / ALiBi (BLOOM/Falcon/MPT) models.
+    // Skipped for learned-position (GPT-2) / ALiBi (BLOOM/Falcon/MPT) models and, per
+    // layer, for Cohere2 NoPE (global) layers.
     let rd = cfg.rope_dim.max(1).min(cfg.head_dim);
-    if cfg.use_rope {
+    if cfg.use_rope && apply_rope {
         for h in 0..cfg.num_heads {
             let s = h * cfg.head_dim;
             apply_rope_partial_factors_scaled(
@@ -324,7 +327,7 @@ pub fn attention_decode_step_ex(
     if write_kv {
         assert_eq!(k.len(), cfg.kv_dim());
         assert_eq!(v.len(), cfg.kv_dim());
-        if cfg.use_rope {
+        if cfg.use_rope && apply_rope {
             for h in 0..cfg.num_kv_heads {
                 let s = h * cfg.head_dim;
                 apply_rope_partial_factors_scaled(

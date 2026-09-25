@@ -341,6 +341,7 @@ fn forward_gemma_inner(
             write_kv,
             factors,
             None,
+            true,
         );
 
         let mut attn_proj = vec![0.0f32; h];
