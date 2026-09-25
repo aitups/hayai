@@ -88,6 +88,9 @@ pub enum LayerOpKind {
     ExpertGate,
     ExpertUp,
     ExpertDown,
+    /// Fused per-expert gate+up 3D tensor (`ffn_gate_up_exps.weight`): split by rows
+    /// into `ExpertGate`/`ExpertUp` at plan time.
+    ExpertGateUp,
     /// Shared expert — `ffn_shexp.*` / `shared_expert.*` (DeepSeek-style).
     SharedExpert,
     /// Gated DeltaNet / SSM / linear-attention family (Qwen3.5 hybrid, etc.).
@@ -189,8 +192,8 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
         | DeltaNet | Mamba | NextN | Recurrence | Conv | MlaQa | MlaQb | MlaKvA | MlaKb
         | MlaVb | MlaKvB => OpBinding::CPU_GEMV,
-        FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown | SharedExpert
-        | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
+        FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown
+        | ExpertGateUp | SharedExpert | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
         LayerOutputScale | Aux | RouterBias | RouterScale | ExpertScale => OpBinding::DISCARD,
     }
@@ -376,13 +379,13 @@ pub fn build_exec_plan(
             for t in tensors.iter() {
                 if let Some(eid) = parse_expert_id(&t.name) {
                     by_exp.entry(eid).or_default().push(t.clone());
-                } else if t.ndims >= 3 {
+                } else if is_expert_op(t.op) && t.ndims >= 3 {
                     fused.push((t.clone(), t.nbytes / n_exp));
                 }
             }
             non_expert_bytes = tensors
                 .iter()
-                .filter(|t| parse_expert_id(&t.name).is_none() && t.ndims < 3)
+                .filter(|t| !is_expert_op(t.op))
                 .map(|t| t.nbytes)
                 .sum();
             if fused.is_empty() {
@@ -407,17 +410,38 @@ pub fn build_exec_plan(
                 for e in 0..n_exp {
                     let mut ets: Vec<TensorRef> = Vec::new();
                     for (t, slice) in &fused {
-                        ets.push(TensorRef {
-                            name: t.name.clone(),
-                            op: t.op,
-                            nbytes: *slice,
-                            ggml_type: t.ggml_type,
-                            ncols: t.ncols,
-                            nrows: t.nrows,
-                            offset: 0,
-                            src_off: e * slice,
-                            ndims: 2,
-                        });
+                        if t.op == LayerOpKind::ExpertGateUp {
+                            // Rows concat [gate | up]: split into two views.
+                            let half = *slice / 2;
+                            let rows_half = (t.nrows / 2).max(1);
+                            for (op, off) in
+                                [(LayerOpKind::ExpertGate, 0usize), (LayerOpKind::ExpertUp, half)]
+                            {
+                                ets.push(TensorRef {
+                                    name: t.name.clone(),
+                                    op,
+                                    nbytes: half,
+                                    ggml_type: t.ggml_type,
+                                    ncols: t.ncols,
+                                    nrows: rows_half,
+                                    offset: 0,
+                                    src_off: e * slice + off,
+                                    ndims: 2,
+                                });
+                            }
+                        } else {
+                            ets.push(TensorRef {
+                                name: t.name.clone(),
+                                op: t.op,
+                                nbytes: *slice,
+                                ggml_type: t.ggml_type,
+                                ncols: t.ncols,
+                                nrows: t.nrows,
+                                offset: 0,
+                                src_off: e * slice,
+                                ndims: 2,
+                            });
+                        }
                     }
                     let mut eoff = 0usize;
                     for ts in ets.iter_mut() {
@@ -649,9 +673,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
     if n.contains("ffn_exp") || n.contains("experts.") || n.contains("exps") {
         if n.contains("gate_up") || n.contains("gateup") {
-            return Err(format!(
-                "fused expert gate+up tensor not implemented in the streaming path (needs split): {name}"
-            ));
+            return Ok(ExpertGateUp);
         }
         return Ok(expert_kind(&n));
     }
@@ -899,14 +921,17 @@ pub(crate) fn parse_expert_id(name: &str) -> Option<usize> {
 pub(crate) fn is_expert_op(op: LayerOpKind) -> bool {
     matches!(
         op,
-        LayerOpKind::ExpertGate | LayerOpKind::ExpertUp | LayerOpKind::ExpertDown
+        LayerOpKind::ExpertGate
+            | LayerOpKind::ExpertUp
+            | LayerOpKind::ExpertDown
+            | LayerOpKind::ExpertGateUp
     )
 }
 
 /// Pack order for fused expert slices: gate@0, up@slice, down@2*slice.
 fn fused_role_rank(op: LayerOpKind) -> usize {
     match op {
-        LayerOpKind::ExpertGate => 0,
+        LayerOpKind::ExpertGate | LayerOpKind::ExpertGateUp => 0,
         LayerOpKind::ExpertUp => 1,
         LayerOpKind::ExpertDown => 2,
         _ => 3,
@@ -1306,8 +1331,11 @@ mod tests {
             cls("model.layers.0.mlp.gate_up_proj.weight").unwrap(),
             LayerOpKind::FfnGateUp
         );
-        // Fused expert gate+up is still unimplemented (loud).
-        assert!(cls("blk.0.ffn_gate_up_exps.weight").is_err());
+        // Fused expert gate+up (split by rows at plan time).
+        assert_eq!(
+            cls("blk.0.ffn_gate_up_exps.weight").unwrap(),
+            LayerOpKind::ExpertGateUp
+        );
         // Learned absolute position embeddings (GPT-2 `wpe`) are a cataloged op.
         assert_eq!(
             cls("transformer.wpe.weight").unwrap(),
@@ -1502,6 +1530,73 @@ mod tests {
         let sparse_window = unit.non_expert_bytes + unit.max_expert_bytes;
         assert_eq!(unit.total_bytes, sparse_window);
         assert!(sparse_window < full_block);
+    }
+
+    /// Fused expert gate+up (`ffn_gate_up_exps`) splits into per-expert gate/up
+    /// views (rows concat `[gate | up]`) alongside the fused down experts.
+    #[test]
+    fn moe_plan_splits_fused_gate_up_experts() {
+        use hayai_model::{gguf::write_minimal_gguf, GgufCatalog, MetadataValue};
+        use std::env::temp_dir;
+
+        let path = temp_dir().join("hayai_plan_moe_fused_gu.gguf");
+        let h: u64 = 8;
+        let ff: u64 = 4;
+        let vocab: u64 = 16;
+        let ne: u64 = 2;
+        let tensors: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("token_embd.weight", vec![h, vocab], vec![0.1f32; (h * vocab) as usize]),
+            ("output_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("output.weight", vec![vocab, h], vec![0.1f32; (vocab * h) as usize]),
+            ("blk.0.attn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.attn_q.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_k.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_v.weight", vec![h, 2 * h], vec![0.1f32; (h * 2 * h) as usize]),
+            ("blk.0.attn_output.weight", vec![2 * h, h], vec![0.1f32; (2 * h * h) as usize]),
+            ("blk.0.ffn_norm.weight", vec![h], vec![1.0f32; h as usize]),
+            ("blk.0.ffn_gate_inp.weight", vec![h, ne], vec![0.1f32; (h * ne) as usize]),
+            // Fused gate+up: [n_embd, 2*ffn, n_expert].
+            (
+                "blk.0.ffn_gate_up_exps.weight",
+                vec![h, 2 * ff, ne],
+                vec![0.1f32; (h * 2 * ff * ne) as usize],
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                vec![ff, h, ne],
+                vec![0.1f32; (ff * h * ne) as usize],
+            ),
+        ];
+        write_minimal_gguf(
+            &path,
+            &[
+                ("general.architecture", MetadataValue::String("olmoe".into())),
+                ("olmoe.expert_count", MetadataValue::U32(2)),
+                ("olmoe.attention.expert_used_count", MetadataValue::U32(1)),
+            ],
+            &tensors,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&path).unwrap();
+        let plan = build_exec_plan(&cat, 0, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let unit = plan.units.iter().find(|u| u.block_id == Some(0)).unwrap();
+        assert_eq!(unit.experts.len(), 2);
+        // gate, up (from the fused tensor) + down.
+        assert_eq!(unit.experts[0].tensors.len(), 3);
+        let gate = &unit.experts[0].tensors[0];
+        let up = &unit.experts[0].tensors[1];
+        let down = &unit.experts[0].tensors[2];
+        assert_eq!(gate.op, LayerOpKind::ExpertGate);
+        assert_eq!(up.op, LayerOpKind::ExpertUp);
+        assert_eq!(down.op, LayerOpKind::ExpertDown);
+        assert_eq!(gate.nrows, ff as usize);
+        assert_eq!(up.nrows, ff as usize);
+        assert_eq!(gate.ncols, h as usize);
+        assert_eq!(gate.src_off, 0);
+        assert_eq!(up.src_off, gate.nbytes); // up starts after gate rows
+        assert_eq!(down.src_off, 0);
     }
 
     /// Un GGUF disperso de `saor` (2 tensores sin prefijo `blk.N.`) abre y se

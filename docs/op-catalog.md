@@ -45,6 +45,7 @@ Rules:
 | `RouterScale` | `ffn_gate_inp.scale` | DISCARD (preloaded) | router input scale |
 | `ExpertScale` | `ffn_*_exps.scale` (length `n_expert`) | DISCARD (preloaded) | per-expert scale |
 | `ExpertGate`/`ExpertUp`/`ExpertDown` | `ffn_exp.E.ffn_*`, `experts.E.{w1,w2,w3,gate/up/down_proj}` | GPU_ASYNC | MoE (fused 3D slices) |
+| `ExpertGateUp` | `ffn_gate_up_exps` (fused `[gate\|up]` per expert) | GPU_ASYNC | split into `ExpertGate`/`ExpertUp` at plan time |
 | `SharedExpert` | `shared_expert`, `ffn_shexp` | GPU_ASYNC | MoE |
 | `DeltaNet` | `delta`, `linear_attn`, `ssm*`, `conv1d`, `in_proj_qkv(z)`, `in_proj_ba`, `shortconv.out_proj` | CPU_GEMV | hybrid (Qwen3.5) |
 | `Mamba` | `ssm_x`, `ssm_in`, `.ssm_d` | CPU_GEMV | mamba_infer |
@@ -62,9 +63,7 @@ Rules:
 
 | Tensor | Reason |
 |---|---|
-| MLA full/absorbed (`is_mla` split 3D `wk_b`/`wv_b`) | Not implemented (non-absorbed `attn_kv_b` Lite path is) |
 | `relative_attention_bias` / `cross_attn` / `.encoder.` / `.decoder.` | T5/BART are encoder-decoder — a separate architecture class, not yet implemented |
-| `ffn_gate_up_exps` (fused experts) | Fused per-expert gate+up; needs a 3D row split |
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
 | anything unrecognized | Register a `LayerOpKind` + classifier arm + `op_binding` (see `docs/adding-a-model-family.md`) |
 
@@ -93,14 +92,21 @@ Rules:
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 
-`mla_attention` (`crates/hayai-core/src/moe_infer.rs`) implements the non-absorbed
-`deepseek2` path (Lite + legacy fused `attn_kv_b`): `attn_q` (lite) or `q_a`→`q_b`,
-`attn_kv_a_mqa` → latent `c_kv`(+`k_pe`), `attn_kv_a_norm`, fused `attn_kv_b` →
-per-head `[k_nope | v]`, YaRN RoPE on the trailing `qk_rope` dims (offset
-`qk_nope`), MQA-style compressed cache. Validated: `attn_factor`/`kq_scale` match
-`llama-context.cpp`/`deepseek2.cpp`; a clean-room reference reproduces `q_pe`/`attn`
-bit-for-bit; DeepSeek-V2-Lite logits at position 0 (after BOS) are identical to
-`llama.cpp`.
+`mla_attention` (`crates/hayai-core/src/moe_infer.rs`) implements both `deepseek2`
+variants:
+- **Non-absorbed** (Lite + legacy fused `attn_kv_b`): `attn_q` (lite) or `q_a`→`q_b`,
+  `attn_kv_a_mqa` → latent `c_kv`(+`k_pe`), `attn_kv_a_norm`, fused `attn_kv_b` →
+  per-head `[k_nope | v]`, per-head KV cache.
+- **Absorbed** (`attn_k_b`/`attn_v_b`, full DeepSeek-V2/V3 + Kimi): `W_kb` absorbs
+  `q_nope` per head (`q_absorbed = W_kb^T q_nope`), a single MQA latent KV cache
+  (`[c_kv | k_pe]`), and `W_vb` maps the attention output back to `v_head_dim`;
+  `MlaMeta::absorbed` selects it and `view_of_head` slices the packed 3D per-head tensors.
+
+Both use YaRN RoPE on the trailing `qk_rope` dims (offset `qk_nope`). Validated:
+`attn_factor`/`kq_scale` match `llama-context.cpp`/`deepseek2.cpp`; a clean-room
+reference reproduces `q_pe`/`attn` bit-for-bit; DeepSeek-V2-Lite (non-absorbed) logits
+at position 0 (after BOS) are identical to `llama.cpp`; the absorbed `W_kb^T q` algebra
+is unit-tested (`absorbed_wkb_gemv_is_transpose_product`).
 
 ## MoE routing (modern)
 

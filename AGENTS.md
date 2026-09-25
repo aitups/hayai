@@ -108,9 +108,15 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   (`llama-server`) is done at **fixed positions** (compare top-k logits, not greedy
   text) — llama.cpp quantizes GEMV activations (Q8_K) and its `/completion` adds a
   sampler chain, so text diverges even when the forward matches. MLA
-  (DeepSeek-V2/V3, non-absorbed `attn_kv_b` Lite path) is implemented in
-  `moe_infer::mla_attention` and matches `llama-context.cpp`'s YaRN
-  `attn_factor`/`kq_scale`; the full/absorbed split-3D `wk_b`/`wv_b` path is pending.
+  (DeepSeek-V2/V3, Kimi) is implemented in `moe_infer::mla_attention` and matches
+  `llama-context.cpp`'s YaRN `attn_factor`/`kq_scale`. Both variants are supported:
+  the non-absorbed Lite path (`attn_kv_b`, per-head `[k_nope|v]` decompression) and the
+  absorbed path (`attn_k_b`/`attn_v_b`, split-3D `wk_b`/`wv_b` per head with a single MQA
+  latent KV cache — `MlaMeta::absorbed` selects it; `view_of_head` slices each head).
+- Fused 3D experts (`ffn_gate_up_exps`, per-expert rows `[gate|up]`) are split into
+  `ExpertGate`/`ExpertUp` slices at plan time (`build_exec_plan`); only `is_expert_op`
+  3-D tensors feed the fused path, so per-head MLA `attn_k_b`/`attn_v_b` are never
+  mistaken for experts.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
   `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a

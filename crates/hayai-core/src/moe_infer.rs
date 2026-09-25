@@ -646,12 +646,6 @@ fn mla_attention(
         rms_norm(c_kv, kn, eps);
     }
 
-    // Fused decompression: `attn_kv_b` → per head `[k_nope | v]`.
-    let wkv_b = view_of(base, loaded, LayerOpKind::MlaKvB)?;
-    let ph = m.qk_nope + m.v_head_dim;
-    let mut kv = vec![0.0f32; m.n_heads * ph];
-    wkv_b.gemv(c_kv, &mut kv)?;
-
     // DeepSeek pre-scales `kq_scale` so YaRN's `mscale²` is applied once here
     // (the RoPE itself scales q/k by `attn_factor_org`).
     let rope = gen.attn_cfg.rope;
@@ -668,32 +662,71 @@ fn mla_attention(
     };
     let scale = mscale * mscale / (qk_head as f32).sqrt();
     let mut attn = vec![0.0f32; m.n_heads * m.v_head_dim];
+    // `k_nope`-equivalent shown by the dump (per-head decompressed, or the latent).
+    let k_nope_dump: Vec<f32>;
     {
         let caches = gen
             .mla_kv
             .as_mut()
             .ok_or_else(|| StreamInferError::Msg("MLA without cache".into()))?;
         let cache = &mut caches[layer];
-        for hd in 0..m.n_heads {
-            let mut k = vec![0.0f32; qk_head];
-            k[..m.qk_nope].copy_from_slice(&kv[hd * ph..hd * ph + m.qk_nope]);
-            k[m.qk_nope..].copy_from_slice(&k_pe_snapshot);
-            let v = kv[hd * ph + m.qk_nope..hd * ph + ph].to_vec();
-            // K cache stores the full `[k_nope | k_pe]`; its value slot is unused.
-            cache.k.heads[hd].append(&k, &k);
-            cache.v.heads[hd].append(&v, &v);
-            let qh = &q[hd * qk_head..(hd + 1) * qk_head];
-            let slots = cache.k.heads[hd].attention_slots();
-            let mut scores: Vec<f32> = slots
-                .iter()
-                .map(|&s| cache.k.heads[hd].score_key(s, qh) * scale)
-                .collect();
-            softmax(&mut scores);
-            let mut acc = vec![0.0f32; m.v_head_dim];
-            for (i, &s) in slots.iter().enumerate() {
-                cache.v.heads[hd].accumulate_value(s, scores[i], &mut acc);
+        if m.absorbed {
+            // Absorbed path (`attn_k_b`/`attn_v_b`): one MQA cache head in latent
+            // space; `q_nope` is absorbed per head via `W_kb`, output via `W_vb`.
+            let mut k_full = Vec::with_capacity(m.kv_lora_rank + m.qk_rope);
+            k_full.extend_from_slice(c_kv);
+            k_full.extend_from_slice(&k_pe_snapshot);
+            cache.k.heads[0].append(&k_full, &k_full);
+            cache.v.heads[0].append(c_kv, c_kv);
+            let slots = cache.k.heads[0].attention_slots();
+            for hd in 0..m.n_heads {
+                let qn = &q[hd * qk_head..hd * qk_head + m.qk_nope];
+                let wkb = view_of_head(base, loaded, LayerOpKind::MlaKb, hd, m.n_heads)?;
+                let mut qcur = vec![0.0f32; m.kv_lora_rank];
+                wkb.gemv(qn, &mut qcur)?;
+                qcur.extend_from_slice(&q[hd * qk_head + m.qk_nope..(hd + 1) * qk_head]);
+                let mut scores: Vec<f32> = slots
+                    .iter()
+                    .map(|&s| cache.k.heads[0].score_key(s, &qcur) * scale)
+                    .collect();
+                softmax(&mut scores);
+                let mut acc = vec![0.0f32; m.kv_lora_rank];
+                for (i, &s) in slots.iter().enumerate() {
+                    cache.v.heads[0].accumulate_value(s, scores[i], &mut acc);
+                }
+                let wvb = view_of_head(base, loaded, LayerOpKind::MlaVb, hd, m.n_heads)?;
+                let out = &mut attn[hd * m.v_head_dim..(hd + 1) * m.v_head_dim];
+                wvb.gemv(&acc, out)?;
             }
-            attn[hd * m.v_head_dim..(hd + 1) * m.v_head_dim].copy_from_slice(&acc);
+            k_nope_dump = c_kv.to_vec();
+        } else {
+            // Fused decompression: `attn_kv_b` → per head `[k_nope | v]`.
+            let wkv_b = view_of(base, loaded, LayerOpKind::MlaKvB)?;
+            let ph = m.qk_nope + m.v_head_dim;
+            let mut kv = vec![0.0f32; m.n_heads * ph];
+            wkv_b.gemv(c_kv, &mut kv)?;
+            k_nope_dump = kv[..3.min(kv.len())].to_vec();
+            for hd in 0..m.n_heads {
+                let mut k = vec![0.0f32; qk_head];
+                k[..m.qk_nope].copy_from_slice(&kv[hd * ph..hd * ph + m.qk_nope]);
+                k[m.qk_nope..].copy_from_slice(&k_pe_snapshot);
+                let v = kv[hd * ph + m.qk_nope..hd * ph + ph].to_vec();
+                // K cache stores the full `[k_nope | k_pe]`; its value slot is unused.
+                cache.k.heads[hd].append(&k, &k);
+                cache.v.heads[hd].append(&v, &v);
+                let qh = &q[hd * qk_head..(hd + 1) * qk_head];
+                let slots = cache.k.heads[hd].attention_slots();
+                let mut scores: Vec<f32> = slots
+                    .iter()
+                    .map(|&s| cache.k.heads[hd].score_key(s, qh) * scale)
+                    .collect();
+                softmax(&mut scores);
+                let mut acc = vec![0.0f32; m.v_head_dim];
+                for (i, &s) in slots.iter().enumerate() {
+                    cache.v.heads[hd].accumulate_value(s, scores[i], &mut acc);
+                }
+                attn[hd * m.v_head_dim..(hd + 1) * m.v_head_dim].copy_from_slice(&acc);
+            }
         }
     }
 
@@ -712,7 +745,7 @@ fn mla_attention(
             &k_pe_snapshot[..3.min(k_pe_snapshot.len())],
             &q[..3],
             &q[m.qk_nope..m.qk_nope + 3],
-            &kv[..3],
+            &k_nope_dump[..3.min(k_nope_dump.len())],
             &attn[..3]
         );
     }
@@ -734,6 +767,30 @@ fn view_of<'a>(
         t.nrows,
         t.ggml_type,
         &base[*off..*off + t.nbytes],
+    ))
+}
+
+/// View over one head of a packed 3D per-head tensor (`attn_k_b`/`attn_v_b`:
+/// `[qk_nope, kv_lora, n_head]` / `[kv_lora, v_head_dim, n_head]`).
+fn view_of_head(
+    base: &[u8],
+    loaded: &[(TensorRef, usize)],
+    op: LayerOpKind,
+    head: usize,
+    n_head: usize,
+) -> Result<QuantMatrix, StreamInferError> {
+    let (t, off) = loaded
+        .iter()
+        .find(|(t, _)| t.op == op)
+        .ok_or_else(|| StreamInferError::Msg(format!("MLA block missing {op:?} tensor")))?;
+    let head_bytes = t.nbytes / n_head.max(1);
+    let start = *off + head * head_bytes;
+    Ok(QuantMatrix::view(
+        t.name.clone(),
+        t.ncols,
+        t.nrows,
+        t.ggml_type,
+        &base[start..start + head_bytes],
     ))
 }
 
@@ -954,6 +1011,28 @@ mod tests {
         assert_eq!(top_k_indices(&scores, 2), vec![1, 4]);
         assert_eq!(top_k_indices(&scores, 10), vec![1, 4, 2, 0, 3]);
         assert_eq!(top_k_indices(&scores, 0), vec![1]);
+    }
+
+    #[test]
+    fn absorbed_wkb_gemv_is_transpose_product() {
+        // Absorbed MLA computes `q_absorbed = W_kb^T @ q_nope`. `W_kb` is stored
+        // `[qk_nope, kv_lora]` (ne0 = qk_nope contiguous), and our row-major GEMV
+        // over `ncols=qk_nope, nrows=kv_lora` yields exactly `sum_nope W[nope, l]*q`.
+        use hayai_model::GgmlType;
+        let qk_nope = 3usize;
+        let kv_lora = 2usize;
+        let mut data = Vec::new();
+        for latent in 0..kv_lora {
+            for nope in 0..qk_nope {
+                data.extend_from_slice(&((nope as f32) + 10.0 * latent as f32).to_le_bytes());
+            }
+        }
+        let w = QuantMatrix::view("wk_b", qk_nope, kv_lora, GgmlType::F32, &data);
+        let q = [1.0f32, 2.0, 3.0];
+        let mut out = vec![0.0f32; kv_lora];
+        w.gemv(&q, &mut out).unwrap();
+        assert!((out[0] - (0.0 * 1.0 + 1.0 * 2.0 + 2.0 * 3.0)).abs() < 1e-6);
+        assert!((out[1] - (10.0 * 1.0 + 11.0 * 2.0 + 12.0 * 3.0)).abs() < 1e-6);
     }
 
     #[test]

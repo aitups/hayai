@@ -156,6 +156,8 @@ pub(crate) struct MlaMeta {
     pub(crate) qk_nope: usize,
     pub(crate) qk_rope: usize,
     pub(crate) v_head_dim: usize,
+    /// `true` for the absorbed path (`attn_k_b`/`attn_v_b`, 1 KV head MQA).
+    pub(crate) absorbed: bool,
 }
 
 impl MlaMeta {
@@ -845,17 +847,31 @@ impl StreamingGenerator {
                 .or_else(|| cat_u32("attention.value_length_mla"))
                 .unwrap_or(128) as usize;
             let n_heads = config.num_attention_heads;
+            // Absorbed MLA (`attn_k_b`/`attn_v_b`, full DeepSeek-V2/V3 + Kimi) uses a
+            // single MQA KV head over the latent; the Lite path decompresses per head.
+            let absorbed = (0..config.num_layers)
+                .any(|i| catalog.tensor(&format!("blk.{i}.attn_k_b.weight")).is_ok());
             let meta = MlaMeta {
                 n_heads,
                 kv_lora_rank,
                 qk_nope: key_length.saturating_sub(qk_rope),
                 qk_rope,
                 v_head_dim,
+                absorbed,
             };
             let caches: Vec<MlaKvCache> = (0..n_slots)
-                .map(|_| MlaKvCache {
-                    k: LayerKvCache::new(n_heads, meta.qk_head(), sink, window),
-                    v: LayerKvCache::new(n_heads, v_head_dim, sink, window),
+                .map(|_| {
+                    if absorbed {
+                        MlaKvCache {
+                            k: LayerKvCache::new(1, kv_lora_rank + qk_rope, sink, window),
+                            v: LayerKvCache::new(1, kv_lora_rank, sink, window),
+                        }
+                    } else {
+                        MlaKvCache {
+                            k: LayerKvCache::new(n_heads, meta.qk_head(), sink, window),
+                            v: LayerKvCache::new(n_heads, v_head_dim, sink, window),
+                        }
+                    }
                 })
                 .collect();
             let kv_norms: Vec<Option<Vec<f32>>> = (0..n_slots)
