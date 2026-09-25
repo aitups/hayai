@@ -75,13 +75,22 @@ impl Tokenizer {
             .get("tokenizer.ggml.eos_token_id")
             .and_then(|v| v.as_u32())
             .unwrap_or(2);
+        // Pre-tokenizer tag (`tokenizer.ggml.pre`): selects the Llama-3 BPE variant and,
+        // like llama.cpp, its default `add_bos` when the key is absent.
+        let pre = metadata
+            .get("tokenizer.ggml.pre")
+            .and_then(|v| match v {
+                crate::gguf_types::MetadataValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
         let add_bos = metadata
             .get("tokenizer.ggml.add_bos_token")
             .and_then(|v| match v {
                 crate::gguf_types::MetadataValue::Bool(b) => Some(*b),
                 _ => None,
             })
-            .unwrap_or(false);
+            .unwrap_or(matches!(pre, "llama-bpe" | "llama3" | "llama-v3"));
 
         let model = metadata
             .get("tokenizer.ggml.model")

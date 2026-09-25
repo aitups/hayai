@@ -185,7 +185,7 @@ impl StreamingGenerator {
                         pos,
                         &mut attn_out,
                         true,
-                        self.longrope_sel.as_deref(),
+                        self.rope_freq_factors.as_deref(),
                         self.alibi_slopes.as_deref(),
                     );
                     let mut attn_proj = vec![0.0f32; h];
@@ -356,7 +356,7 @@ impl StreamingGenerator {
                         self.position,
                         &mut attn_out,
                         true,
-                        self.longrope_sel.as_deref(),
+                        self.rope_freq_factors.as_deref(),
                         self.alibi_slopes.as_deref(),
                     );
                     let mut attn_proj = vec![0.0f32; h];
@@ -530,7 +530,7 @@ impl StreamingGenerator {
                     base_pos + t,
                     &mut attn_out,
                     true,
-                    self.longrope_sel.as_deref(),
+                    self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
                 );
                 let mut attn_proj = vec![0.0f32; h];

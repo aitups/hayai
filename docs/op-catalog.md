@@ -128,7 +128,9 @@ T5 is a separate architecture **class** (two stacks), handled by
   `apply_rope_partial_factors_scaled`. LongRoPE (Phi-3-128k) is detected by the
   `rope_factors_{short,long}.weight` tensors: `short`/`long` are selected by sequence
   length (`> original_context_length`) and passed as per-dim `freq_factors`, with
-  `attn_factor` as the cos/sin mscale.
+  `attn_factor` as the cos/sin mscale. A `rope_freqs.weight` tensor (Gemma4
+  proportional RoPE, or the Llama-3 NTK-by-parts scaling baked by the converter) is
+  likewise passed as per-dim `freq_factors` in the Dense path.
 - **Architecture scalars** (Granite): `{arch}.embedding_scale`, `residual_scale`,
   `logit_scale` and `attention.scale` (→ `AttentionConfig::scale_override`) applied in
   the Dense paths; `head_count_kv` may be a per-layer array (first element used).

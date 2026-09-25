@@ -452,8 +452,10 @@ pub struct StreamingGenerator {
     pub(crate) gemma_rope_freqs: Option<Vec<f32>>,
     /// LongRoPE (Phi-3-128k): `(short_factors, long_factors, original_ctx_len)`.
     pub(crate) longrope: Option<(Vec<f32>, Vec<f32>, usize)>,
-    /// LongRoPE per-dim factors selected for the current sequence length.
-    pub(crate) longrope_sel: Option<Vec<f32>>,
+    /// Per-dim RoPE `freq_factors` for the Dense path: `rope_freqs.weight` (Gemma4
+    /// proportional / Llama-3 NTK-by-parts baked by the converter) or LongRoPE
+    /// `rope_factors_{short,long}` selected by sequence length.
+    pub(crate) rope_freq_factors: Option<Vec<f32>>,
     /// Gemma4 per-layer-embedding projection (`per_layer_model_proj.weight`): a
     /// single global tensor, loaded once on first use instead of once per token.
     pub(crate) ple_model_proj: Option<QuantMatrix>,
@@ -1046,9 +1048,9 @@ impl StreamingGenerator {
             scratch_gate: vec![0.0; hidden],
             scratch_proj: vec![0.0; hidden],
             z_l_init,
+            rope_freq_factors: gemma_rope_freqs.clone(),
             gemma_rope_freqs,
             longrope,
-            longrope_sel: None,
             ple_model_proj: None,
             ple_proj_norm: None,
             moe_non_expert: None,
@@ -1644,7 +1646,7 @@ impl StreamingGenerator {
                 pos,
                 &mut self.scratch_attn,
                 true,
-                self.longrope_sel.as_deref(),
+                self.rope_freq_factors.as_deref(),
                 self.alibi_slopes.as_deref(),
             );
             if let Some(ref gate_w) = current.attn_gate {
@@ -1974,7 +1976,7 @@ impl StreamingGenerator {
                     pos,
                     &mut attn_out,
                     true,
-                    self.longrope_sel.as_deref(),
+                    self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
                 );
                 if let Some(ref gate_w) = current.attn_gate {
@@ -2515,7 +2517,7 @@ impl StreamingGenerator {
         }
         // LongRoPE: pick short/long per-dim factors by sequence length (Phi-3-128k).
         if let Some((short, long, orig)) = &self.longrope {
-            self.longrope_sel = Some(if prompt_ids.len() > *orig {
+            self.rope_freq_factors = Some(if prompt_ids.len() > *orig {
                 long.clone()
             } else {
                 short.clone()
@@ -3064,7 +3066,7 @@ impl StreamingGenerator {
                     pos,
                     &mut attn_out_flat[c * q_dim..(c + 1) * q_dim],
                     true,
-                    self.longrope_sel.as_deref(),
+                    self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
                 );
             }
@@ -3277,7 +3279,7 @@ pub fn forward_batched_seq(
                     t,
                     &mut attn_out_flat[idx * q_dim..(idx + 1) * q_dim],
                     true,
-                    self.longrope_sel.as_deref(),
+                    self.rope_freq_factors.as_deref(),
                     self.alibi_slopes.as_deref(),
                 );
             }

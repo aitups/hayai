@@ -108,7 +108,11 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   (`"jploski"`, falcon-7B/40B) uses RoPE, only the old arch (falcon-rw-1b) ALiBi.
   RoPE scaling covers linear/YaRN and **LongRoPE** (Phi-3-128k: `rope_factors_{short,
   long}.weight` selected by sequence length + `attn_factor` mscale, passed as per-dim
-  `freq_factors`). applying RoPE to them corrupts attention. Validation against a local `llama.cpp`
+  `freq_factors`). A `rope_freqs.weight` tensor (Gemma4 proportional RoPE, or Llama-3's
+  NTK-by-parts scaling baked by the converter) is also passed as `freq_factors` in the
+  Dense path. The tokenizer defaults `add_bos=true` for the `llama-bpe`/`llama3`
+  pre-tokenizers when `tokenizer.ggml.add_bos_token` is absent (matching llama.cpp,
+  whose default is true). applying RoPE to them corrupts attention. Validation against a local `llama.cpp`
   (`llama-server`) is done at **fixed positions** (compare top-k logits, not greedy
   text) — llama.cpp quantizes GEMV activations (Q8_K) and its `/completion` adds a
   sampler chain, so text diverges even when the forward matches. MLA
