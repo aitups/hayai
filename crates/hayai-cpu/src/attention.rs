@@ -195,6 +195,9 @@ pub struct AttentionConfig {
     pub rope_dim: usize,
     /// If `Some`, use this attention scale instead of `1/sqrt(head_dim)`. Gemma4 uses `1.0`.
     pub scale_override: Option<f32>,
+    /// ALiBi bias clamp (`{arch}.attention.max_alibi_bias`, MPT): `bias = max(bias, -max)`.
+    /// `0.0` disables clamping (BLOOM/Falcon).
+    pub alibi_max_bias: f32,
     /// Linear / YaRN RoPE scaling.
     pub rope: RopeScaling,
     /// `false` for models with learned positions (GPT-2) or ALiBi (BLOOM/Falcon/MPT),
@@ -219,6 +222,7 @@ impl AttentionConfig {
             rope_theta,
             rope_dim: head_dim,
             scale_override: None,
+            alibi_max_bias: 0.0,
             rope: RopeScaling::NONE,
             use_rope: true,
         }
@@ -352,7 +356,7 @@ pub fn attention_decode_step_ex(
         let kv_head = q_head / groups;
         let q_slice = &q[q_head * cfg.head_dim..(q_head + 1) * cfg.head_dim];
         let kv = &cache.heads[kv_head];
-        let alibi = alibi_slopes.map(|s| (s[q_head], position));
+        let alibi = alibi_slopes.map(|s| (s[q_head], position, cfg.alibi_max_bias));
         kv.attend(q_slice, scale, &mut scores, &mut acc, alibi);
         out[q_head * cfg.head_dim..(q_head + 1) * cfg.head_dim].copy_from_slice(&acc);
     }
@@ -438,6 +442,7 @@ mod tests {
             rope_theta: 10000.0,
             rope_dim: 8,
             scale_override: None,
+            alibi_max_bias: 0.0,
             rope: RopeScaling::NONE,
             use_rope: true,
         };

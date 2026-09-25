@@ -145,7 +145,8 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   self-attn); cross-attention has no bias; norms are T5 RMS; FFN is gated `gelu_new`
   (`gated-gelu`; not stored in the GGUF, assumed). The T5 tokenizer is SentencePiece
   **unigram** — `Tokenizer::unigram_encode` runs Viterbi over `tokenizer.ggml.scores`
-  when `tokenizer.ggml.model` is `t5`/`umt5`. Validated vs HF `fln-t5-small`
+  for vocabs with scores and **no merges** (T5, plus some non-standard conversions),
+  with `<0xNN>` byte fallback. Validated vs HF `fln-t5-small`
   (ids + top-5 logits); tests auto-skip without the model. The CLI `generate` and
   `hayai-server` auto-detect enc-dec models (`is_encoder_decoder`) and use this path
   (`T5Session`/`EncDecSession`); the decoder-only `StreamingGenerator` rejects them

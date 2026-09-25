@@ -92,6 +92,7 @@ pub fn resolve_full_attn_cfg(
         rope_theta: config.rope_theta,
         rope_dim: head_dim,
         scale_override: None,
+        alibi_max_bias: 0.0,
         rope: hayai_cpu::RopeScaling::NONE,
         use_rope: true,
     };

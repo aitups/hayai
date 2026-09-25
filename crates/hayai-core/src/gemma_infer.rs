@@ -158,6 +158,7 @@ impl GemmaMeta {
             rope_theta: rope,
             rope_dim: head_dim,
             scale_override: Some(1.0), // Gemma4: no 1/sqrt(d)
+            alibi_max_bias: 0.0,
             rope: hayai_cpu::RopeScaling::NONE,
             use_rope: true,
         }

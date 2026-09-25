@@ -230,15 +230,16 @@ impl BoundedKvCache {
 
     /// Softmax attention over resident slots (FP for recent, INT8 channel-wise otherwise).
     ///
-    /// `alibi`: optional `(slope, query_position)` — adds `-slope * (q_pos - k_pos)`
-    /// to every score before softmax (BLOOM/Falcon/MPT).
+    /// `alibi`: optional `(slope, query_position, max_bias)` — adds
+    /// `max(-slope * (q_pos - k_pos), -max_bias)` to every score before softmax
+    /// (BLOOM/Falcon/MPT; `max_bias <= 0` disables the clamp).
     pub fn attend(
         &self,
         query: &[f32],
         scale: f32,
         scores_out: &mut Vec<f32>,
         acc: &mut [f32],
-        alibi: Option<(f32, usize)>,
+        alibi: Option<(f32, usize, f32)>,
     ) {
         assert_eq!(query.len(), self.dim);
         assert_eq!(acc.len(), self.dim);
@@ -253,8 +254,12 @@ impl BoundedKvCache {
         scores_out.reserve(slots.len());
         for (idx, &slot) in slots.iter().enumerate() {
             let mut s = self.score_key(slot, query) * scale;
-            if let (Some((slope, q_pos)), Some(pos)) = (alibi, positions.as_ref()) {
-                s -= slope * (q_pos as f32 - pos[idx] as f32);
+            if let (Some((slope, q_pos, max_bias)), Some(pos)) = (alibi, positions.as_ref()) {
+                let mut b = -slope * (q_pos as f32 - pos[idx] as f32);
+                if max_bias > 0.0 {
+                    b = b.max(-max_bias);
+                }
+                s += b;
             }
             scores_out.push(s);
         }
@@ -329,6 +334,23 @@ mod tests {
         let slots = cache.attention_slots();
         assert_eq!(slots.len(), 5);
         assert_eq!(&slots[..2], &[0, 1]);
+    }
+
+    #[test]
+    fn alibi_bias_is_clamped_to_max() {
+        // 3 keys with zero scores; slope 1, q_pos 2 → biases -2,-1,0; clamp at -1 → -1,-1,0.
+        let mut cache = BoundedKvCache::with_recent_fp(1, 0, 8, 8);
+        for _ in 0..3 {
+            cache.append(&[0.0], &[0.0]);
+        }
+        let mut scores = Vec::new();
+        let mut acc = [0.0f32; 1];
+        cache.attend(&[0.0], 1.0, &mut scores, &mut acc, Some((1.0, 2, 1.0)));
+        assert!(
+            (scores[0] - scores[1]).abs() < 1e-6,
+            "bias not clamped: {scores:?}"
+        );
+        assert!(scores[2] > scores[1], "recent key should dominate: {scores:?}");
     }
 
     #[test]

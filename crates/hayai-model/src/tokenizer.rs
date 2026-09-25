@@ -205,8 +205,8 @@ impl Tokenizer {
             .and_then(|v| v.as_f32_array())
             .unwrap_or_default();
         let unigram = merges.is_empty()
-            && scores.len() == token_to_id.len()
-            && (model == "t5" || model == "umt5" || model == "t5encoder");
+            && !scores.is_empty()
+            && scores.len() == token_to_id.len();
 
         Ok(Self {
             tokens,
@@ -467,8 +467,19 @@ pub fn normalize_jinja_template(raw: &str) -> String {
             match self.token_to_id.get(&piece) {
                 Some(&id) => out.push(id),
                 None => {
-                    if let Some(id) = unk {
-                        out.push(id);
+                    // Byte fallback (`<0xNN>`), then `<unk>`.
+                    let mut pushed = false;
+                    for b in piece.as_bytes() {
+                        let tok = format!("<0x{b:02X}>");
+                        if let Some(&id) = self.token_to_id.get(&tok) {
+                            out.push(id);
+                            pushed = true;
+                        }
+                    }
+                    if !pushed {
+                        if let Some(id) = unk {
+                            out.push(id);
+                        }
                     }
                 }
             }

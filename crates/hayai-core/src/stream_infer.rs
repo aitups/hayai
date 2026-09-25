@@ -3659,6 +3659,11 @@ fn build_attn_config(
         config.rope_theta,
     );
     cfg.head_dim = head_dim;
+    // ALiBi bias clamp (`mpt.attention.max_alibi_bias`); 0 disables (BLOOM/Falcon).
+    cfg.alibi_max_bias = cat
+        .meta_f32(&format!("{}.attention.max_alibi_bias", config.architecture))
+        .or_else(|| cat.meta_f32("mpt.attention.max_alibi_bias"))
+        .unwrap_or(0.0);
     // Partial RoPE (Qwen3.5: rope.dimension_count=64 with head_dim=256).
     if let Some(rd) = cat
         .meta_u32(&format!("{}.rope.dimension_count", config.architecture))

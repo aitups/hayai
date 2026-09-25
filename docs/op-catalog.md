@@ -122,6 +122,7 @@ T5 is a separate architecture **class** (two stacks), handled by
   in `BoundedKvCache::attend`; absolute key positions from `attention_slot_positions`.
   Falcon is split by `falcon.tensor_data_layout`: the new multiquery architecture
   (`"jploski"`, falcon-7B/40B) uses **RoPE**, only the old arch (falcon-rw-1b) ALiBi.
+  MPT clamps the bias to `{arch}.attention.max_alibi_bias` (`alibi_max_bias`).
 - **RoPE scaling** (linear / YaRN / **LongRoPE**): `{arch}.rope.scaling.{type,factor,
   beta_*,original_context_length,attn_factor}` → `AttentionConfig.rope` /
   `apply_rope_partial_factors_scaled`. LongRoPE (Phi-3-128k) is detected by the
@@ -144,7 +145,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   identical), Qwen2.5-7B (attention biases, top-4 pos-0/1 identical),
   StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical), Falcon-7B (fused MQA
   QKV + shared-norm parallel residual, greedy identical), GLM-4/`chatglm` (fused QKV
-  + bias, fused `ffn_up` gate+up, partial RoPE, prefill top-k identical).
+  + bias, fused `ffn_up` gate+up, partial RoPE, prefill top-k identical), MPT-7B (ALiBi
+  + `max_alibi_bias` clamp + fused QKV, greedy identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 
