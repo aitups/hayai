@@ -118,9 +118,13 @@ T5 is a separate architecture **class** (two stacks), handled by
   `apply_rope_partial_factors_scaled`.
 - **`AttentionConfig::use_rope`**: `false` for learned-position (GPT-2) / ALiBi
   (BLOOM/Falcon/MPT) models, which must not rotate Q/K.
+- **Parallel residual + single shared norm** (Phi-2/GPT-J/PaLM): when block 0 has
+  `attn_norm` + `ffn_up` but no `ffn_norm` (`detect_parallel_residual`), the per-token
+  Dense path computes `x = x + attn(ln(x)) + ffn(ln(x))` from the same normed input.
 - Validated against `llama.cpp` at fixed positions (bit-identical top-k logits):
   GPT-2 (F16/Q4_K_M/Q2_K, no RoPE), tiny BLOOM (ALiBi), OLMoE (MoE + RoPE),
-  SmolLM2 (F16, GQA + RoPE, pos 0/1/2/5).
+  SmolLM2 (F16, GQA + RoPE, pos 0/1/2/5), Phi-2 (Q4_K_M, parallel residual + partial
+  RoPE, 20-token greedy identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 

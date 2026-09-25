@@ -113,6 +113,13 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   the non-absorbed Lite path (`attn_kv_b`, per-head `[k_nope|v]` decompression) and the
   absorbed path (`attn_k_b`/`attn_v_b`, split-3D `wk_b`/`wv_b` per head with a single MQA
   latent KV cache — `MlaMeta::absorbed` selects it; `view_of_head` slices each head).
+- **Parallel residual + single shared norm** (Phi-2/GPT-J/PaLM): detected when block 0
+  has `attn_norm` + `ffn_up` but no `ffn_norm` (`detect_parallel_residual`); then
+  `forward_inner` computes `x = x + attn(ln(x)) + ffn(ln(x))` (both from the same
+  normed input) and forces the `simple_dense` per-token path. Phi-2 also uses a fused
+  `attn_qkv` (already split) and **partial RoPE** (`rope.dimension_count=32` of 80).
+  Validated vs `llama-server` on `phi-2.Q4_K_M` (20-token greedy identical; top-4
+  pos-0 logits identical).
 - Fused 3D experts (`ffn_gate_up_exps`, per-expert rows `[gate|up]`) are split into
   `ExpertGate`/`ExpertUp` slices at plan time (`build_exec_plan`); only `is_expert_op`
   3-D tensors feed the fused path, so per-head MLA `attn_k_b`/`attn_v_b` are never

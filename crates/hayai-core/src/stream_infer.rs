@@ -386,6 +386,9 @@ pub struct StreamingGenerator {
     /// Classic-transformer Dense features (LayerNorm / learned positions / input
     /// LayerNorm): prefill falls back to the per-token Dense path.
     pub(crate) simple_dense: bool,
+    /// Parallel residual + single shared norm (Phi-2/GPT-J/PaLM): `x = x + attn(ln(x))
+    /// + ffn(ln(x))` — the block has `attn_norm` but no `ffn_norm`.
+    pub(crate) parallel_residual: bool,
     /// ALiBi slopes (one per query head) for BLOOM/Falcon/MPT; `None` otherwise.
     pub(crate) alibi_slopes: Option<Vec<f32>>,
     pub(crate) has_output_weight: bool,
@@ -742,7 +745,14 @@ impl StreamingGenerator {
             })
             .collect();
         let has_output_weight = catalog.tensor("output.weight").is_ok();
-        let simple_dense = use_layernorm || learned_pos.is_some() || token_embed_norm.is_some();
+        // Parallel residual (Phi-2/GPT-J/PaLM): one shared `attn_norm` per block with
+        // no `ffn_norm`; both sublayers read the same normed input and add to the
+        // residual together.
+        let parallel_residual = detect_parallel_residual(&catalog);
+        let simple_dense = use_layernorm
+            || learned_pos.is_some()
+            || token_embed_norm.is_some()
+            || parallel_residual;
         // ALiBi (BLOOM/Falcon/MPT): score bias from absolute q/k positions.
         let alibi_slopes = if matches!(
             arch.as_str(),
@@ -943,6 +953,7 @@ impl StreamingGenerator {
             ffn_bias,
             use_layernorm,
             simple_dense,
+            parallel_residual,
             alibi_slopes,
             has_output_weight,
             sampler,
@@ -1581,7 +1592,7 @@ impl StreamingGenerator {
             if let Some(b) = self.attn_bias.get(layer_idx) {
                 add_bias(&mut self.scratch_proj, &b.o);
             }
-            {
+            if !self.parallel_residual {
                 let x = &mut self.act_pp[sel];
                 for i in 0..h {
                     x[i] += self.scratch_proj[i];
@@ -1612,14 +1623,16 @@ impl StreamingGenerator {
             }
 
             // --- FFN: unmap after Attn, then enqueue async ---
-            self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
-            apply_norm(
-                &mut self.scratch_xn,
-                &self.layer_norms[layer_idx].ffn_norm,
-                &self.layer_norms[layer_idx].ffn_norm_bias,
-                eps,
-                self.use_layernorm,
-            );
+            if !self.parallel_residual {
+                self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
+                apply_norm(
+                    &mut self.scratch_xn,
+                    &self.layer_norms[layer_idx].ffn_norm,
+                    &self.layer_norms[layer_idx].ffn_norm_bias,
+                    eps,
+                    self.use_layernorm,
+                );
+            }
 
             self.ws_gate.fill(0.0);
             self.ws_up.fill(0.0);
@@ -1714,8 +1727,15 @@ impl StreamingGenerator {
 
             {
                 let sel = self.act_sel;
-                for i in 0..h {
-                    self.act_pp[sel][i] += self.ws_down[i];
+                if self.parallel_residual {
+                    // `x = x + attn(ln(x)) + ffn(ln(x))` (both from the shared norm).
+                    for i in 0..h {
+                        self.act_pp[sel][i] += self.scratch_proj[i] + self.ws_down[i];
+                    }
+                } else {
+                    for i in 0..h {
+                        self.act_pp[sel][i] += self.ws_down[i];
+                    }
                 }
             }
             if let Some((pack, lay)) = next_staged {
@@ -3607,6 +3627,15 @@ fn build_attn_config(
     Ok(cfg)
 }
 
+/// Detect the parallel-residual + single shared norm layout (Phi-2/GPT-J/PaLM):
+/// block 0 has `attn_norm` and `ffn_up` but no `ffn_norm`, so both sublayers read
+/// the same normed activation and add to the residual together.
+pub(crate) fn detect_parallel_residual(cat: &GgufCatalog) -> bool {
+    cat.tensor("blk.0.ffn_norm.weight").is_err()
+        && cat.tensor("blk.0.attn_norm.weight").is_ok()
+        && cat.tensor("blk.0.ffn_up.weight").is_ok()
+}
+
 pub fn load_config(cat: &GgufCatalog) -> Result<ModelConfig, GgufError> {
     let arch = cat.meta_str("general.architecture").unwrap_or("llama");
     let prefix = if arch == "llama" || arch == "qwen2" || arch.contains("smollm") {
@@ -3826,6 +3855,44 @@ mod tests {
             ),
             ModelKind::Gemma
         );
+    }
+
+    /// Parallel-residual detection: block 0 with `attn_norm` + `ffn_up` but no
+    /// `ffn_norm` is the Phi-2/GPT-J single-norm layout; a separate `ffn_norm` is
+    /// the sequential layout.
+    #[test]
+    fn detect_parallel_residual_layout() {
+        let phi = temp_dir().join("hayai_parallel_residual.gguf");
+        let t: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("blk.0.attn_norm.weight", vec![8], vec![1.0; 8]),
+            ("blk.0.ffn_up.weight", vec![8, 16], vec![1.0; 128]),
+            ("blk.0.ffn_down.weight", vec![16, 8], vec![1.0; 128]),
+        ];
+        write_minimal_gguf(
+            &phi,
+            &[("general.architecture", MetadataValue::String("phi2".into()))],
+            &t,
+        )
+        .unwrap();
+        let cat = GgufCatalog::open(&phi).unwrap();
+        assert!(detect_parallel_residual(&cat));
+        let _ = std::fs::remove_file(&phi);
+
+        let seq = temp_dir().join("hayai_sequential_residual.gguf");
+        let t2: Vec<(&str, Vec<u64>, Vec<f32>)> = vec![
+            ("blk.0.attn_norm.weight", vec![8], vec![1.0; 8]),
+            ("blk.0.ffn_norm.weight", vec![8], vec![1.0; 8]),
+            ("blk.0.ffn_up.weight", vec![8, 16], vec![1.0; 128]),
+        ];
+        write_minimal_gguf(
+            &seq,
+            &[("general.architecture", MetadataValue::String("llama".into()))],
+            &t2,
+        )
+        .unwrap();
+        let cat2 = GgufCatalog::open(&seq).unwrap();
+        assert!(!detect_parallel_residual(&cat2));
+        let _ = std::fs::remove_file(&seq);
     }
 
     #[test]
