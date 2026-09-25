@@ -102,6 +102,15 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   only** and no `other` bucket: a real op that is not executed fails loudly
   (`gate_up`/`gateup` fused FFN, `wpe`/`position_embd` learned positions), and a compute
   `.proj.weight` is no longer swallowed by `Aux`.
+- **RoPE is opt-in per model**: `AttentionConfig::use_rope` is `false` for models
+  whose positions come from learned embeddings (GPT-2) or ALiBi (BLOOM/Falcon/MPT);
+  applying RoPE to them corrupts attention. Validation against a local `llama.cpp`
+  (`llama-server`) is done at **fixed positions** (compare top-k logits, not greedy
+  text) — llama.cpp quantizes GEMV activations (Q8_K) and its `/completion` adds a
+  sampler chain, so text diverges even when the forward matches. MLA
+  (DeepSeek-V2/V3, non-absorbed `attn_kv_b` Lite path) is implemented in
+  `moe_infer::mla_attention` and matches `llama-context.cpp`'s YaRN
+  `attn_factor`/`kq_scale`; the full/absorbed split-3D `wk_b`/`wv_b` path is pending.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
   `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a

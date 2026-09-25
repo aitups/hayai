@@ -62,7 +62,7 @@ Rules:
 
 | Tensor | Reason |
 |---|---|
-| MLA (full/absorbed `wk_b`/`wv_b`) | Non-absorbed DeepSeek-V2-Lite forward is implemented; the absorbed `is_mla` path (split 3D `wk_b`/`wv_b`) is pending |
+| MLA full/absorbed (`is_mla` split 3D `wk_b`/`wv_b`) | Not implemented (non-absorbed `attn_kv_b` Lite path is) |
 | `relative_attention_bias` / `cross_attn` / `.encoder.` / `.decoder.` | T5/BART are encoder-decoder — a separate architecture class, not yet implemented |
 | `ffn_gate_up_exps` (fused experts) | Fused per-expert gate+up; needs a 3D row split |
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
@@ -85,8 +85,22 @@ Rules:
 - **RoPE scaling** (linear / YaRN): `{arch}.rope.scaling.{type,factor,beta_*,
   original_context_length,attn_factor}` → `AttentionConfig.rope` /
   `apply_rope_partial_factors_scaled`.
-- Validated: `gpt2-small-danish` → "København er hovedstaden i **Danmark**";
-  tiny-random BLOOM reproduces llama.cpp's greedy output exactly (`orldorld…`).
+- **`AttentionConfig::use_rope`**: `false` for learned-position (GPT-2) / ALiBi
+  (BLOOM/Falcon/MPT) models, which must not rotate Q/K.
+- Validated against `llama.cpp` at fixed positions (bit-identical top-k logits):
+  GPT-2 (F16/Q4_K_M/Q2_K, no RoPE), tiny BLOOM (ALiBi), OLMoE (MoE + RoPE),
+  SmolLM2 (F16, GQA + RoPE, pos 0/1/2/5).
+
+## MLA (DeepSeek-V2/V3, Kimi)
+
+`mla_attention` (`crates/hayai-core/src/moe_infer.rs`) implements the non-absorbed
+`deepseek2` path (Lite + legacy fused `attn_kv_b`): `attn_q` (lite) or `q_a`→`q_b`,
+`attn_kv_a_mqa` → latent `c_kv`(+`k_pe`), `attn_kv_a_norm`, fused `attn_kv_b` →
+per-head `[k_nope | v]`, YaRN RoPE on the trailing `qk_rope` dims (offset
+`qk_nope`), MQA-style compressed cache. Validated: `attn_factor`/`kq_scale` match
+`llama-context.cpp`/`deepseek2.cpp`; a clean-room reference reproduces `q_pe`/`attn`
+bit-for-bit; DeepSeek-V2-Lite logits at position 0 (after BOS) are identical to
+`llama.cpp`.
 
 ## MoE routing (modern)
 
