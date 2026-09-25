@@ -127,7 +127,9 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   (`gated-gelu`; not stored in the GGUF, assumed). The T5 tokenizer is SentencePiece
   **unigram** — `Tokenizer::unigram_encode` runs Viterbi over `tokenizer.ggml.scores`
   when `tokenizer.ggml.model` is `t5`/`umt5`. Validated vs HF `fln-t5-small`
-  (ids + top-5 logits); tests auto-skip without the model.
+  (ids + top-5 logits); tests auto-skip without the model. The CLI `generate` and
+  `hayai-server` auto-detect enc-dec models (`is_encoder_decoder`) and use this path
+  (`T5Session`); the decoder-only `StreamingGenerator` rejects them explicitly.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
   `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a

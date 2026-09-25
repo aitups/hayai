@@ -20,6 +20,8 @@ pub struct ModelHandle {
     pub sinks: usize,
     pub window: usize,
     pub memory_strategy: MemoryStrategy,
+    /// Encoder-decoder (T5/BART): routes generation through `encoder_decoder_infer`.
+    pub encoder_decoder: bool,
 }
 
 /// Server-wide registry (models discovered at startup; handles built lazily).
@@ -108,6 +110,7 @@ impl ModelRegistry {
 
     fn load_handle(&self, id: &str, path: PathBuf) -> Result<ModelHandle, ApiError> {
         let cat = GgufCatalog::open(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+        let encoder_decoder = hayai_core::encoder_decoder_infer::is_encoder_decoder(&cat);
         let tokenizer = Arc::new(Tokenizer::from_catalog(&cat).map_err(|e| ApiError::internal(e.to_string()))?);
         let config = hayai_core::load_config(&cat).map_err(|e| ApiError::internal(e.to_string()))?;
         drop(cat);
@@ -122,6 +125,7 @@ impl ModelRegistry {
             sinks: self.sinks,
             window: self.window,
             memory_strategy: self.memory_strategy,
+            encoder_decoder,
         })
     }
 }

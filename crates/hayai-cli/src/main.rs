@@ -1101,13 +1101,7 @@ fn cmd_generate(
 
     // Encoder-decoder (T5/BART): dedicated text-to-text streaming path.
     if let Ok(peek) = hayai_model::GgufCatalog::open(&model) {
-        let is_ede = peek
-            .meta_str("general.architecture")
-            .map(|a| a == "t5" || a == "t5encoder" || a == "umt5" || a == "bart")
-            .unwrap_or(false)
-            || peek.tensor("enc.blk.0.attn_q.weight").is_ok()
-            || peek.tensor("encoder.blk.0.attn_q.weight").is_ok();
-        if is_ede {
+        if hayai_core::encoder_decoder_infer::is_encoder_decoder(&peek) {
             drop(peek);
             return cmd_generate_t5(&model, &prompt, max_tokens);
         }

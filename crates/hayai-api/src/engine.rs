@@ -5,6 +5,48 @@ use crate::registry::ModelHandle;
 use hayai_core::GenerationSession;
 use std::sync::Arc;
 
+/// Decode the accumulated ids byte-exactly, emit the new text delta, and detect
+/// stop sequences. Returns `true` when a stop sequence matched.
+fn emit_decoded(
+    tokenizer: &hayai_model::Tokenizer,
+    ids: &[u32],
+    decoded: &mut String,
+    stop: &[String],
+    on_delta: &mut impl FnMut(&str) -> Result<(), ApiError>,
+) -> Result<bool, ApiError> {
+    // Byte-exact decode: emit only the complete UTF-8 prefix so a multi-byte
+    // character split across tokens is held back instead of being rendered as
+    // U+FFFD and later contradicted.
+    let raw = tokenizer.decode_bytes(ids);
+    let valid = match std::str::from_utf8(&raw) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or(""),
+    };
+    if valid.len() < decoded.len() {
+        // Defensive: never slice below the already-emitted prefix.
+        decoded.truncate(valid.len());
+    }
+    // Stop-sequence check before emitting the delta (avoids emitting the stop).
+    if let Some((_stop_str, stop_at)) = stop
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| valid.find(s.as_str()).map(|i| (s.clone(), i)))
+        .min_by_key(|(_, i)| *i)
+    {
+        if stop_at > decoded.len() {
+            on_delta(&valid[decoded.len()..stop_at])?;
+            decoded.push_str(&valid[decoded.len()..stop_at]);
+        }
+        return Ok(true);
+    }
+    if valid.len() > decoded.len() {
+        let delta = &valid[decoded.len()..];
+        on_delta(delta)?;
+        decoded.push_str(delta);
+    }
+    Ok(false)
+}
+
 /// Run one completion: prefill `prompt`, decode up to `max_tokens`, and push
 /// each text delta through `on_delta` (streaming or no-op). Applies `stop`
 /// sequences and trims the output at the first match.
@@ -16,8 +58,11 @@ pub fn generate_text(
     max_tokens: usize,
     params: SamplingParams,
     stop: &[String],
-    mut on_delta: impl FnMut(&str) -> Result<(), ApiError>,
+    on_delta: impl FnMut(&str) -> Result<(), ApiError>,
 ) -> Result<(String, String, usize, usize), ApiError> {
+    if handle.encoder_decoder {
+        return generate_text_t5(handle, prompt, max_tokens, params, stop, on_delta);
+    }
     let sampler = params.sampler();
     let mut session = GenerationSession::start(
         &handle.path,
@@ -40,6 +85,7 @@ pub fn generate_text(
 
     let mut decoded: String = String::new();
     let mut finish = "length";
+    let mut on_delta = on_delta;
 
     for _ in 0..max_tokens.max(1) {
         match session.next_token() {
@@ -50,47 +96,62 @@ pub fn generate_text(
             }
             Err(e) => return Err(ApiError::internal(e.to_string())),
         }
-        // Byte-exact decode: emit only the complete UTF-8 prefix so a multi-byte
-        // character split across tokens is held back instead of being rendered as
-        // U+FFFD and later contradicted.
-        let raw = handle.tokenizer.decode_bytes(session.generated_ids());
-        let valid = match std::str::from_utf8(&raw) {
-            Ok(s) => s,
-            Err(e) => std::str::from_utf8(&raw[..e.valid_up_to()]).unwrap_or(""),
-        };
-        debug_assert!(
-            valid.starts_with(decoded.as_str()),
-            "decoded text must be a prefix of the next valid decode"
-        );
-        if valid.len() < decoded.len() {
-            // Defensive: never slice below the already-emitted prefix.
-            decoded.truncate(valid.len());
-        }
-        // Stop-sequence check before emitting the delta (avoids emitting the stop).
-        if let Some((_stop_str, stop_at)) = stop
-            .iter()
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| valid.find(s.as_str()).map(|i| (s.clone(), i)))
-            .min_by_key(|(_, i)| *i)
-        {
-            // `stop_at` may precede `decoded` when the match spans already-emitted
-            // text; only emit the part that is both after `decoded` and before the
-            // stop (this previously panicked on `before_stop[decoded.len()..]`).
-            if stop_at > decoded.len() {
-                on_delta(&valid[decoded.len()..stop_at])?;
-                decoded.push_str(&valid[decoded.len()..stop_at]);
-            }
+        if emit_decoded(
+            &handle.tokenizer,
+            session.generated_ids(),
+            &mut decoded,
+            stop,
+            &mut on_delta,
+        )? {
             finish = "stop";
             session.mark_finished();
             break;
         }
-        if valid.len() > decoded.len() {
-            let delta = &valid[decoded.len()..];
-            on_delta(delta)?;
-            decoded.push_str(delta);
-        }
     }
 
+    let completion_tokens = session.completion_tokens();
+    Ok((decoded, finish.to_string(), prompt_tokens, completion_tokens))
+}
+
+/// Encoder-decoder (T5/BART) completion via the token-by-token [`T5Session`].
+fn generate_text_t5(
+    handle: Arc<ModelHandle>,
+    prompt: &str,
+    max_tokens: usize,
+    params: SamplingParams,
+    stop: &[String],
+    mut on_delta: impl FnMut(&str) -> Result<(), ApiError>,
+) -> Result<(String, String, usize, usize), ApiError> {
+    use hayai_core::encoder_decoder_infer::T5Session;
+    let mut session = T5Session::start(&handle.path, params.sampler(), params.seed)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    session.set_penalties(params.penalties);
+    let prompt_tokens = session
+        .prefill(prompt)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut decoded = String::new();
+    let mut finish = "length";
+    for _ in 0..max_tokens.max(1) {
+        match session.next_token() {
+            Ok(Some(_tok)) => {}
+            Ok(None) => {
+                finish = "stop";
+                break;
+            }
+            Err(e) => return Err(ApiError::internal(e.to_string())),
+        }
+        if emit_decoded(
+            &handle.tokenizer,
+            session.generated_ids(),
+            &mut decoded,
+            stop,
+            &mut on_delta,
+        )? {
+            finish = "stop";
+            session.mark_finished();
+            break;
+        }
+    }
     let completion_tokens = session.completion_tokens();
     Ok((decoded, finish.to_string(), prompt_tokens, completion_tokens))
 }

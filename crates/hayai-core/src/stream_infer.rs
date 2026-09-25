@@ -626,6 +626,15 @@ impl StreamingGenerator {
     ) -> Result<Self, StreamInferError> {
         let path = path.as_ref().to_path_buf();
         let mut catalog = GgufCatalog::open(&path)?;
+        // Encoder-decoder (T5/BART) is a distinct architecture class handled by
+        // `encoder_decoder_infer`; the decoder-only paths would misread `enc.blk`/`dec.blk`.
+        if crate::encoder_decoder_infer::is_encoder_decoder(&catalog) {
+            return Err(StreamInferError::Msg(
+                "encoder-decoder model (T5/BART): use the encoder-decoder path \
+                 (`hayai_core::encoder_decoder_infer`), not the decoder-only streaming generator"
+                    .into(),
+            ));
+        }
         let config = load_config(&catalog)?;
         let mut attn_cfg = build_attn_config(&catalog, &config)?;
 

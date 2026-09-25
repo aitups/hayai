@@ -48,6 +48,16 @@ impl From<GgufError> for EdeError {
 
 pub type Result<T> = std::result::Result<T, EdeError>;
 
+/// True when the GGUF is an encoder-decoder model (T5/BART), which must use this
+/// module rather than the decoder-only streaming path.
+pub fn is_encoder_decoder(cat: &GgufCatalog) -> bool {
+    matches!(
+        cat.meta_str("general.architecture"),
+        Some("t5") | Some("t5encoder") | Some("umt5") | Some("bart")
+    ) || cat.tensor("enc.blk.0.attn_q.weight").is_ok()
+        || cat.tensor("encoder.blk.0.attn_q.weight").is_ok()
+}
+
 /// T5 model geometry resolved from GGUF metadata / tensor shapes.
 #[derive(Debug, Clone)]
 pub struct T5Config {
@@ -625,6 +635,137 @@ pub fn generate(
     let mut ids = tokenizer.encode(&text, false);
     ids.push(model.cfg.eos_id);
     model.generate_ids(&ids, max_new_tokens)
+}
+
+/// Token-by-token T5 session for the OpenAI-like server (mirrors
+/// [`crate::session::GenerationSession`]'s drive loop).
+pub struct T5Session {
+    model: T5Model,
+    tokenizer: Tokenizer,
+    sampler: hayai_model::SamplerConfig,
+    penalties: hayai_model::Penalties,
+    rng: u64,
+    enc_len: usize,
+    cross: Vec<(Vec<f32>, Vec<f32>)>,
+    self_kv: Vec<(Vec<f32>, Vec<f32>)>,
+    logits: Vec<f32>,
+    cur_pos: usize,
+    prompt_tokens: usize,
+    generated_ids: Vec<u32>,
+    finished: bool,
+}
+
+impl T5Session {
+    pub fn start(
+        path: impl AsRef<Path>,
+        sampler: hayai_model::SamplerConfig,
+        seed: u64,
+    ) -> Result<Self> {
+        let model = T5Model::open(path.as_ref())?;
+        let cat = GgufCatalog::open(path.as_ref())?;
+        let tokenizer = Tokenizer::from_catalog(&cat)?;
+        let dec_layers = model.cfg.dec_layers;
+        Ok(Self {
+            model,
+            tokenizer,
+            sampler,
+            penalties: hayai_model::Penalties::default(),
+            rng: seed,
+            enc_len: 0,
+            cross: Vec::new(),
+            self_kv: vec![(Vec::new(), Vec::new()); dec_layers],
+            logits: Vec::new(),
+            cur_pos: 0,
+            prompt_tokens: 0,
+            generated_ids: Vec::new(),
+            finished: false,
+        })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn set_penalties(&mut self, penalties: hayai_model::Penalties) {
+        self.penalties = penalties;
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+
+    pub fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens
+    }
+
+    pub fn completion_tokens(&self) -> usize {
+        self.generated_ids.len()
+    }
+
+    pub fn generated_ids(&self) -> &[u32] {
+        &self.generated_ids
+    }
+
+    pub fn model_name(&self) -> &str {
+        self.model.cat.meta_str("general.name").unwrap_or("t5")
+    }
+
+    /// Encode + run the encoder + prime cross-attention and the first decoder step.
+    pub fn prefill(&mut self, prompt: &str) -> Result<usize> {
+        if self.finished {
+            return Ok(0);
+        }
+        let text = format!(" {prompt}");
+        let mut ids = self.tokenizer.encode(&text, false);
+        ids.push(self.model.cfg.eos_id);
+        let enc = self.model.encode(&ids)?;
+        self.enc_len = ids.len();
+        self.cross = self.model.prepare_cross(&enc, self.enc_len)?;
+        self.self_kv = vec![(Vec::new(), Vec::new()); self.model.cfg.dec_layers];
+        self.cur_pos = 0;
+        self.logits = self.model.decode_step(
+            self.model.cfg.decoder_start,
+            self.cur_pos,
+            &self.cross,
+            &mut self.self_kv,
+            self.enc_len,
+        )?;
+        self.cur_pos += 1;
+        self.prompt_tokens = ids.len();
+        Ok(ids.len())
+    }
+
+    /// Sample the next token and advance the decoder one step.
+    pub fn next_token(&mut self) -> Result<Option<u32>> {
+        if self.finished {
+            return Ok(None);
+        }
+        let next = hayai_model::sample_with(
+            &self.logits,
+            self.sampler,
+            &mut self.rng,
+            &self.penalties,
+            &self.generated_ids,
+        );
+        if self.tokenizer.is_stop(next) {
+            self.finished = true;
+            return Ok(None);
+        }
+        self.generated_ids.push(next);
+        self.logits = self.model.decode_step(
+            next,
+            self.cur_pos,
+            &self.cross,
+            &mut self.self_kv,
+            self.enc_len,
+        )?;
+        self.cur_pos += 1;
+        Ok(Some(next))
+    }
 }
 
 #[cfg(test)]

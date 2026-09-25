@@ -269,7 +269,10 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 | Gemma 4 | 12B (`post_ffw_norm`, `layer_output_scale`, per-head Q/K norms) and E4B (shared-KV, SWA/global, PLE, GELU softcap) |
 | HRM-Text | recurrent H/L stacks (`hrm_text`) |
 | Qwen 3.5 | hybrid DeltaNet (SSM/linear attention) + full attention + MTP `nextn` draft head |
-| MoE | router (`ffn_gate_inp`) + per-expert (`ffn_exp.E.*`) and fused-3D (`ffn_*_exps.*`) experts; **sparse streaming**: only the top-k experts are read per token (~`top_k/n_expert` of the FFN disk bandwidth). Validated on OLMoE-1B-7B (64 experts / 8 active) |
+| MoE | router (`ffn_gate_inp`) + per-expert (`ffn_exp.E.*`) and fused-3D (`ffn_*_exps.*`, incl. fused `ffn_gate_up_exps`) experts; **sparse streaming**: only the top-k experts are read per token (~`top_k/n_expert` of the FFN disk bandwidth). Validated on OLMoE-1B-7B (64 experts / 8 active) |
+| MLA | DeepSeek-V2/V3, Kimi: non-absorbed (`attn_kv_b`) and absorbed (`attn_k_b`/`attn_v_b`) paths, YaRN `attn_factor`/`kq_scale` matching `llama.cpp`. Validated on DeepSeek-V2-Lite (position-0 logits) |
+| Classic transformer | GPT-2 (learned absolute positions, LayerNorm, erf-GELU), BLOOM/Falcon/MPT (ALiBi), ungated FFN; RoPE is opt-in per model. Validated on GPT-2/BLOOM |
+| Encoder-decoder | T5/FLAN-T5 (`t5`): bidirectional encoder + causal decoder with **cross-attention** and learned **relative position bias** (no RoPE/absolute positions, no `1/√d`), gated `gelu_new` FFN, SentencePiece **unigram** tokenizer. Validated vs HF `flan-t5-small` (CLI + server) |
 
 **Quantization formats:** F32/F16, Q4_0/Q4_1, Q5_0/Q5_1, Q8_0, the K-family (Q2_K–Q6_K), and IQ2/IQ3/IQ4 (BF16 has CPU GEMV only). **Q8_K/Q8_1** are recognized but size-only; **IQ1/TQ** raise a hard unsupported-type error.
 
