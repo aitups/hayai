@@ -68,6 +68,7 @@ Rules:
 | Tensor | Reason |
 |---|---|
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
+| `cohere2` per-layer SWA + NoPE | Command-R7B: `load_swa_pattern(4)` — SWA layers use RoPE + a 4096 sliding window, global layers use **NoPE** (no RoPE) + full attention, plus a multiplicative `logit_scale`. Parallel residual is already handled. |
 | anything unrecognized | Register a `LayerOpKind` + classifier arm + `op_binding` (see `docs/adding-a-model-family.md`) |
 
 ## Encoder-decoder (T5 / BART) — `encoder_decoder_infer`
@@ -148,7 +149,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical), Falcon-7B (fused MQA
   QKV + shared-norm parallel residual, greedy identical), GLM-4/`chatglm` (fused QKV
   + bias, fused `ffn_up` gate+up, partial RoPE, prefill top-k identical), MPT-7B (ALiBi
-  + `max_alibi_bias` clamp + fused QKV, greedy identical).
+  + `max_alibi_bias` clamp + fused QKV, greedy identical), MiniCPM5-2B (`llama` arch,
+  top-1 identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 

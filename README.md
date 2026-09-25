@@ -265,7 +265,7 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 
 | Family | Architecture / notes |
 | --- | --- |
-| Llama-family | e.g. SmolLM2 (default smoke model) and **Llama-3.x** (`llama-bpe` pre-tokenizer with default BOS; the converter bakes the Llama-3 NTK-by-parts scaling into `rope_freqs.weight`, applied as per-dim `freq_factors`). Validated Llama-3.2-1B-Q8_0 (top-1 logits + first token identical to `llama.cpp`) |
+| Llama-family | e.g. SmolLM2 (default smoke model), **Llama-3.x** (`llama-bpe` pre-tokenizer with default BOS; the converter bakes the Llama-3 NTK-by-parts scaling into `rope_freqs.weight`, applied as per-dim `freq_factors`) and **MiniCPM5-2B** (`minicpm5` pre). Validated Llama-3.2-1B-Q8_0 and MiniCPM5-2B-Q4_K_M (top-1 logits identical to `llama.cpp`) |
 | Gemma 4 | 12B (`post_ffw_norm`, `layer_output_scale`, per-head Q/K norms) and E4B (shared-KV, SWA/global, PLE, GELU softcap) |
 | HRM-Text | recurrent H/L stacks (`hrm_text`) |
 | Qwen 3.5 | hybrid DeltaNet (SSM/linear attention) + full attention + MTP `nextn` draft head |
