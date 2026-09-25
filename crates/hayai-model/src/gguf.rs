@@ -3,6 +3,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 use tracing::info;
 
 const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
@@ -12,7 +13,7 @@ const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" LE
 pub struct GgufHeader {
     pub version: u32,
     pub alignment: u64,
-    pub metadata: HashMap<String, MetadataValue>,
+    pub metadata: Arc<HashMap<String, MetadataValue>>,
     pub tensors: Vec<TensorInfo>,
     pub tensor_index: HashMap<String, usize>,
     pub data_offset: u64,
@@ -116,7 +117,7 @@ pub fn parse_header_bytes(data: &[u8]) -> Result<GgufHeader, GgufError> {
     Ok(GgufHeader {
         version,
         alignment,
-        metadata,
+        metadata: Arc::new(metadata),
         tensors,
         tensor_index,
         data_offset,
@@ -127,7 +128,7 @@ pub fn parse_header_bytes(data: &[u8]) -> Result<GgufHeader, GgufError> {
 pub struct GgufFile {
     pub version: u32,
     pub alignment: u64,
-    pub metadata: HashMap<String, MetadataValue>,
+    pub metadata: Arc<HashMap<String, MetadataValue>>,
     pub tensors: Vec<TensorInfo>,
     pub tensor_index: HashMap<String, usize>,
     /// Absolute file offset where tensor_data begins.

@@ -41,9 +41,13 @@ SmolLM2-135M-Instruct-Q4_K_M (100.6 MiB).
 | Objetivo @75 % | ~40.7 tok/s |
 | Objetivo @80 % | ~43.4 tok/s |
 
-> Nota: el decode actual en `minimal` está muy por debajo (≈1.6 tok/s) y en
-> residente ≈5–6 tok/s; la brecha con el objetivo es el trabajo de Fase 1
-> (planner de reparto, prefetch de expertos, prefill batcheado, solape I/O).
+> Nota: el decode en `minimal` (streaming) ronda hoy **≈10–12 tok/s** y en residente
+> **≈16 tok/s** en SmolLM2-135M-Q4_K_M. El gran salto reciente fue eliminar el
+> `fork_reader` por capa del prefetch: clonaba el vocabulario completo del tokenizer
+> (`metadata`) en cada capa; ahora `metadata` es `Arc`, con lo que el fork baja de
+> ≈5 ms a ≈0.2 ms por capa (**≈3.4×** más tok/s en streaming). La brecha restante con el
+> objetivo (≈40 tok/s @75 %) es de cómputo (GEMV de la FFN en CPU) + I/O: el trabajo
+> pendiente es descargar la FFN a la GPU y solapar mejor, no ya el coste del fork.
 
 ## Añadir un equipo
 

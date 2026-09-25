@@ -11,6 +11,7 @@ use crate::sparse_dag::{TENSOR_ADJACENCY, TENSOR_WEIGHTS};
 use hayai_io::{open_weight_io, IoBackend, IoRange, WeightIo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::info;
 
 /// On-disk GGUF with explicit reads (no mmap of weight payloads).
@@ -19,7 +20,8 @@ pub struct GgufCatalog {
     io: Box<dyn WeightIo>,
     pub version: u32,
     pub alignment: u64,
-    pub metadata: HashMap<String, MetadataValue>,
+    /// Shared (cheap-to-clone) so prefetch `fork_reader` doesn't copy the tokenizer vocab.
+    pub metadata: Arc<HashMap<String, MetadataValue>>,
     pub tensors: Vec<TensorInfo>,
     pub tensor_index: HashMap<String, usize>,
     pub data_offset: u64,
