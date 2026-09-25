@@ -136,7 +136,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   SmolLM2 (F16, GQA + RoPE, pos 0/1/2/5), Phi-2 (Q4_K_M, parallel residual + partial
   RoPE, 20-token greedy identical), Phi-3-mini (fused `ffn_up` gate+up, greedy
   identical), Granite-4.0-1b (architecture scalars + array `head_count_kv`, greedy
-  identical), Qwen2.5-7B (attention biases, top-4 pos-0/1 identical).
+  identical), Qwen2.5-7B (attention biases, top-4 pos-0/1 identical),
+  StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 

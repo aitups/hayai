@@ -750,9 +750,10 @@ impl StreamingGenerator {
             })
             .collect();
         let has_output_weight = catalog.tensor("output.weight").is_ok();
-        // Parallel residual (Phi-2/GPT-J/PaLM): one shared `attn_norm` per block with
-        // no `ffn_norm`; both sublayers read the same normed input and add to the
-        // residual together.
+        // Parallel residual: two sublayers read the residual *before* either is added.
+        // Detected from the tensor layout (one shared norm, no `ffn_norm`), not from
+        // `{arch}.use_parallel_residual` — that metadata is unreliable (e.g. the
+        // StableLM-2 GGUF sets it true while the HF config is sequential).
         let parallel_residual = detect_parallel_residual(&catalog);
         // Architecture scalars (Granite): embedding / residual / logit multipliers.
         let meta_scale = |keys: &[&str]| -> f32 {
@@ -1672,6 +1673,7 @@ impl StreamingGenerator {
             }
 
             // --- FFN: unmap after Attn, then enqueue async ---
+            // Parallel residual (Phi-2/GPT-J): the FFN reuses the attention-normed input.
             if !self.parallel_residual {
                 self.scratch_xn.copy_from_slice(&self.act_pp[sel]);
                 apply_norm(
