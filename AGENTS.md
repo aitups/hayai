@@ -117,6 +117,17 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   `ExpertGate`/`ExpertUp` slices at plan time (`build_exec_plan`); only `is_expert_op`
   3-D tensors feed the fused path, so per-head MLA `attn_k_b`/`attn_v_b` are never
   mistaken for experts.
+- Encoder-decoder (T5/BART) is a distinct architecture **class**, run by
+  `hayai-core/src/encoder_decoder_infer.rs` (`T5Model`), not the decoder-only
+  `StreamingGenerator`. `enc.blk.N.*` and `dec.blk.N.*` become separate plan units
+  (`dec` offset by `DEC_BLOCK_OFFSET`). T5 has **no RoPE / no absolute positions /
+  no `1/√d` scaling**: attention adds a learned relative position bias (`attn_rel_b`,
+  HF `_relative_position_bucket`, bidirectional for encoder+cross, causal for decoder
+  self-attn); cross-attention has no bias; norms are T5 RMS; FFN is gated `gelu_new`
+  (`gated-gelu`; not stored in the GGUF, assumed). The T5 tokenizer is SentencePiece
+  **unigram** — `Tokenizer::unigram_encode` runs Viterbi over `tokenizer.ggml.scores`
+  when `tokenizer.ggml.model` is `t5`/`umt5`. Validated vs HF `fln-t5-small`
+  (ids + top-5 logits); tests auto-skip without the model.
 - Fused `attn_qkv.weight` is split by output rows (concat `[q|k|v]`) into q/k/v at pack
   load (see `load_layer_pack_into_fused`); a head-interleaved layout is opt-in via the
   `hayai.attn_qkv_interleave_repeats` GGUF metadata. Generic `Conv` tensors execute as a

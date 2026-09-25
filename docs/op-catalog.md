@@ -52,6 +52,10 @@ Rules:
 | `NextN` | `.nextn.`, `nextn_`, `.mtp.`, `mtp_` | CPU_GEMV | mtp/spec_decode |
 | `PleEmbed`/`PleModelProj`/`PleProjNorm`/`PleGate`/`PleProj`/`PlePostNorm` | `per_layer_*`, `blk.N.{inp_gate,proj,post_norm}` (when `embedding_length_per_layer_input > 0`) | mixed | gemma4 PLE |
 | `Recurrence` | `h_cycle`, `l_cycle`, `recurrent`, `z_h`, `z_l`, `h_layers`, `l_layers` | CPU_GEMV | HRM |
+| `CrossAttnQ/K/V/O` | `dec.blk.N.cross_attn_{q,k,v,o}` (T5/BART) | CPU_GEMV | `encoder_decoder_infer` |
+| `CrossAttnNorm` | `dec.blk.N.cross_attn_norm` | DISCARD (preloaded) | encoder-decoder |
+| `EncOutputNorm`/`DecOutputNorm` | `enc.output_norm` / `dec.output_norm` | DISCARD (preloaded) | encoder-decoder |
+| `RelPosBias` | `attn_rel_b` / `relative_attention_bias` (T5) | DISCARD (preloaded) | relative position bias |
 | `Conv` | `conv*` (depthwise causal, activation from `hayai.conv_activation`) | CPU_GEMV | dense residual |
 | `FfnDagAdjacency`/`FfnDagWeights` | `ffn_dag_adjacency`, `ffn_dag_weights` | GPU_ASYNC | sparse DAG |
 | `Aux` | `*.bias`/`*_bias`, `*.scale`/`*_scale`, `*rope*`, `*cos*`, `*sin*`, `*inv_freq*`, `*alibi*` | DISCARD | passive (preloaded/ignored) |
@@ -63,9 +67,37 @@ Rules:
 
 | Tensor | Reason |
 |---|---|
-| `relative_attention_bias` / `cross_attn` / `.encoder.` / `.decoder.` | T5/BART are encoder-decoder — a separate architecture class, not yet implemented |
 | `attn_sink`, `shear` | Compute-affecting, unimplemented |
 | anything unrecognized | Register a `LayerOpKind` + classifier arm + `op_binding` (see `docs/adding-a-model-family.md`) |
+
+## Encoder-decoder (T5 / BART) — `encoder_decoder_infer`
+
+T5 is a separate architecture **class** (two stacks), handled by
+`crates/hayai-core/src/encoder_decoder_infer.rs` (`T5Model`), not the decoder-only
+`StreamingGenerator`. Tensors still stream layer-by-layer via the shared
+`ExecPlan` + GGUF slice loader. Details:
+
+- `enc.blk.N.*` (bidirectional self-attn) and `dec.blk.N.*` (causal self-attn +
+  cross-attn) map to distinct plan units (`dec` offset by `DEC_BLOCK_OFFSET`).
+- **No RoPE / no absolute positions / no `1/√d` score scaling**: attention adds a
+  learned **relative position bias** (`attn_rel_b`, shared from block 0) binned by
+  the HF `_relative_position_bucket` function (bidirectional for encoder + cross,
+  causal for decoder self-attn). Cross-attention has no bias.
+- Norms are T5 `T5LayerNorm` (RMS, weight only); the FFN is **gated with
+  `gelu_new`** (`gated-gelu`; the GGUF does not record `feed_forward_proj`, so that
+  is the assumed default). Output uses a separate `output.weight` (not tied) and is
+  **not** scaled by `d_model^-0.5` when the embeddings are untied.
+- Tokenizer: `tokenizer.ggml.model = "t5"` uses SentencePiece **unigram** (no
+  merges); `Tokenizer` now runs Viterbi over `tokenizer.ggml.scores` for these
+  vocabularies (`unigram_encode`), with a leading space (`add_dummy_prefix`) and a
+  trailing EOS.
+- **Validated** vs HuggingFace `google/flan-t5-small`: encoder ids and greedy ids
+  match exactly (`translate English to German: The house is wonderful.` →
+  `Das Haus ist schön.`); first-step top-5 logits match (`[644,316,37,660,1122]`,
+  Δ ≈ F16 rounding). Tests: `t5_first_logits_match_hf`, `t5_greedy_matches_hf`
+  (auto-skip without `models/flan-t5-small.F16.gguf`).
+- BART shares the class but differs in details (learned positions, LayerNorm,
+  different FFN); only the T5 path is implemented/validated so far.
 
 ## Implemented classic-transformer Dense ops (Fase 1)
 

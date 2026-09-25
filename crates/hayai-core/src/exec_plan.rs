@@ -49,6 +49,19 @@ pub enum LayerOpKind {
     MlaVb,
     /// MLA legacy fused `attn_kv_b` (unsplit `k_b`+`v_b`).
     MlaKvB,
+    /// Encoder-decoder (T5/BART): encoder stack final norm (`enc.output_norm`).
+    EncOutputNorm,
+    /// Encoder-decoder (T5/BART): decoder stack final norm (`dec.output_norm`).
+    DecOutputNorm,
+    /// Cross-attention q/k/v/o projections (`dec.blk.N.cross_attn_*`).
+    CrossAttnQ,
+    CrossAttnK,
+    CrossAttnV,
+    CrossAttnO,
+    /// Cross-attention input norm (`dec.blk.N.cross_attn_norm`).
+    CrossAttnNorm,
+    /// Relative position bias table (`attn_rel_b`, `[n_buckets, n_heads]`).
+    RelPosBias,
     /// Fused QKV projection (`attn_qkv.weight` / `qkv_proj.weight`).
     AttnQkv,
     /// `attn_q_norm.weight` — per-head query norm (Gemma4).
@@ -191,11 +204,12 @@ pub fn op_binding(kind: LayerOpKind) -> OpBinding {
         | PleProjNorm | PlePostNorm | TokenEmbedNorm | MlaQaNorm | MlaKvANorm => OpBinding::CPU_NORM,
         AttnQ | AttnK | AttnV | AttnO | AttnGate | AttnQkv | PleGate | PleProj | Router
         | DeltaNet | Mamba | NextN | Recurrence | Conv | MlaQa | MlaQb | MlaKvA | MlaKb
-        | MlaVb | MlaKvB => OpBinding::CPU_GEMV,
+        | MlaVb | MlaKvB | CrossAttnQ | CrossAttnK | CrossAttnV | CrossAttnO => OpBinding::CPU_GEMV,
         FfnGate | FfnUp | FfnDown | FfnGateUp | ExpertGate | ExpertUp | ExpertDown
         | ExpertGateUp | SharedExpert | OutputProj | PleModelProj => OpBinding::GPU_ASYNC,
         FfnDagAdjacency | FfnDagWeights => OpBinding::GPU_ASYNC,
-        LayerOutputScale | Aux | RouterBias | RouterScale | ExpertScale => OpBinding::DISCARD,
+        LayerOutputScale | Aux | RouterBias | RouterScale | ExpertScale | EncOutputNorm
+        | DecOutputNorm | CrossAttnNorm | RelPosBias => OpBinding::DISCARD,
     }
 }
 
@@ -519,6 +533,26 @@ pub fn build_exec_plan(
 }
 
 fn parse_block_id(name: &str) -> Option<usize> {
+    // Disjoint block-id base for the decoder stack of encoder-decoder models.
+    pub(crate) const DEC_BLOCK_OFFSET: usize = 100_000;
+    // Encoder-decoder (T5/BART): `enc.blk.N.*` / `dec.blk.N.*`. The decoder stack is
+    // offset into a disjoint id range so encoder/decoder units never collide.
+    for prefix in ["enc.blk.", "encoder.blk."] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = num.parse() {
+                return Some(v);
+            }
+        }
+    }
+    for prefix in ["dec.blk.", "decoder.blk."] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = num.parse::<usize>() {
+                return Some(DEC_BLOCK_OFFSET + v);
+            }
+        }
+    }
     // blk.12.attn_q.weight / model.layers.3.mlp.down_proj.weight / etc.
     for prefix in ["blk.", "model.layers.", "layers."] {
         if let Some(rest) = name.strip_prefix(prefix) {
@@ -605,6 +639,33 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
     if n.contains("per_layer_final_norm") {
         return Ok(PlePostNorm);
+    }
+
+    // ── Phase 1b: encoder-decoder (T5/BART) — before generic attn/norm/output. ─
+    if n.contains("enc.output_norm") || n.contains("encoder.final_layer_norm") {
+        return Ok(EncOutputNorm);
+    }
+    if n.contains("dec.output_norm") || n.contains("decoder.final_layer_norm") {
+        return Ok(DecOutputNorm);
+    }
+    if n.contains("cross_attn_norm") || n.contains("cross_attention_norm") {
+        return Ok(CrossAttnNorm);
+    }
+    if n.contains("cross_attn_q") || n.contains("enc_dec_attn_q") {
+        return Ok(CrossAttnQ);
+    }
+    if n.contains("cross_attn_k") || n.contains("enc_dec_attn_k") {
+        return Ok(CrossAttnK);
+    }
+    if n.contains("cross_attn_v") || n.contains("enc_dec_attn_v") {
+        return Ok(CrossAttnV);
+    }
+    if n.contains("cross_attn_o") || n.contains("enc_dec_attn_o") {
+        return Ok(CrossAttnO);
+    }
+    if n.contains("attn_rel_b") || n.contains("relative_attention_bias") || n.contains("rel_attn_bias")
+    {
+        return Ok(RelPosBias);
     }
 
     // ── Phase 2: global embeddings / output head. ────────────────────────────
@@ -786,6 +847,7 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     if n.contains("attn_output")
         || n.contains("o_proj")
         || n.contains("attn_out")
+        || n.contains("attn_o.")
         || n.contains(".wo.")
         || n.contains("self_attention.dense")
         || n.contains("attention.dense")
@@ -869,19 +931,6 @@ pub fn classify_tensor_impl(name: &str, has_ple: bool) -> Result<LayerOpKind, St
     }
 
     // ── Phase 14: hard failures (the only arch-block reasons). ────────────────
-    // Encoder-decoder (T5/BART) relative position bias + cross-attention are a
-    // separate architecture class; fail loudly instead of an opaque "unknown".
-    if n.contains("relative_attention_bias")
-        || n.contains("rel_attn_bias")
-        || n.contains("cross_attn")
-        || n.contains("cross_attention")
-        || n.contains(".encoder.")
-        || n.contains(".decoder.")
-    {
-        return Err(format!(
-            "encoder-decoder / relative-position tensor not implemented yet: {name}"
-        ));
-    }
     if n.contains("mmproj") || n.contains("vision") || n.contains("clip") {
         return Err(format!(
             "vision/multimodal tensor not in text streaming registry yet: {name}"

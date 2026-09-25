@@ -25,6 +25,12 @@ pub struct Tokenizer {
     /// Raw Jinja chat template stored in the GGUF (`tokenizer.chat_template`),
     /// if present. Used by the OpenAI-like API to render chat messages.
     pub chat_template: Option<String>,
+    /// SentencePiece unigram piece log-probabilities (`tokenizer.ggml.scores`).
+    /// Empty for BPE vocabularies.
+    pub scores: Vec<f32>,
+    /// True when the vocabulary is SentencePiece **unigram** (e.g. T5): encoding
+    /// uses Viterbi segmentation over `scores` instead of BPE merges.
+    pub unigram: bool,
 }
 
 impl Tokenizer {
@@ -193,6 +199,15 @@ impl Tokenizer {
                     })
             });
 
+        // SentencePiece unigram (T5): no BPE merges, a `scores` table drives Viterbi.
+        let scores: Vec<f32> = metadata
+            .get("tokenizer.ggml.scores")
+            .and_then(|v| v.as_f32_array())
+            .unwrap_or_default();
+        let unigram = merges.is_empty()
+            && scores.len() == token_to_id.len()
+            && (model == "t5" || model == "umt5" || model == "t5encoder");
+
         Ok(Self {
             tokens,
             token_to_id,
@@ -206,6 +221,8 @@ impl Tokenizer {
             bytes_to_unicode,
             unicode_to_byte,
             chat_template,
+            scores,
+            unigram,
         })
     }
 
@@ -289,13 +306,17 @@ pub fn normalize_jinja_template(raw: &str) -> String {
                 }
             }
             let chunk = &rest[..cut];
-            let words = if self.spm {
-                split_words(chunk, true)
+            if self.unigram {
+                ids.extend(self.unigram_encode(chunk));
             } else {
-                self.gpt2_split(chunk)
-            };
-            for word in words {
-                ids.extend(self.bpe_encode_word(&word));
+                let words = if self.spm {
+                    split_words(chunk, true)
+                } else {
+                    self.gpt2_split(chunk)
+                };
+                for word in words {
+                    ids.extend(self.bpe_encode_word(&word));
+                }
             }
             rest = &rest[cut..];
         }
@@ -395,6 +416,64 @@ pub fn normalize_jinja_template(raw: &str) -> String {
             }
         }
         None
+    }
+
+    /// SentencePiece unigram Viterbi segmentation (T5). Maximizes the sum of piece
+    /// log-probabilities over the `▁`-normalized text; unknown chars fall back to
+    /// `<unk>`.
+    fn unigram_encode(&self, text: &str) -> Vec<u32> {
+        let norm: String = text.replace(' ', "\u{2581}");
+        let chars: Vec<char> = norm.chars().collect();
+        let n = chars.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let max_len = 24usize;
+        let mut best = vec![f32::NEG_INFINITY; n + 1];
+        let mut back = vec![usize::MAX; n + 1];
+        best[0] = 0.0;
+        for i in 1..=n {
+            let lo = i.saturating_sub(max_len);
+            for j in (lo..i).rev() {
+                let piece: String = chars[j..i].iter().collect();
+                if let Some(&id) = self.token_to_id.get(&piece) {
+                    if best[j].is_finite() {
+                        let score = best[j] + self.scores[id as usize];
+                        if score > best[i] {
+                            best[i] = score;
+                            back[i] = j;
+                        }
+                    }
+                }
+            }
+            if back[i] == usize::MAX {
+                // Unknown character: emit `<unk>` for a single char.
+                best[i] = if best[i - 1].is_finite() { best[i - 1] } else { 0.0 };
+                back[i] = i - 1;
+            }
+        }
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        let mut i = n;
+        while i > 0 {
+            let j = back[i];
+            pieces.push((j, i));
+            i = j;
+        }
+        pieces.reverse();
+        let unk = self.token_to_id.get("<unk>").copied();
+        let mut out = Vec::with_capacity(pieces.len());
+        for (j, k) in pieces {
+            let piece: String = chars[j..k].iter().collect();
+            match self.token_to_id.get(&piece) {
+                Some(&id) => out.push(id),
+                None => {
+                    if let Some(id) = unk {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn bpe_encode_word(&self, word: &str) -> Vec<u32> {

@@ -998,6 +998,32 @@ fn cmd_fetch_model(dir: PathBuf, url: Option<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Greedy text-to-text generation for encoder-decoder (T5/BART) models.
+fn cmd_generate_t5(
+    model: &std::path::Path,
+    prompt: &str,
+    max_tokens: usize,
+) -> anyhow::Result<()> {
+    use hayai_core::encoder_decoder_infer::{generate, T5Model};
+    let cat = hayai_model::GgufCatalog::open(model)?;
+    let tokenizer = Tokenizer::from_catalog(&cat)?;
+    drop(cat);
+    let t0 = Instant::now();
+    let mut m = T5Model::open(model)?;
+    println!(
+        "  Ready T5 (enc {}/dec {} layers, d_model {}, heads {}) in {:.2}s",
+        m.cfg.enc_layers,
+        m.cfg.dec_layers,
+        m.cfg.d_model,
+        m.cfg.n_heads,
+        t0.elapsed().as_secs_f64()
+    );
+    let ids = generate(&mut m, &tokenizer, prompt, max_tokens)?;
+    println!("─────────────────────────────────────────────────────────────");
+    println!("{}", tokenizer.decode(&ids).trim());
+    Ok(())
+}
+
 fn cmd_generate(
     model: PathBuf,
     prompt: String,
@@ -1072,6 +1098,20 @@ fn cmd_generate(
     );
     println!("  Memory: {}", memory_strategy);
     println!("─────────────────────────────────────────────────────────────");
+
+    // Encoder-decoder (T5/BART): dedicated text-to-text streaming path.
+    if let Ok(peek) = hayai_model::GgufCatalog::open(&model) {
+        let is_ede = peek
+            .meta_str("general.architecture")
+            .map(|a| a == "t5" || a == "t5encoder" || a == "umt5" || a == "bart")
+            .unwrap_or(false)
+            || peek.tensor("enc.blk.0.attn_q.weight").is_ok()
+            || peek.tensor("encoder.blk.0.attn_q.weight").is_ok();
+        if is_ede {
+            drop(peek);
+            return cmd_generate_t5(&model, &prompt, max_tokens);
+        }
+    }
 
     let rss_before = process_rss_bytes();
     let mode = parse_device_mode(&device);

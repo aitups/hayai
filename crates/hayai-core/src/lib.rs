@@ -1,6 +1,7 @@
 pub mod adaptive_window;
 pub mod calibration;
 pub mod deltanet;
+pub mod encoder_decoder_infer;
 pub mod exec_plan;
 pub mod layer_cfg;
 pub mod gemma_infer;
