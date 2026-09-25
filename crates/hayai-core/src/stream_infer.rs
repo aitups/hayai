@@ -777,12 +777,20 @@ impl StreamingGenerator {
             || learned_pos.is_some()
             || token_embed_norm.is_some()
             || parallel_residual;
-        // ALiBi (BLOOM/Falcon/MPT): score bias from absolute q/k positions.
+        // ALiBi (BLOOM/Falcon/MPT): score bias from absolute q/k positions. Falcon is
+        // special: the "new" multiquery architecture (`tensor_data_layout = "jploski"`,
+        // falcon-7B/40B) uses **RoPE**, not ALiBi; only the old arch (falcon-rw-1b) does.
         let alibi_slopes = if matches!(
             arch.as_str(),
             "bloom" | "falcon" | "mpt" | "starcoder" | "refact" | "jais"
         ) {
-            Some(alibi_slopes(config.num_attention_heads))
+            let falcon_rope = arch == "falcon"
+                && catalog.meta_str("falcon.tensor_data_layout") == Some("jploski");
+            if falcon_rope {
+                None
+            } else {
+                Some(alibi_slopes(config.num_attention_heads))
+            }
         } else {
             None
         };

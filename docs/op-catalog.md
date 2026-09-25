@@ -120,6 +120,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   (`token_embd_norm`, BLOOM).
 - **ALiBi** (BLOOM/Falcon/MPT/Starcoder): `-slope[h]·(q_pos - k_pos)` added to scores
   in `BoundedKvCache::attend`; absolute key positions from `attention_slot_positions`.
+  Falcon is split by `falcon.tensor_data_layout`: the new multiquery architecture
+  (`"jploski"`, falcon-7B/40B) uses **RoPE**, only the old arch (falcon-rw-1b) ALiBi.
 - **RoPE scaling** (linear / YaRN): `{arch}.rope.scaling.{type,factor,beta_*,
   original_context_length,attn_factor}` → `AttentionConfig.rope` /
   `apply_rope_partial_factors_scaled`.
@@ -137,7 +139,8 @@ T5 is a separate architecture **class** (two stacks), handled by
   RoPE, 20-token greedy identical), Phi-3-mini (fused `ffn_up` gate+up, greedy
   identical), Granite-4.0-1b (architecture scalars + array `head_count_kv`, greedy
   identical), Qwen2.5-7B (attention biases, top-4 pos-0/1 identical),
-  StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical).
+  StableLM-2 (partial RoPE + qkv biases, top-5 pos-0 identical), Falcon-7B (fused MQA
+  QKV + shared-norm parallel residual, greedy identical).
 
 ## MLA (DeepSeek-V2/V3, Kimi)
 
