@@ -246,16 +246,6 @@ impl T5Model {
         let plan = build_exec_plan(&cat, 0, false)
             .map_err(|u| EdeError::Msg(format!("T5 exec plan failed on {}: {}", u.tensor_name, u.hint)))?;
 
-        let mut enc = Vec::new();
-        let mut dec = Vec::new();
-        for u in &plan.units {
-            match u.block_id {
-                Some(id) if id >= DEC_BLOCK_OFFSET => dec.push(id - DEC_BLOCK_OFFSET),
-                Some(id) => enc.push(id),
-                None => {}
-            }
-        }
-        let _ = (enc, dec);
         // Encoder / decoder streaming units, indexed by original block id.
         let enc_units: Vec<Unit> = (0..cfg.enc_layers)
             .map(|want| {
