@@ -1794,7 +1794,8 @@ impl StreamingGenerator {
                 }
             }
 
-            let t_ffn_fin = Instant::now();            if let Some(inflight) = inflight {
+            let t_ffn_fin = Instant::now();
+            if let Some(inflight) = inflight {
                 ffn_finish_scratch(
                     orch,
                     inflight,
