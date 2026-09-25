@@ -1094,6 +1094,15 @@ mod tests {
         classify_tensor_impl(name, true)
     }
 
+    /// Compute-affecting ops with no public GGUF to validate against (`attn_sink`,
+    /// `shear`) must fail **loudly** rather than being silently discarded.
+    #[test]
+    fn unsupported_compute_ops_fail_loudly() {
+        assert!(cls("blk.0.attn_sink.weight").is_err());
+        assert!(cls("blk.0.attn_sink").is_err());
+        assert!(cls("blk.0.shear.weight").is_err());
+    }
+
     #[test]
     fn classifies_llama_tensors() {
         assert_eq!(cls("blk.0.attn_q.weight").unwrap(), LayerOpKind::AttnQ);
