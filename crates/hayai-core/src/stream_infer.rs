@@ -48,6 +48,66 @@ impl PrefetchSlotPtr {
     }
 }
 
+/// One layer prefetch job: destination slot (raw address), layer index, fused dims.
+pub(crate) struct PrefetchJob {
+    pub(crate) layer: usize,
+    pub(crate) addr: usize,
+    pub(crate) len: usize,
+    pub(crate) fused: Option<(usize, usize)>,
+}
+
+/// Persistent prefetch worker.
+///
+/// Spawning a thread and `fork_reader`ing a catalog **per layer** costs ~5 ms/layer
+/// (`fork_reader` used to clone the whole tokenizer vocab). This worker forked the
+/// reader once and drains jobs from a channel, so both vanish from the hot path.
+pub(crate) struct PrefetchWorker {
+    jobs: std::sync::mpsc::Sender<PrefetchJob>,
+    done: std::sync::mpsc::Receiver<Result<(), GgufError>>,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl PrefetchWorker {
+    pub(crate) fn new(cat: GgufCatalog) -> Self {
+        let (jt, jr) = std::sync::mpsc::channel::<PrefetchJob>();
+        let (dt, dr) = std::sync::mpsc::channel::<Result<(), GgufError>>();
+        let handle = std::thread::spawn(move || {
+            let mut cat = cat;
+            while let Ok(job) = jr.recv() {
+                let dst = unsafe { std::slice::from_raw_parts_mut(job.addr as *mut u8, job.len) };
+                let res = match job.fused {
+                    Some((q, kv)) => cat
+                        .load_layer_pack_into_fused(job.layer, dst, q, kv)
+                        .map(|_| ()),
+                    None => cat.load_layer_pack_into(job.layer, dst).map(|_| ()),
+                };
+                if dt.send(res).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            jobs: jt,
+            done: dr,
+            _handle: handle,
+        }
+    }
+
+    pub(crate) fn submit(&self, job: PrefetchJob) -> Result<(), StreamInferError> {
+        self.jobs
+            .send(job)
+            .map_err(|_| StreamInferError::Msg("prefetch worker dropped".into()))
+    }
+
+    pub(crate) fn wait(&self) -> Result<(), StreamInferError> {
+        match self.done.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Err(StreamInferError::Msg("prefetch worker dropped".into())),
+        }
+    }
+}
+
 /// Activation applied by the generic causal depthwise conv.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ConvActivation {
@@ -449,6 +509,8 @@ pub struct StreamingGenerator {
     pub(crate) scratch_attn: Vec<f32>,
     pub(crate) scratch_gate: Vec<f32>,
     pub(crate) scratch_proj: Vec<f32>,
+    /// Persistent prefetch worker (created lazily on the first non-resident decode).
+    pub(crate) prefetch_worker: Option<PrefetchWorker>,
     /// HRM frozen low-cycle init state (`hrm.z_l_init`), length = hidden.
     pub(crate) z_l_init: Option<Vec<f32>>,
     /// Gemma4 proportional RoPE factors (`rope_freqs.weight`), cached once.
@@ -1082,6 +1144,7 @@ impl StreamingGenerator {
             scratch_attn: vec![0.0; hidden],
             scratch_gate: vec![0.0; hidden],
             scratch_proj: vec![0.0; hidden],
+            prefetch_worker: None,
             z_l_init,
             rope_freq_factors: gemma_rope_freqs.clone(),
             gemma_rope_freqs,
@@ -1576,7 +1639,8 @@ impl StreamingGenerator {
             current = self.load_pack(0)?;
             layout = current.layout();
         }
-        let mut prefetch: Option<JoinHandle<Result<PrefetchOk, GgufError>>> = None;
+        let mut prefetch_owned: Option<JoinHandle<Result<PrefetchOk, GgufError>>> = None;
+        let mut prefetch_pending = false;
 
         for layer_idx in 0..n_layers {
             self.act_swap_prepare();
@@ -1606,31 +1670,36 @@ impl StreamingGenerator {
             // Resident mode skips prefetch: every layer is already in device memory.
             if !scratch.as_ref().map(|s| s.resident).unwrap_or(false)
                 && layer_idx + 1 < n_layers
-                && prefetch.is_none()
+                && !prefetch_pending
+                && prefetch_owned.is_none()
             {
-                let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
                 let next_fused = self.fused_qkv_dims(next);
                 if let Some(sc) = scratch.as_mut() {
+                    if self.prefetch_worker.is_none() {
+                        let cat = self.catalog.fork_reader()?;
+                        self.prefetch_worker = Some(PrefetchWorker::new(cat));
+                    }
                     let next_slot = (layer_idx + 1) % 2;
-                    let mut slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
+                    let slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
                     if let Some(m) = self.owned_mem.as_mut() {
                         m.note_prefetch_staging(0);
                     }
-                    prefetch = Some(thread::spawn(move || {
-                        let dst = unsafe { slot_ptr.as_mut_slice() };
-                        match next_fused {
-                            Some((q, kv)) => cat.load_layer_pack_into_fused(next, dst, q, kv),
-                            None => cat.load_layer_pack_into(next, dst),
-                        }
-                    }));
+                    self.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
+                        layer: next,
+                        addr: slot_ptr.addr,
+                        len: slot_ptr.len,
+                        fused: next_fused,
+                    })?;
+                    prefetch_pending = true;
                 } else {
                     // No scratch: the prefetch must return **owned** matrices.
                     // Returning views into a `blob` local to this closure would
                     // dangle the moment the closure returns (the pack is used by
                     // the main thread afterwards). The owned loaders copy every
                     // tensor into its own allocation, so the pack owns its bytes.
-                    prefetch = Some(thread::spawn(move || match next_fused {
+                    let mut cat = self.catalog.fork_reader()?;
+                    prefetch_owned = Some(thread::spawn(move || match next_fused {
                         Some((q, kv)) => {
                             let pack = cat.load_layer_pack_fused(next, q, kv)?.0;
                             let lay = pack.layout();
@@ -1778,7 +1847,7 @@ impl StreamingGenerator {
             self.ffn_secs += t_ffn_enq.elapsed().as_secs_f64();
 
             let mut next_staged: Option<PrefetchOk> = None;
-            if let Some(handle) = prefetch.take() {
+            if let Some(handle) = prefetch_owned.take() {
                 let t_join = Instant::now();
                 match handle.join() {
                     Ok(Ok((pack, lay))) => {
@@ -1791,6 +1860,24 @@ impl StreamingGenerator {
                     }
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => return Err(StreamInferError::Msg("prefetch join panicked".into())),
+                }
+            } else if prefetch_pending {
+                let t_join = Instant::now();
+                self.prefetch_worker
+                    .as_ref()
+                    .ok_or_else(|| StreamInferError::Msg("prefetch worker missing".into()))?
+                    .wait()?;
+                let dt = t_join.elapsed().as_secs_f64();
+                self.overlap_secs += dt;
+                self.attn_ffn_overlap_secs += dt;
+                self.prefetch_hits += 1;
+                prefetch_pending = false;
+                if let Some(sc) = scratch.as_mut() {
+                    let next_slot = (layer_idx + 1) % 2;
+                    let base = sc.host_slot(next_slot);
+                    let (pack, lay) = self.pack_views_from_base(layer_idx + 1, base)?;
+                    self.io_bytes += lay.total as u64;
+                    next_staged = Some((pack, lay));
                 }
             }
 

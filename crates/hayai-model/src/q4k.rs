@@ -9,23 +9,22 @@ pub const Q4_K_BLOCK_BYTES: usize = 144; // d(2)+dmin(2)+scales(12)+qs(128)
 
 #[inline]
 fn gemv_q4k_sub32(d: f32, minv: f32, q: &[u8], x: &[f32], high_nibble: bool) -> f32 {
-    use std::simd::f32x8;
-    use std::simd::num::SimdFloat;
+    use std::simd::num::{SimdFloat, SimdUint};
+    use std::simd::{f32x8, u32x8, u8x8, Simd};
     let mut acc = f32x8::splat(0.0);
     let d_v = f32x8::splat(d);
     let m_v = f32x8::splat(minv);
+    let shift = u8x8::splat(4);
+    let mask = u8x8::splat(0x0F);
+    let magic = u32x8::splat(0x4B00_0000);
+    let magic_f = f32x8::splat(8_388_608.0);
     for chunk in 0..4 {
         let o = chunk * 8;
-        let mut w = [0.0f32; 8];
-        for i in 0..8 {
-            let nibble = if high_nibble {
-                q[o + i] >> 4
-            } else {
-                q[o + i] & 0x0F
-            };
-            w[i] = nibble as f32;
-        }
-        let wv = f32x8::from_array(w) * d_v - m_v;
+        let bytes = u8x8::from_slice(&q[o..o + 8]);
+        let nib = if high_nibble { bytes >> shift } else { bytes & mask };
+        // u8 nibble -> f32 via the "magic number" int-to-float bit trick, all SIMD.
+        let f = f32x8::from_bits(nib.cast::<u32>() | magic) - magic_f;
+        let wv = f * d_v - m_v;
         let xv = f32x8::from_slice(&x[o..o + 8]);
         acc += wv * xv;
     }

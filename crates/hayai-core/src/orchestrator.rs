@@ -90,26 +90,43 @@ impl EngineOrchestrator {
                     )
                 }
             }
-            ExecutionMode::Auto => match OpenClDevicePool::try_init_all_gpus() {
-                Ok(pool) => {
+            ExecutionMode::Auto => {
+                // Small models lose on a discrete GPU: the per-layer FFN DMA (coarse
+                // SVM transfers) costs more than the CPU GEMV it saves. Only offload
+                // once the FFN is big enough (`hidden*ff`), overridable via
+                // `HAYAI_FFN_MIN_GPU_PARAMS`.
+                let ffn = model_config
+                    .hidden_size
+                    .saturating_mul(model_config.intermediate_size);
+                let min_gpu = std::env::var("HAYAI_FFN_MIN_GPU_PARAMS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(6_000_000usize);
+                if ffn < min_gpu {
                     info!(
-                        "OpenCL pool ({}): {}",
-                        pool.len(),
-                        pool.names().join(" | ")
+                        "Auto: FFN hidden*ff={ffn} < {min_gpu} params → CPU (GPU DMA dominates for small models)"
                     );
-                    (ExecutionMode::Auto, pool)
+                    (ExecutionMode::CpuOnly, OpenClDevicePool::empty())
+                } else {
+                    match OpenClDevicePool::try_init_all_gpus() {
+                        Ok(pool) => {
+                            info!(
+                                "OpenCL pool ({}): {}",
+                                pool.len(),
+                                pool.names().join(" | ")
+                            );
+                            (ExecutionMode::Auto, pool)
+                        }
+                        Err(e) => {
+                            info!(
+                                "No OpenCL GPU available ({}). Falling back to CPU-Only mode.",
+                                e
+                            );
+                            (ExecutionMode::CpuOnly, OpenClDevicePool::empty())
+                        }
+                    }
                 }
-                Err(e) => {
-                    info!(
-                        "No OpenCL GPU available ({}). Falling back to CPU-Only mode.",
-                        e
-                    );
-                    (
-                        ExecutionMode::CpuOnly,
-                        OpenClDevicePool::empty(),
-                    )
-                }
-            },
+            }
         };
 
         Self {
