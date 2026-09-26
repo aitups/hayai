@@ -5,7 +5,7 @@
 
 use super::IoBackend;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use tracing::debug;
@@ -102,6 +102,36 @@ impl FileWeightIo {
     }
 }
 
+/// One positioned read loop (Windows `seek_read`, POSIX `seek`+`read`).
+fn read_at_file(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.read_at(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read"));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
 impl WeightIo for FileWeightIo {
     fn path(&self) -> &Path {
         &self.path
@@ -116,32 +146,7 @@ impl WeightIo for FileWeightIo {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        // Windows: `seek_read` is a single positioned syscall (no cursor update),
-        // which sustains more sequential bandwidth than `seek`+`read` when the
-        // layer is issued as many ~10 MiB tensor reads.
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::FileExt;
-            let mut done = 0usize;
-            while done < buf.len() {
-                let n = self
-                    .file
-                    .seek_read(&mut buf[done..], offset + done as u64)?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "short read",
-                    ));
-                }
-                done += n;
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.read_exact(buf)
-        }
+        read_at_file(&self.file, offset, buf)
     }
 }
 

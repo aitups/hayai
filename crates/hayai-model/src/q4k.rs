@@ -10,7 +10,7 @@ pub const Q4_K_BLOCK_BYTES: usize = 144; // d(2)+dmin(2)+scales(12)+qs(128)
 #[inline]
 fn gemv_q4k_sub32(d: f32, minv: f32, q: &[u8], x: &[f32], high_nibble: bool) -> f32 {
     use std::simd::num::{SimdFloat, SimdUint};
-    use std::simd::{f32x8, u32x8, u8x8, Simd};
+    use std::simd::{f32x8, u32x8, u8x8};
     let mut acc = f32x8::splat(0.0);
     let d_v = f32x8::splat(d);
     let m_v = f32x8::splat(minv);
