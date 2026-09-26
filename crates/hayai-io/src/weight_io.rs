@@ -116,8 +116,32 @@ impl WeightIo for FileWeightIo {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buf)
+        // Windows: `seek_read` is a single positioned syscall (no cursor update),
+        // which sustains more sequential bandwidth than `seek`+`read` when the
+        // layer is issued as many ~10 MiB tensor reads.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut done = 0usize;
+            while done < buf.len() {
+                let n = self
+                    .file
+                    .seek_read(&mut buf[done..], offset + done as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short read",
+                    ));
+                }
+                done += n;
+            }
+            Ok(())
+        }
+        #[cfg(not(windows))]
+        {
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.read_exact(buf)
+        }
     }
 }
 
