@@ -25,8 +25,25 @@ pub trait WeightIo: Send {
     /// Default implementation falls back to sequential [`Self::read_at`].
     fn read_many_at(&mut self, dst: &mut [u8], requests: &[IoRange]) -> io::Result<()> {
         validate_ranges(dst.len(), requests)?;
-        for r in requests {
-            self.read_at(r.offset, &mut dst[r.start..r.end])?;
+        // Coalesce runs that are contiguous in *both* the file and `dst` into a single
+        // read: a plan unit's tensors are catalog-ordered, so a layer collapses to one
+        // large sequential read (the disk sustains far more than 7 seeks' worth).
+        let mut i = 0;
+        while i < requests.len() {
+            let mut j = i;
+            while j + 1 < requests.len() {
+                let a = requests[j];
+                let b = requests[j + 1];
+                if a.offset + (a.end - a.start) as u64 == b.offset && a.end == b.start {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let start = requests[i].start;
+            let end = requests[j].end;
+            self.read_at(requests[i].offset, &mut dst[start..end])?;
+            i = j + 1;
         }
         Ok(())
     }
