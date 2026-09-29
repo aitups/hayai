@@ -220,38 +220,24 @@ impl DeltaNetLayerWeights {
         let mut conv_out = vec![0.0f32; cd];
         // PyTorch/HF/ggml causal Conv1d: weight[0]·oldest … weight[k-1]·newest.
         // HAYAI_CONV_FLIP=1 reverses taps (diagnose GGUF tap order).
-        // HAYAI_DN_NO_CONV=1 skips conv (silu of raw qkv mix) for ablation.
         let flip = std::env::var("HAYAI_CONV_FLIP").ok().as_deref() == Some("1");
-        let no_conv = std::env::var("HAYAI_DN_NO_CONV").ok().as_deref() == Some("1");
-        if no_conv {
-            for c in 0..cd {
-                conv_out[c] = silu(mixed[c]);
+        for c in 0..cd {
+            let row = c * k;
+            let mut acc = 0.0f32;
+            for t in 0..hist {
+                let st = &state.conv[t * cd..t * cd + cd];
+                let w_idx = if flip { hist - t } else { t };
+                acc += self.conv1d[row + w_idx] * st[c];
             }
-            if hist > 0 {
-                if hist > 1 {
-                    state.conv.copy_within(cd..hist * cd, 0);
-                }
-                state.conv[(hist - 1) * cd..hist * cd].copy_from_slice(&mixed[..cd]);
+            let w_new = if flip { 0 } else { hist };
+            acc += self.conv1d[row + w_new] * mixed[c];
+            conv_out[c] = silu(acc);
+        }
+        if hist > 0 {
+            if hist > 1 {
+                state.conv.copy_within(cd..hist * cd, 0);
             }
-        } else {
-            for c in 0..cd {
-                let row = c * k;
-                let mut acc = 0.0f32;
-                for t in 0..hist {
-                    let st = &state.conv[t * cd..t * cd + cd];
-                    let w_idx = if flip { hist - t } else { t };
-                    acc += self.conv1d[row + w_idx] * st[c];
-                }
-                let w_new = if flip { 0 } else { hist };
-                acc += self.conv1d[row + w_new] * mixed[c];
-                conv_out[c] = silu(acc);
-            }
-            if hist > 0 {
-                if hist > 1 {
-                    state.conv.copy_within(cd..hist * cd, 0);
-                }
-                state.conv[(hist - 1) * cd..hist * cd].copy_from_slice(&mixed[..cd]);
-            }
+            state.conv[(hist - 1) * cd..hist * cd].copy_from_slice(&mixed[..cd]);
         }
 
         let key_dim = self.n_k_heads * self.head_k;
@@ -260,11 +246,8 @@ impl DeltaNetLayerWeights {
         let mut kk = conv_out[key_dim..key_dim * 2].to_vec();
         let v = conv_out[key_dim * 2..key_dim * 2 + value_dim].to_vec();
 
-        let no_l2 = std::env::var("HAYAI_DN_NO_L2").ok().as_deref() == Some("1");
-        if !no_l2 {
-            l2_norm_heads(&mut q, self.n_k_heads, self.head_k, self.eps);
-            l2_norm_heads(&mut kk, self.n_k_heads, self.head_k, self.eps);
-        }
+        l2_norm_heads(&mut q, self.n_k_heads, self.head_k, self.eps);
+        l2_norm_heads(&mut kk, self.n_k_heads, self.head_k, self.eps);
 
         let q_scale = 1.0 / (self.head_k as f32).sqrt();
         for e in q.iter_mut() {
@@ -273,15 +256,8 @@ impl DeltaNetLayerWeights {
 
         let mut alpha_h = vec![0.0f32; self.n_v_heads];
         let mut beta_h = vec![0.0f32; self.n_v_heads];
-        // HAYAI_DN_SWAP_AB=1 swaps α/β projections (naming mismatch probe).
-        let swap_ab = std::env::var("HAYAI_DN_SWAP_AB").ok().as_deref() == Some("1");
-        if swap_ab {
-            self.beta.gemv(x, &mut alpha_h)?;
-            self.alpha.gemv(x, &mut beta_h)?;
-        } else {
-            self.alpha.gemv(x, &mut alpha_h)?;
-            self.beta.gemv(x, &mut beta_h)?;
-        }
+        self.alpha.gemv(x, &mut alpha_h)?;
+        self.beta.gemv(x, &mut beta_h)?;
 
         let mut o = vec![0.0f32; value_dim];
         let hv = self.head_v;
@@ -289,29 +265,12 @@ impl DeltaNetLayerWeights {
         // GQA over V-heads: llama.cpp expands K-heads with `ggml_repeat` (tile),
         // so V-head `vh` maps to K-head `vh % n_k` — NOT HF `repeat_interleave`
         // (`vh / ratio`). Wrong mapping yields coherent-looking garbage until fixed.
-        let k_repeat = (self.n_v_heads / self.n_k_heads).max(1);
-        // HAYAI_DN_BETA_RAW=1: skip sigmoid on β (treat as already [0,1]).
-        let beta_raw = std::env::var("HAYAI_DN_BETA_RAW").ok().as_deref() == Some("1");
-        // HAYAI_DN_A_RAW=1: treat ssm_a as A_log (apply -exp) instead of prebaked -exp(A_log).
-        let a_raw = std::env::var("HAYAI_DN_A_RAW").ok().as_deref() == Some("1");
-        // HAYAI_DN_KMAP=interleave: HF-style vh/ratio (debug only; default = llama tile).
-        let kmap_interleave = std::env::var("HAYAI_DN_KMAP").ok().as_deref() == Some("interleave");
-
         for vh in 0..self.n_v_heads {
-            let kh = if kmap_interleave {
-                vh / k_repeat
-            } else {
-                vh % self.n_k_heads
-            };
-            let a_param = self.a[vh.min(self.a.len() - 1)];
-            let a = if a_raw { -a_param.exp() } else { a_param };
+            let kh = vh % self.n_k_heads;
+            let a = self.a[vh.min(self.a.len() - 1)];
             let soft = softplus(self.dt_bias.get(vh).copied().unwrap_or(0.0) + alpha_h[vh]);
             let decay = (a * soft).exp();
-            let b = if beta_raw {
-                beta_h[vh]
-            } else {
-                sigmoid(beta_h[vh])
-            };
+            let b = sigmoid(beta_h[vh]);
 
             let s = &mut state.ssm[vh * hk * hv..(vh + 1) * hk * hv];
             let qh = &q[kh * hk..kh * hk + hk];

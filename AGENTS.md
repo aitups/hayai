@@ -239,6 +239,11 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   bounded RAM cache (`HAYAI_MOE_NONEXPERT_MB`, default 1024) and streams only the top-k
   experts (`HAYAI_MOE_CACHE_MB`, default 512). Gemma PLE's global `per_layer_model_proj`
   is loaded once; per-layer PLE weights are prefetched one layer ahead. The MoE CPU path
-  evaluates the top-k experts in parallel (rayon).
+  evaluates the top-k experts in parallel (rayon). **Expert-pack prefetch is not
+  implemented**: prefetching the next layer's likely experts (previous-token selection,
+  then warming the LRU cache) was prototyped and reverted — for OLMoE the selection is not
+  predictable the next token so it ~doubled I/O (11506 → 23862 MiB, 1.74 → 1.30 tok/s),
+  and the 512 MiB cache (128 packs vs 1024 experts) thrashes. Needs a better predictor
+  (global frequency / grouped routing) and a native Linux host to measure.
 - `PRD.md`, `implementation_plan.md`, and `pr_soporte_gguf_disperso_v3.md` are the design
-  sources of truth; README duplicates the "Quantization formats" line (cosmetic).
+  sources of truth.

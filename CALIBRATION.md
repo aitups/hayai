@@ -49,6 +49,17 @@ SmolLM2-135M-Instruct-Q4_K_M (100.6 MiB).
 > objetivo (≈40 tok/s @75 %) es de cómputo (GEMV de la FFN en CPU) + I/O: el trabajo
 > pendiente es descargar la FFN a la GPU y solapar mejor, no ya el coste del fork.
 
+## Target de producto — ARM64 (GB10-class)
+
+La compilación cruzada de las lib crates se verifica con
+`cargo check --target aarch64-unknown-linux-gnu -p hayai-core -p hayai-io -p hayai-opencl
+-p hayai-cpu -p hayai-model -p hayai-kernels` (host de cross-check sin GPU/OpenCL).
+
+**Pendiente:** ejecutar `calibrate` en hardware ARM64/GB10 real y añadir aquí su perfil
+(RAM host, disco, GEMV efectivo, objetivos @75 %/@80 %); el planificador y el agente de
+despliegue leen estos valores. Hasta entonces, los objetivos de este equipo son los del
+host de desarrollo de arriba.
+
 ## Añadir un equipo
 
 1. Ejecutar el comando `calibrate` en el equipo (BC250, GB10, …) con un modelo
