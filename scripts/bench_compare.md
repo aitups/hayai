@@ -41,3 +41,36 @@ llama-bench -m models/foo.gguf -p 512 -n 128
 ```
 
 Or run `scripts/bench_compare.sh` / `scripts/bench_compare.ps1`.
+
+## Linux container (io_uring) — hayai vs llama.cpp
+
+Same four GGUFs for both engines, one per execution path, so the Linux `io_uring`
+read path is compared against llama.cpp on equal footing (proves the disk is not
+the limiter):
+
+1. `SmolLM2-135M-Instruct-Q4_K_M.gguf` — Dense small (resident)
+2. `Qwen2.5-7B-Instruct-Q4_K_M.gguf` — Dense large (streaming, I/O-bound)
+3. `OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf` — MoE (sparse)
+4. `Qwen_Qwen3.5-4B-Q4_K_M.gguf` — hybrid / DeltaNet
+
+CPU-only image: builds hayai (nightly) and llama.cpp (`master`, CPU) inside
+Debian bookworm, then runs both with `models/` mounted read-only. Reports
+prefill/decode tok/s and peak RSS (`/usr/bin/time -v`).
+
+```bash
+# Linux / WSL / Git Bash — builds the image, runs the table, saves to bench_results/
+scripts/bench_docker.sh
+
+# PowerShell (Docker Desktop)
+scripts\bench_docker.ps1
+
+# One model, custom sizes
+MODELS="Qwen2.5-7B-Instruct-Q4_K_M.gguf" N=64 PP=256 scripts/bench_docker.sh
+```
+
+Env knobs: `MODELS_DIR`, `MODELS` (space-separated basenames), `N` (decode
+tokens), `PP` (llama-bench prefill tokens), `THREADS`, `MEMORY_STRATEGY`
+(default `minimal` so hayai streams instead of becoming resident),
+`LLAMA_REF` (build arg). Fixtures: `scripts/bench_docker/Dockerfile`,
+`scripts/bench_docker/compare_inside.sh`.
+

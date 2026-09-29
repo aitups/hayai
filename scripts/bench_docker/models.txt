@@ -1,0 +1,4 @@
+SmolLM2-135M-Instruct-Q4_K_M.gguf
+Qwen2.5-7B-Instruct-Q4_K_M.gguf
+OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf
+Qwen_Qwen3.5-4B-Q4_K_M.gguf

@@ -304,9 +304,13 @@ picks any OpenCL GPU and falls back to CPU-only if none is available.
 
 - `scripts/bench_suite.ps1` — full suite: hayai vs llama.cpp (llama-bench/llama-cli) over SmolLM2, HRM-Text, Qwen3.5 and Gemma4; writes a timestamped report into `bench_results/` (gitignored).
 - `scripts/bench_compare.sh` — Linux equivalent, along with `bench_compare.ps1` and the protocol notes in `scripts/bench_compare.md`.
+- `scripts/bench_docker.{sh,ps1}` — builds a CPU-only Debian image with hayai (nightly) + llama.cpp (master) and compares both engines on 4 models (one per execution path: SmolLM2, Qwen2.5-7B, OLMoE, Qwen3.5-4B), reporting prefill/decode tok/s and peak RSS on real Linux `io_uring` (`models/` mounted read-only).
 
 ```powershell
 powershell -File scripts/bench_suite.ps1 -SmolTokens 32 -SuiteTokens 8
+
+# Linux container (io_uring) compare; Docker required
+bash scripts/bench_docker.sh
 ```
 
 ---

@@ -221,6 +221,10 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   machine-specific helpers, not a reproducible codegen step.
 - `scripts/bench_suite.ps1` (Windows) / `bench_compare.{sh,ps1}` (Linux) run side-by-side
   vs llama.cpp; protocol notes in `scripts/bench_compare.md`. Not part of `cargo test`.
+  `scripts/bench_docker.{sh,ps1}` build a CPU-only Debian image (hayai nightly + llama.cpp
+  master) and compare both engines on the 4-path suite (SmolLM2/Qwen2.5-7B/OLMoE/Qwen3.5-4B)
+  with `models/` mounted read-only — prefill/decode tok/s + peak RSS on real Linux
+  `io_uring`.
 - `hayai-server` flags added for safety: `--max-concurrency` (default 4, bounds concurrent
   generations) and `--api-key` / `HAYAI_API_KEY` (when set, `/v1/*` requires
   `Authorization: Bearer`). Request body is capped at 8 MiB and `/v1/*` rejects `n>1`,
