@@ -108,6 +108,10 @@ pub fn open_weight_io<P: AsRef<Path>>(path: P) -> io::Result<Box<dyn WeightIo>> 
 pub struct FileWeightIo {
     path: PathBuf,
     file: File,
+    /// Reusable staging buffer for the block-contiguous read path (see
+    /// [`WeightIo::read_many_at`]). `io_uring` never needs it: it submits the scatter
+    /// batch to the kernel in one go.
+    stage: Vec<u8>,
 }
 
 impl FileWeightIo {
@@ -115,7 +119,11 @@ impl FileWeightIo {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
         tracing::debug!(path = %path.display(), "Opened File WeightIo");
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            stage: Vec::new(),
+        })
     }
 }
 
@@ -164,6 +172,53 @@ impl WeightIo for FileWeightIo {
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         read_at_file(&self.file, offset, buf)
+    }
+
+    fn read_many_at(&mut self, dst: &mut [u8], requests: &[IoRange]) -> io::Result<()> {
+        validate_ranges(dst.len(), requests)?;
+        // A plan unit's / layer's tensors are contiguous in the file but not in `dst`.
+        // One sequential read of the bounding range (a single seek) then a split beats
+        // one positioned read per tensor on a seek-bound host. Skip it when the bounding
+        // range would read far more than the payload (sparse/holey requests).
+        if requests.len() > 1 {
+            let lo = requests.iter().map(|r| r.offset).min().unwrap();
+            let hi = requests
+                .iter()
+                .map(|r| r.offset + (r.end - r.start) as u64)
+                .max()
+                .unwrap();
+            let span = (hi - lo) as usize;
+            let total: usize = requests.iter().map(|r| r.end - r.start).sum();
+            if span <= total.saturating_mul(2) {
+                if self.stage.len() < span {
+                    self.stage.resize(span, 0);
+                }
+                read_at_file(&self.file, lo, &mut self.stage[..span])?;
+                for r in requests {
+                    let s = (r.offset - lo) as usize;
+                    let n = r.end - r.start;
+                    dst[r.start..r.end].copy_from_slice(&self.stage[s..s + n]);
+                }
+                return Ok(());
+            }
+        }
+        // Coalesce runs contiguous in both the file and `dst` into single reads.
+        let mut i = 0;
+        while i < requests.len() {
+            let mut j = i;
+            while j + 1 < requests.len() {
+                let a = requests[j];
+                let b = requests[j + 1];
+                if a.offset + (a.end - a.start) as u64 == b.offset && a.end == b.start {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            read_at_file(&self.file, requests[i].offset, &mut dst[requests[i].start..requests[j].end])?;
+            i = j + 1;
+        }
+        Ok(())
     }
 }
 
@@ -450,6 +505,50 @@ mod tests {
         let mut buf = [0u8; 16];
         io.read_at(10, &mut buf).unwrap();
         assert_eq!(buf, (10u8..26).collect::<Vec<_>>().as_slice());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_many_at_splits_a_contiguous_block_into_reordered_dst() {
+        // 64 bytes in the file; request three ranges that are contiguous in the file
+        // but land out of order in `dst` (the layer-pack `q,k,v,o,...` layout).
+        let path = std::env::temp_dir().join("hayai_weight_io_many.bin");
+        let data: Vec<u8> = (0u8..64).collect();
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+        }
+        let mut io = open_weight_io(&path).unwrap();
+        let mut dst = vec![0u8; 32];
+        let requests = [
+            IoRange { offset: 8, start: 16, end: 24 },
+            IoRange { offset: 24, start: 0, end: 8 },
+            IoRange { offset: 40, start: 24, end: 32 },
+        ];
+        io.read_many_at(&mut dst, &requests).unwrap();
+        assert_eq!(&dst[0..8], &data[24..32]);
+        assert_eq!(&dst[16..24], &data[8..16]);
+        assert_eq!(&dst[24..32], &data[40..48]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_many_at_falls_back_when_ranges_are_sparse() {
+        let path = std::env::temp_dir().join("hayai_weight_io_sparse.bin");
+        let data: Vec<u8> = (0u8..200).collect();
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+        }
+        let mut io = open_weight_io(&path).unwrap();
+        let mut dst = vec![0u8; 16];
+        let requests = [
+            IoRange { offset: 0, start: 0, end: 8 },
+            IoRange { offset: 192, start: 8, end: 16 },
+        ];
+        io.read_many_at(&mut dst, &requests).unwrap();
+        assert_eq!(&dst[0..8], &data[0..8]);
+        assert_eq!(&dst[8..16], &data[192..200]);
         let _ = std::fs::remove_file(&path);
     }
 

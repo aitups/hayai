@@ -11,12 +11,11 @@
 
 use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, MoeMeta, TensorRef};
 use crate::orchestrator::EngineOrchestrator;
-use crate::stream_infer::{StreamInferError, StreamingGenerator};
+use crate::stream_infer::{PrefetchJob, PrefetchWorker, StreamInferError, StreamingGenerator};
 use hayai_cpu::{apply_rope_partial_factors_scaled, attention_decode_step, rms_norm, softmax};
 use hayai_model::QuantMatrix;
 use hayai_opencl::StreamingScratch;
 use std::collections::{HashMap, VecDeque};
-use std::thread::JoinHandle;
 use std::time::Instant;
 
 pub(crate) fn prefill_moe(
@@ -57,7 +56,7 @@ pub(crate) fn forward_moe(
     // into the OTHER ping-pong slot while this layer's attention+FFN compute runs
     // (spawned before attention, joined after the expert compute). Same shape as
     // the dense `forward_staged` prefetch.
-    let mut prefetch: Option<JoinHandle<Result<usize, StreamInferError>>> = None;
+    let mut prefetch_bytes: Option<usize> = None;
     let mut prefetched_ready = false;
 
     for layer in 0..n_layers {
@@ -155,18 +154,24 @@ pub(crate) fn forward_moe(
                     specs.push((t.name.clone(), 0, noff, t.nbytes));
                     noff += t.nbytes;
                 }
-                let mut ptr = gen.prepare_prefetch_slot(orch, scratch, (layer + 1) % 2)?;
-                let mut cat = gen.catalog.fork_reader()?;
-                prefetch = Some(std::thread::spawn(move || {
-                    let refs: Vec<(&str, usize, usize, usize)> = specs
-                        .iter()
-                        .map(|(n, a, b, c)| (n.as_str(), *a, *b, *c))
-                        .collect();
-                    let dst = unsafe { ptr.as_mut_slice() };
-                    cat.load_tensors_into(&refs, dst)
-                        .map_err(StreamInferError::from)?;
-                    Ok(noff)
-                }));
+                let slot_ptr = gen.prepare_prefetch_slot(orch, scratch, (layer + 1) % 2)?;
+                if gen.prefetch_worker.is_none() {
+                    let cat = gen.catalog.fork_reader()?;
+                    gen.prefetch_worker = Some(PrefetchWorker::new(cat));
+                }
+                gen.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
+                    read: Box::new(move |cat| {
+                        let refs: Vec<(&str, usize, usize, usize)> = specs
+                            .iter()
+                            .map(|(n, a, b, c)| (n.as_str(), *a, *b, *c))
+                            .collect();
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(slot_ptr.addr as *mut u8, slot_ptr.len)
+                        };
+                        cat.load_tensors_into(&refs, dst)
+                    }),
+                })?;
+                prefetch_bytes = Some(noff);
             }
         }
 
@@ -495,20 +500,16 @@ pub(crate) fn forward_moe(
         gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
 
         // ── Join the prefetch → next layer's non-expert is ready in its slot ──
-        if let Some(handle) = prefetch.take() {
+        if let Some(bytes) = prefetch_bytes.take() {
             let t_join = Instant::now();
-            match handle.join() {
-                Ok(Ok(bytes)) => {
-                    gen.overlap_secs += t_join.elapsed().as_secs_f64();
-                    gen.prefetch_hits += 1;
-                    gen.io_bytes += bytes as u64;
-                    prefetched_ready = true;
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(StreamInferError::Msg("MoE prefetch join panicked".into()))
-                }
-            }
+            gen.prefetch_worker
+                .as_ref()
+                .ok_or_else(|| StreamInferError::Msg("prefetch worker missing".into()))?
+                .wait()?;
+            gen.overlap_secs += t_join.elapsed().as_secs_f64();
+            gen.prefetch_hits += 1;
+            gen.io_bytes += bytes as u64;
+            prefetched_ready = true;
         }
     }
     if !orch.pool.is_empty() {

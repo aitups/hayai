@@ -29,8 +29,8 @@ use crate::orchestrator::EngineOrchestrator;
 /// Raw host-slot pointer for prefetch threads (other ping-pong slot only).
 /// Stored as `usize` so the handle is `Send` without relying on raw-pointer auto traits.
 pub(crate) struct PrefetchSlotPtr {
-    addr: usize,
-    len: usize,
+    pub(crate) addr: usize,
+    pub(crate) len: usize,
 }
 
 impl PrefetchSlotPtr {
@@ -48,12 +48,11 @@ impl PrefetchSlotPtr {
     }
 }
 
-/// One layer prefetch job: destination slot (raw address), layer index, fused dims.
+/// One prefetch job: a closure run on the worker's forked catalog, reading a layer or a
+/// plan unit into a raw destination slot. The destination address is captured as `usize`
+/// so the job stays `Send` without relying on raw-pointer auto traits.
 pub(crate) struct PrefetchJob {
-    pub(crate) layer: usize,
-    pub(crate) addr: usize,
-    pub(crate) len: usize,
-    pub(crate) fused: Option<(usize, usize)>,
+    pub(crate) read: Box<dyn FnOnce(&mut GgufCatalog) -> Result<(), GgufError> + Send + 'static>,
 }
 
 /// Persistent prefetch worker.
@@ -74,13 +73,7 @@ impl PrefetchWorker {
         let handle = std::thread::spawn(move || {
             let mut cat = cat;
             while let Ok(job) = jr.recv() {
-                let dst = unsafe { std::slice::from_raw_parts_mut(job.addr as *mut u8, job.len) };
-                let res = match job.fused {
-                    Some((q, kv)) => cat
-                        .load_layer_pack_into_fused(job.layer, dst, q, kv)
-                        .map(|_| ()),
-                    None => cat.load_layer_pack_into(job.layer, dst).map(|_| ()),
-                };
+                let res = (job.read)(&mut cat);
                 if dt.send(res).is_err() {
                     break;
                 }
@@ -1672,6 +1665,7 @@ impl StreamingGenerator {
                 && layer_idx + 1 < n_layers
                 && !prefetch_pending
                 && prefetch_owned.is_none()
+                && std::env::var_os("HAYAI_NO_PREFETCH").is_none()
             {
                 let next = layer_idx + 1;
                 let next_fused = self.fused_qkv_dims(next);
@@ -1686,10 +1680,17 @@ impl StreamingGenerator {
                         m.note_prefetch_staging(0);
                     }
                     self.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
-                        layer: next,
-                        addr: slot_ptr.addr,
-                        len: slot_ptr.len,
-                        fused: next_fused,
+                        read: Box::new(move |cat| {
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(slot_ptr.addr as *mut u8, slot_ptr.len)
+                            };
+                            match next_fused {
+                                Some((q, kv)) => {
+                                    cat.load_layer_pack_into_fused(next, dst, q, kv).map(|_| ())
+                                }
+                                None => cat.load_layer_pack_into(next, dst).map(|_| ()),
+                            }
+                        }),
                     })?;
                     prefetch_pending = true;
                 } else {

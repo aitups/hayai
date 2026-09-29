@@ -8,12 +8,11 @@
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
     add_bias, add_qkv_bias, ffn_begin_gate_up_scratch, ffn_finish_scratch, GateUpInflight,
-    StreamInferError, StreamingGenerator,
+    PrefetchJob, PrefetchWorker, StreamInferError, StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step_ex, rms_norm};
 use hayai_model::{LayerPackLayout, LayerWeightPack, QuantMatrix};
 use hayai_opencl::StreamingScratch;
-use std::thread;
 use std::time::Instant;
 
 struct PendingFfn {
@@ -106,25 +105,35 @@ impl StreamingGenerator {
                 )?;
             }
 
-            let mut prefetch = None;
+            let mut prefetch = false;
             // Resident / macro-chunk: layers are (or will be) already in memory —
             // the block is staged once by `stage_pack`. No per-layer prefetch.
             if !scratch.resident && scratch.block_k <= 1 && layer_idx + 1 < n_layers {
-                let mut cat = self.catalog.fork_reader()?;
                 let next = layer_idx + 1;
                 let next_fused = self.fused_qkv_dims(next);
                 let next_slot = (layer_idx + 1) % 2;
-                let mut slot_ptr = self.prepare_prefetch_slot(orch, scratch, next_slot)?;
+                let slot_ptr = self.prepare_prefetch_slot(orch, scratch, next_slot)?;
                 if let Some(m) = self.owned_mem.as_mut() {
                     m.note_prefetch_staging(0);
                 }
-                prefetch = Some(thread::spawn(move || {
-                    let dst = unsafe { slot_ptr.as_mut_slice() };
-                    match next_fused {
-                        Some((q, kv)) => cat.load_layer_pack_into_fused(next, dst, q, kv),
-                        None => cat.load_layer_pack_into(next, dst),
-                    }
-                }));
+                if self.prefetch_worker.is_none() {
+                    let cat = self.catalog.fork_reader()?;
+                    self.prefetch_worker = Some(PrefetchWorker::new(cat));
+                }
+                self.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
+                    read: Box::new(move |cat| {
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut(slot_ptr.addr as *mut u8, slot_ptr.len)
+                        };
+                        match next_fused {
+                            Some((q, kv)) => {
+                                cat.load_layer_pack_into_fused(next, dst, q, kv).map(|_| ())
+                            }
+                            None => cat.load_layer_pack_into(next, dst).map(|_| ()),
+                        }
+                    }),
+                })?;
+                prefetch = true;
             }
 
             let mut pending: Option<PendingFfn> = None;
@@ -260,23 +269,20 @@ impl StreamingGenerator {
                 };
                 self.ffn_secs += t_enq.elapsed().as_secs_f64();
 
-                if t == 0 {
-                    if let Some(handle) = prefetch.take() {
-                        let t_join = Instant::now();
-                        match handle.join() {
-                            Ok(Ok((pack, lay))) => {
-                                let dt = t_join.elapsed().as_secs_f64();
-                                self.overlap_secs += dt;
-                                self.io_bytes += lay.total as u64;
-                                self.prefetch_hits += 1;
-                                next_staged = Some((pack, lay));
-                            }
-                            Ok(Err(e)) => return Err(e.into()),
-                            Err(_) => {
-                                return Err(StreamInferError::Msg("prefetch join panicked".into()))
-                            }
-                        }
-                    }
+                if t == 0 && prefetch {
+                    let t_join = Instant::now();
+                    self.prefetch_worker
+                        .as_ref()
+                        .ok_or_else(|| StreamInferError::Msg("prefetch worker missing".into()))?
+                        .wait()?;
+                    self.overlap_secs += t_join.elapsed().as_secs_f64();
+                    self.prefetch_hits += 1;
+                    let next_slot = (layer_idx + 1) % 2;
+                    let (pack, lay) =
+                        self.pack_views_from_base(layer_idx + 1, scratch.host_slot(next_slot))?;
+                    self.io_bytes += lay.total as u64;
+                    next_staged = Some((pack, lay));
+                    prefetch = false;
                 }
 
                 pending = Some(PendingFfn {
@@ -290,18 +296,17 @@ impl StreamingGenerator {
             }
 
             if layer_idx + 1 < n_layers && next_staged.is_none() {
-                if let Some(handle) = prefetch.take() {
-                    match handle.join() {
-                        Ok(Ok((pack, lay))) => {
-                            self.io_bytes += lay.total as u64;
-                            self.prefetch_hits += 1;
-                            next_staged = Some((pack, lay));
-                        }
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_) => {
-                            return Err(StreamInferError::Msg("prefetch join panicked".into()))
-                        }
-                    }
+                if prefetch {
+                    self.prefetch_worker
+                        .as_ref()
+                        .ok_or_else(|| StreamInferError::Msg("prefetch worker missing".into()))?
+                        .wait()?;
+                    self.prefetch_hits += 1;
+                    let next_slot = (layer_idx + 1) % 2;
+                    let (pack, lay) =
+                        self.pack_views_from_base(layer_idx + 1, scratch.host_slot(next_slot))?;
+                    self.io_bytes += lay.total as u64;
+                    next_staged = Some((pack, lay));
                 } else {
                     let (p, lay) =
                         self.stage_pack(orch, scratch, (layer_idx + 1) % 2, layer_idx + 1)?;
