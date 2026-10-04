@@ -309,6 +309,9 @@ pub struct ExecPlan {
     pub moe: Option<MoeMeta>,
     /// Per-op hardware binding (executor consumes this).
     pub op_bindings: BTreeMap<LayerOpKind, OpBinding>,
+    /// Cost-driven op→device placement, filled by the planner at session start. Empty
+    /// means "no plan yet: use the static capability classes in `op_bindings`".
+    pub placement: crate::planner::Placement,
     pub hw_notes: Vec<String>,
 }
 
@@ -504,15 +507,16 @@ pub fn build_exec_plan(
 
     let mut hw_notes = Vec::new();
     if opencl_devices == 0 {
-        hw_notes.push("CPU-only FFN (empty OpenCL pool)".into());
+        hw_notes.push("CPU-only (empty OpenCL pool); all GEMV on host".into());
     } else {
         hw_notes.push(format!(
-            "OpenCL pool size={opencl_devices}; Attn/RoPE/KV→CPU; large GEMV→GPU"
+            "OpenCL pool size={opencl_devices}; op→device placement is planned from the \
+             measured capabilities at session start (no static attn/FFN split)"
         ));
         if supports_svm {
-            hw_notes.push("SVM host base preferred for APU zero-copy".into());
+            hw_notes.push("SVM host base available for a zero-copy owner".into());
         } else {
-            hw_notes.push("Pinned host + FFN-slice DMA to dGPU mirrors".into());
+            hw_notes.push("Pinned host + per-device VRAM mirror DMA".into());
         }
     }
     hw_notes.push(format!(
@@ -528,6 +532,7 @@ pub fn build_exec_plan(
         known_ops,
         moe,
         op_bindings,
+        placement: Default::default(),
         hw_notes,
     })
 }
@@ -1036,6 +1041,40 @@ pub fn detect_moe_meta(cat: &GgufCatalog) -> Option<MoeMeta> {
 }
 
 impl ExecPlan {
+    /// Distil the plan into the planner's op-task list: one task per op kind with the
+    /// total weight bytes across all units, and the op's capability class.
+    pub fn op_tasks(&self) -> Vec<crate::planner::OpTask> {
+        let mut bytes: BTreeMap<LayerOpKind, u64> = BTreeMap::new();
+        for u in &self.units {
+            for t in &u.tensors {
+                *bytes.entry(t.op).or_insert(0) += t.nbytes as u64;
+            }
+            for e in &u.experts {
+                for t in &e.tensors {
+                    *bytes.entry(t.op).or_insert(0) += t.nbytes as u64;
+                }
+            }
+        }
+        bytes
+            .into_iter()
+            .map(|(kind, nbytes)| {
+                let b = op_binding(kind);
+                crate::planner::OpTask {
+                    kind,
+                    bytes: nbytes,
+                    class: b.device,
+                    deps: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// Run the cost-driven planner against measured capabilities and store the result.
+    pub fn plan_placement(&mut self, caps: &[crate::planner::TargetCaps]) {
+        let tasks = self.op_tasks();
+        self.placement = crate::planner::plan_placement(&tasks, caps, false);
+    }
+
     pub fn format_report(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("architecture: {}\n", self.architecture));

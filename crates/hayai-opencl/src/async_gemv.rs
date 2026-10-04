@@ -299,6 +299,91 @@ impl OpenClEngine {
             label,
         })
     }
+
+    /// Fixed per-op launch overhead (seconds), measured with a tiny resident GEMV.
+    /// This is what dominates small-op devices and what the planner must price.
+    pub fn bench_launch_seconds(&self) -> Result<f64, OpenClError> {
+        let (m, n) = (64usize, 64usize);
+        let weights = vec![0u8; m * n * 4];
+        let mut wbuf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, weights.len(), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("bench weights: {e}")))?
+        };
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut wbuf, CL_BLOCKING, 0, &weights, &[])
+        }
+        .map_err(|e| OpenClError::ClError(format!("bench write: {e}")))?;
+        let input = vec![0.01f32; n];
+        let _ = self
+            .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
+            .wait()?;
+        let iters = 50usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = self
+                .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
+                .wait()?;
+        }
+        Ok(t0.elapsed().as_secs_f64() / iters as f64)
+    }
+
+    /// Effective GEMV bandwidth (bytes/s) with the weights **already resident** on the
+    /// device (no per-call upload) — the mirror/SVM-owned path the planner prices.
+    pub fn bench_resident_gemv_gbytes_s(&self, m: usize, n: usize) -> Result<f64, OpenClError> {
+        let nbytes = m * n * 4;
+        let weights = vec![0u8; nbytes];
+        let mut wbuf = unsafe {
+            Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, nbytes, ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("bench weights: {e}")))?
+        };
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut wbuf, CL_BLOCKING, 0, &weights, &[])
+        }
+        .map_err(|e| OpenClError::ClError(format!("bench write: {e}")))?;
+        let input = vec![0.01f32; n];
+        let _ = self
+            .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
+            .wait()?;
+        let iters = 10usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = self
+                .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
+                .wait()?;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        if dt <= 0.0 {
+            return Ok(0.0);
+        }
+        Ok((nbytes * iters) as f64 / dt / 1e9)
+    }
+
+    /// Host→device transfer bandwidth (bytes/s) for a non-blocking write of `bytes`.
+    pub fn bench_dma_gbytes_s(&self, bytes: usize) -> Result<f64, OpenClError> {
+        let data = vec![0u8; bytes];
+        let iters = 5usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut buf = unsafe {
+                Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, bytes, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("bench dma buf: {e}")))?
+            };
+            let ev = unsafe {
+                self.queue
+                    .enqueue_write_buffer(&mut buf, CL_NON_BLOCKING, 0, &data, &[])
+            }
+            .map_err(|e| OpenClError::ClError(format!("bench dma write: {e}")))?;
+            ev.wait()
+                .map_err(|e| OpenClError::ClError(format!("bench dma wait: {e}")))?;
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        if dt <= 0.0 {
+            return Ok(0.0);
+        }
+        Ok((bytes * iters) as f64 / dt / 1e9)
+    }
 }
 
 fn preferred_local_async(m: usize, max_work_group: usize) -> usize {

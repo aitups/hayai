@@ -95,7 +95,7 @@ pub(crate) fn prefill_hybrid_all(
                 let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
                 gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
                 for (t, x) in xs.iter_mut().enumerate() {
-                    full_attn_apply(gen, layer, base_pos + t, eps, &pack, x)?;
+                    full_attn_apply(gen, orch, layer, base_pos + t, eps, &pack, x)?;
                     ffn_apply(
                         gen,
                         orch,
@@ -594,7 +594,7 @@ fn run_full_attn_block(
     let slot = layer % 2;
     let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
     gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
-    full_attn_apply(gen, layer, pos, eps, &pack, x)?;
+    full_attn_apply(gen, orch, layer, pos, eps, &pack, x)?;
     gen.finish_ffn_unmap(orch, scratch, slot)?;
     ffn_apply(
         gen,
@@ -612,12 +612,14 @@ fn run_full_attn_block(
 /// Attention residual for one full-attention token: `x += Wo·attn(Q,K,V)`.
 pub(crate) fn full_attn_apply(
     gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
     layer: usize,
     pos: usize,
     eps: f32,
     pack: &hayai_model::LayerWeightPack,
     x: &mut [f32],
 ) -> Result<(), StreamInferError> {
+    use crate::exec_plan::{op_binding, LayerOpKind};
     let h = x.len();
     let t_attn = Instant::now();
     let mut xn = x.to_vec();
@@ -628,9 +630,11 @@ pub(crate) fn full_attn_apply(
     let mut q_full = vec![0.0f32; pack.wq.nrows];
     let mut k = vec![0.0f32; pack.wk.nrows];
     let mut v = vec![0.0f32; pack.wv.nrows];
-    pack.wq.gemv(&xn, &mut q_full)?;
-    pack.wk.gemv(&xn, &mut k)?;
-    pack.wv.gemv(&xn, &mut v)?;
+    // Attention GEMVs go through the orchestrator so the planner places them where
+    // they are fastest (they are not pinned to the CPU).
+    orch.execute_op(LayerOpKind::AttnQ, op_binding(LayerOpKind::AttnQ), &pack.wq, &xn, &mut q_full)?;
+    orch.execute_op(LayerOpKind::AttnK, op_binding(LayerOpKind::AttnK), &pack.wk, &xn, &mut k)?;
+    orch.execute_op(LayerOpKind::AttnV, op_binding(LayerOpKind::AttnV), &pack.wv, &xn, &mut v)?;
 
     // Per-layer dims from this block's tensors (9B/27B may differ from 4B meta defaults).
     let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
@@ -689,7 +693,13 @@ pub(crate) fn full_attn_apply(
     }
     attn_out.resize(wo_in, 0.0);
     let mut attn_proj = vec![0.0f32; h];
-    pack.wo.gemv(&attn_out, &mut attn_proj)?;
+    orch.execute_op(
+        LayerOpKind::AttnO,
+        op_binding(LayerOpKind::AttnO),
+        &pack.wo,
+        &attn_out,
+        &mut attn_proj,
+    )?;
     for i in 0..h {
         x[i] += attn_proj[i];
     }

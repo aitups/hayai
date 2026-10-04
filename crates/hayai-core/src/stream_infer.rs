@@ -2272,7 +2272,7 @@ impl StreamingGenerator {
                 .map(|e| e.device_info.supports_svm)
                 .unwrap_or(false);
             match crate::exec_plan::build_exec_plan(&self.catalog, n_gpu, svm) {
-                Ok(plan) => {
+                Ok(mut plan) => {
                     info!(
                         "ExecPlan arch={} units={} max_unit={}KiB ops={:?}",
                         plan.architecture,
@@ -2282,6 +2282,28 @@ impl StreamingGenerator {
                     );
                     for note in &plan.hw_notes {
                         debug!("ExecPlan HW: {note}");
+                    }
+                    // Cost-driven placement: measure the host + every device and plan
+                    // where each op runs. No static attn/FFN split survives this.
+                    if !orch.pool.is_empty() {
+                        let t_cal = Instant::now();
+                        let profile = crate::calibration::calibrate(
+                            &orch.pool,
+                            Some(self.catalog.path.as_path()),
+                        );
+                        let caps = crate::planner::caps_from_profile(&profile, u64::MAX);
+                        plan.plan_placement(&caps);
+                        info!(
+                            "Planner: {:.0} ms | host {:.1} GB/s disk {:.1} GB/s | makespan {:.2} ms/layer",
+                            t_cal.elapsed().as_secs_f64() * 1e3,
+                            profile.host_bw_gbytes_s,
+                            profile.disk_bw_gbytes_s,
+                            plan.placement.makespan_s * 1e3,
+                        );
+                        for (kind, target) in &plan.placement.assignments {
+                            debug!("placement: {kind:?} → {target}");
+                        }
+                        orch.set_placement(plan.placement.clone());
                     }
                     self.exec_plan = Some(std::sync::Arc::new(plan));
                 }

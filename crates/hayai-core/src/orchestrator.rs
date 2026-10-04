@@ -38,6 +38,9 @@ pub struct EngineOrchestrator {
     /// All OpenCL GPUs in the pool (empty ⇒ CPU-only).
     pub pool: OpenClDevicePool,
     pub model_config: ModelConfig,
+    /// Cost-driven op→device placement (from the planner). Empty ⇒ fall back to the
+    /// static capability classes in `op_bindings`.
+    placement: std::collections::BTreeMap<crate::exec_plan::LayerOpKind, crate::planner::ComputeTarget>,
 }
 
 // SAFETY: OpenCL handles are raw pointers; the orchestrator is always accessed
@@ -91,39 +94,25 @@ impl EngineOrchestrator {
                 }
             }
             ExecutionMode::Auto => {
-                // Small models lose on a discrete GPU: the per-layer FFN DMA (coarse
-                // SVM transfers) costs more than the CPU GEMV it saves. Only offload
-                // once the FFN is big enough (`hidden*ff`), overridable via
-                // `HAYAI_FFN_MIN_GPU_PARAMS`.
-                let ffn = model_config
-                    .hidden_size
-                    .saturating_mul(model_config.intermediate_size);
-                let min_gpu = std::env::var("HAYAI_FFN_MIN_GPU_PARAMS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(6_000_000usize);
-                if ffn < min_gpu {
-                    info!(
-                        "Auto: FFN hidden*ff={ffn} < {min_gpu} params → CPU (GPU DMA dominates for small models)"
-                    );
-                    (ExecutionMode::CpuOnly, OpenClDevicePool::empty())
-                } else {
-                    match OpenClDevicePool::try_init_all_gpus() {
-                        Ok(pool) => {
-                            info!(
-                                "OpenCL pool ({}): {}",
-                                pool.len(),
-                                pool.names().join(" | ")
-                            );
-                            (ExecutionMode::Auto, pool)
-                        }
-                        Err(e) => {
-                            info!(
-                                "No OpenCL GPU available ({}). Falling back to CPU-Only mode.",
-                                e
-                            );
-                            (ExecutionMode::CpuOnly, OpenClDevicePool::empty())
-                        }
+                // Cost-driven: always bring up every compute device. The planner decides
+                // per-op where work runs from the measured capabilities at session
+                // start. No model-size gate: a fast device must not be hidden behind a
+                // static threshold (`HAYAI_FFN_MIN_GPU_PARAMS` removed).
+                match OpenClDevicePool::try_init_all_gpus() {
+                    Ok(pool) => {
+                        info!(
+                            "OpenCL pool ({}): {}",
+                            pool.len(),
+                            pool.names().join(" | ")
+                        );
+                        (ExecutionMode::Auto, pool)
+                    }
+                    Err(e) => {
+                        info!(
+                            "No OpenCL GPU available ({}). Falling back to CPU-Only mode.",
+                            e
+                        );
+                        (ExecutionMode::CpuOnly, OpenClDevicePool::empty())
                     }
                 }
             }
@@ -133,7 +122,18 @@ impl EngineOrchestrator {
             mode: final_mode,
             pool,
             model_config,
+            placement: Default::default(),
         }
+    }
+
+    /// Install the cost-driven placement produced by the planner.
+    pub fn set_placement(&mut self, placement: crate::planner::Placement) {
+        self.placement = placement.assignments;
+    }
+
+    /// Where the planner wants `kind` to run, if anywhere.
+    pub fn placed_target(&self, kind: crate::exec_plan::LayerOpKind) -> Option<crate::planner::ComputeTarget> {
+        self.placement.get(&kind).copied()
     }
 
     /// Primary FFN/scratch device (first in pool).
@@ -226,12 +226,27 @@ impl EngineOrchestrator {
     /// hardcoded call sites.
     pub fn execute_op(
         &mut self,
-        _op: crate::LayerOpKind,
+        op: crate::exec_plan::LayerOpKind,
         binding: crate::exec_plan::OpBinding,
         matrix: &QuantMatrix,
         input: &[f32],
         output: &mut [f32],
     ) -> Result<(), OrchestratorError> {
+        // The planner's cost-driven placement wins when present: it may send a GEMV op
+        // to *any* device (or keep it on the host), independent of the static class.
+        match self.placement.get(&op).copied() {
+            Some(crate::planner::ComputeTarget::Cpu) => {
+                return matrix
+                    .gemv(input, output)
+                    .map_err(|e| OrchestratorError::Msg(e.to_string()));
+            }
+            Some(crate::planner::ComputeTarget::Device(i)) => {
+                if self.pool.engines.get(i).is_some() {
+                    return self.gpu_gemv_indexed(i, matrix, input, output);
+                }
+            }
+            None => {}
+        }
         match binding.device {
             crate::exec_plan::OpDevice::GpuAsync => self.execute_quant_gemv(matrix, input, output),
             crate::exec_plan::OpDevice::Cpu | crate::exec_plan::OpDevice::HostRowRead => {
@@ -241,6 +256,20 @@ impl EngineOrchestrator {
             }
             crate::exec_plan::OpDevice::Discard => Ok(()),
         }
+    }
+
+    /// GEMV on a specific pool device, chosen by the planner's placement.
+    fn gpu_gemv_indexed(
+        &mut self,
+        idx: usize,
+        matrix: &QuantMatrix,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), OrchestratorError> {
+        let cl = self.pool.engines.get(idx).ok_or_else(|| {
+            OrchestratorError::Msg(format!("placed device {idx} not in pool"))
+        })?;
+        self.gpu_gemv(cl, matrix, input, output)
     }
 
     fn gpu_gemv(

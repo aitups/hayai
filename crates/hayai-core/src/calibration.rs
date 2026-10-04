@@ -21,9 +21,17 @@ use std::time::Instant;
 pub struct DeviceProfile {
     pub name: String,
     pub kind: String,
+    /// Index into the OpenCL pool (the planner's `ComputeTarget::Device(i)`).
+    pub device_index: usize,
     pub global_mem_bytes: u64,
     /// Effective streaming GEMV bandwidth (bytes/s) including host→device upload.
     pub effective_gemv_gbytes_s: f64,
+    /// Effective GEMV bandwidth (bytes/s) with weights already resident on the device.
+    pub resident_gemv_gbytes_s: f64,
+    /// Fixed per-op launch overhead (µs).
+    pub launch_us: f64,
+    /// Host→device transfer bandwidth (bytes/s).
+    pub dma_gbytes_s: f64,
 }
 
 /// Full hardware profile for one host.
@@ -221,13 +229,25 @@ pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile
         .and_then(|p| measure_disk_bandwidth_gbytes_s(p).ok())
         .unwrap_or(0.0);
     let mut devices = Vec::new();
-    for e in &pool.engines {
+    for (idx, e) in pool.engines.iter().enumerate() {
         let bw = measure_device_gemv_gbytes_s(e).unwrap_or(0.0);
+        let resident_bw = e.bench_resident_gemv_gbytes_s(2048, 2048).unwrap_or(bw);
+        let launch_us = e
+            .bench_launch_seconds()
+            .map(|s| s * 1e6)
+            .unwrap_or(0.0);
+        let dma_bw = e
+            .bench_dma_gbytes_s(16 * 1024 * 1024)
+            .unwrap_or(0.0);
         devices.push(DeviceProfile {
             name: e.device_info.device_name.clone(),
             kind: format!("{:?}", e.device_info.device_kind),
+            device_index: idx,
             global_mem_bytes: e.device_info.global_mem_size,
             effective_gemv_gbytes_s: bw,
+            resident_gemv_gbytes_s: resident_bw,
+            launch_us,
+            dma_gbytes_s: dma_bw,
         });
     }
     HwProfile {
