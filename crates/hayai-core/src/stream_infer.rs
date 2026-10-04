@@ -196,7 +196,6 @@ pub(crate) struct LayerNorms {
 /// Dense FFN biases (`ffn_gate/up/down.bias`), preloaded once per model.
 #[derive(Clone, Default)]
 pub(crate) struct LayerFfnBias {
-    pub(crate) gate: Option<Vec<f32>>,
     pub(crate) up: Option<Vec<f32>>,
     pub(crate) down: Option<Vec<f32>>,
 }
@@ -514,11 +513,6 @@ pub struct StreamingGenerator {
     /// proportional / Llama-3 NTK-by-parts baked by the converter) or LongRoPE
     /// `rope_factors_{short,long}` selected by sequence length.
     pub(crate) rope_freq_factors: Option<Vec<f32>>,
-    /// Gemma4 per-layer-embedding projection (`per_layer_model_proj.weight`): a
-    /// single global tensor, loaded once on first use instead of once per token.
-    pub(crate) ple_model_proj: Option<QuantMatrix>,
-    /// Gemma4 PLE projection norm (`per_layer_proj_norm.weight`), loaded once.
-    pub(crate) ple_proj_norm: Option<Vec<f32>>,
     /// Adaptive memory strategy for the resident/macro-chunk window.
     pub memory_strategy: MemoryStrategy,
     /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
@@ -808,7 +802,6 @@ impl StreamingGenerator {
         }
         let ffn_bias: Vec<LayerFfnBias> = (0..n_slots)
             .map(|l| LayerFfnBias {
-                gate: catalog.dequant_f32(&format!("blk.{l}.ffn_gate.bias")).ok(),
                 up: catalog.dequant_f32(&format!("blk.{l}.ffn_up.bias")).ok(),
                 down: catalog.dequant_f32(&format!("blk.{l}.ffn_down.bias")).ok(),
             })
@@ -1142,8 +1135,6 @@ impl StreamingGenerator {
             rope_freq_factors: gemma_rope_freqs.clone(),
             gemma_rope_freqs,
             longrope,
-            ple_model_proj: None,
-            ple_proj_norm: None,
             moe_non_expert: None,
             moe_non_expert_bytes: 0,
             moe_non_expert_cap: std::env::var("HAYAI_MOE_NONEXPERT_MB")

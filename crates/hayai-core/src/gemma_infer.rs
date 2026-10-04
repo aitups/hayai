@@ -32,7 +32,6 @@ pub(crate) fn build_layer_kv_caches(
 
 struct GemmaMeta {
     head_full: usize,
-    head_swa: usize,
     rope_full: f32,
     rope_swa: f32,
     swa_window: usize,
@@ -125,7 +124,6 @@ impl GemmaMeta {
         }
         Ok(Self {
             head_full,
-            head_swa,
             rope_full,
             rope_swa,
             swa_window,

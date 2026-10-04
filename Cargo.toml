@@ -14,7 +14,6 @@ members = [
 [workspace.package]
 version = "0.2.3"
 edition = "2021"
-authors = ["Hayai Team"]
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -46,4 +45,3 @@ hayai-opencl = { path = "crates/hayai-opencl" }
 hayai-kernels = { path = "crates/hayai-kernels" }
 hayai-cpu = { path = "crates/hayai-cpu" }
 hayai-model = { path = "crates/hayai-model" }
-hayai-api = { path = "crates/hayai-api" }
