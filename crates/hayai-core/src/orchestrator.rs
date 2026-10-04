@@ -1,7 +1,7 @@
 use hayai_cpu::cpu_lut_matmul_q4;
 use hayai_model::{GgmlType, ModelConfig, QuantMatrix};
 use hayai_opencl::{
-    discover_opencl_devices, OpenClDevicePool, OpenClEngine, OpenClError, PendingGemv,
+    discover_opencl_devices, Kernel, OpenClDevicePool, OpenClEngine, OpenClError, PendingGemv,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -47,6 +47,36 @@ pub struct EngineOrchestrator {
 // behind a `Mutex` (API server serializes requests per model), so the underlying
 // OpenCL objects are never used concurrently. `Sync` comes from `Arc<Mutex<_>>`.
 unsafe impl Send for EngineOrchestrator {}
+
+/// Map a quant type to its OpenCL GEMV kernel + debug label. `None` = no kernel,
+/// which is a hard failure on a GPU host (never a silent CPU fallback).
+fn gemv_kernel(cl: &OpenClEngine, t: GgmlType) -> Option<(&Kernel, &'static str)> {
+    Some(match t {
+        GgmlType::Q4_0 => (&cl.gemv_q4_0, "q4_0"),
+        GgmlType::Q4_1 => (&cl.gemv_q4_1, "q4_1"),
+        GgmlType::Q8_0 => (&cl.gemv_q8_0, "q8_0"),
+        GgmlType::Q5_0 => (&cl.gemv_q5_0, "q5_0"),
+        GgmlType::Q5_1 => (&cl.gemv_q5_1, "q5_1"),
+        GgmlType::Q2_K => (&cl.gemv_q2_k, "q2_k"),
+        GgmlType::Q3_K => (&cl.gemv_q3_k, "q3_k"),
+        GgmlType::Q4_K => (&cl.gemv_q4_k, "q4_k"),
+        GgmlType::Q5_K => (&cl.gemv_q5_k, "q5_k"),
+        GgmlType::Q6_K => (&cl.gemv_q6_k, "q6_k"),
+        GgmlType::IQ4_NL => (&cl.gemv_iq4_nl, "iq4_nl"),
+        GgmlType::IQ4_XS => (&cl.gemv_iq4_xs, "iq4_xs"),
+        GgmlType::IQ3_XXS => (&cl.gemv_iq3_xxs, "iq3_xxs"),
+        GgmlType::IQ3_S => (&cl.gemv_iq3_s, "iq3_s"),
+        GgmlType::IQ2_XXS => (&cl.gemv_iq2_xxs, "iq2_xxs"),
+        GgmlType::IQ2_XS => (&cl.gemv_iq2_xs, "iq2_xs"),
+        GgmlType::IQ2_S => (&cl.gemv_iq2_s, "iq2_s"),
+        GgmlType::F32 => (&cl.gemv_f32, "f32"),
+        GgmlType::F16 => (&cl.gemv_f16, "f16"),
+        GgmlType::BF16 => (&cl.gemv_bf16, "bf16"),
+        GgmlType::Q8_1 => (&cl.gemv_q8_1, "q8_1"),
+        GgmlType::Q8_K => (&cl.gemv_q8_k, "q8_k"),
+        _ => return None,
+    })
+}
 
 impl EngineOrchestrator {
     pub fn new(requested_mode: ExecutionMode, model_config: ModelConfig) -> Self {
@@ -281,161 +311,25 @@ impl EngineOrchestrator {
     ) -> Result<(), OrchestratorError> {
         cl.ffn_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let m = matrix.nrows;
-        let n = matrix.ncols;
-        let w = matrix.data();
-        let result = match matrix.ggml_type {
-            GgmlType::Q4_0 => cl.ggml_gemv_q4_0(m, n, w, input, output),
-            GgmlType::Q4_1 => cl.ggml_gemv_q4_1(m, n, w, input, output),
-            GgmlType::Q8_0 => cl.ggml_gemv_q8_0(m, n, w, input, output),
-            GgmlType::Q5_0 => cl.ggml_gemv_async(
-                &cl.gemv_q5_0,
-                "q5_0",
-                m,
-                n,
-                w,
-                input,
-            )
-            .and_then(|p| {
-                let v = p.wait()?;
-                output.copy_from_slice(&v);
-                Ok(())
-            }),
-            GgmlType::Q5_1 => cl
-                .ggml_gemv_async(&cl.gemv_q5_1, "q5_1", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q2_K => cl
-                .ggml_gemv_async(&cl.gemv_q2_k, "q2_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q3_K => cl
-                .ggml_gemv_async(&cl.gemv_q3_k, "q3_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q4_K => cl
-                .ggml_gemv_async(&cl.gemv_q4_k, "q4_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q5_K => cl
-                .ggml_gemv_async(&cl.gemv_q5_k, "q5_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q6_K => cl
-                .ggml_gemv_async(&cl.gemv_q6_k, "q6_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ4_NL => cl
-                .ggml_gemv_async(&cl.gemv_iq4_nl, "iq4_nl", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ4_XS => cl
-                .ggml_gemv_async(&cl.gemv_iq4_xs, "iq4_xs", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ3_XXS => cl
-                .ggml_gemv_async(&cl.gemv_iq3_xxs, "iq3_xxs", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ3_S => cl
-                .ggml_gemv_async(&cl.gemv_iq3_s, "iq3_s", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ2_XXS => cl
-                .ggml_gemv_async(&cl.gemv_iq2_xxs, "iq2_xxs", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ2_XS => cl
-                .ggml_gemv_async(&cl.gemv_iq2_xs, "iq2_xs", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::IQ2_S => cl
-                .ggml_gemv_async(&cl.gemv_iq2_s, "iq2_s", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::F32 => cl
-                .ggml_gemv_async(&cl.gemv_f32, "f32", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::F16 => cl
-                .ggml_gemv_async(&cl.gemv_f16, "f16", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            // BF16 / Q8_1 / Q8_K now have OpenCL kernels (async).
-            GgmlType::BF16 => cl
-                .ggml_gemv_async(&cl.gemv_bf16, "bf16", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q8_1 => cl
-                .ggml_gemv_async(&cl.gemv_q8_1, "q8_1", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            GgmlType::Q8_K => cl
-                .ggml_gemv_async(&cl.gemv_q8_k, "q8_k", m, n, w, input)
-                .and_then(|p| {
-                    let v = p.wait()?;
-                    output.copy_from_slice(&v);
-                    Ok(())
-                }),
-            other => {
-                return Err(OrchestratorError::Msg(format!(
-                    "OpenCL GEMV missing for {other:?} — GPU present, CPU fallback disabled (PRD). \
-                     Need OpenCL kernel for this quant."
-                )));
-            }
-        };
-        result.map_err(OrchestratorError::from)
+        let (kernel, label) = gemv_kernel(cl, matrix.ggml_type).ok_or_else(|| {
+            OrchestratorError::Msg(format!(
+                "OpenCL GEMV missing for {:?} — GPU present, CPU fallback disabled (PRD). \
+                 Need an OpenCL kernel for this quant.",
+                matrix.ggml_type
+            ))
+        })?;
+        // One unified synchronous dispatch reusing the engine's persistent device
+        // workspace: no per-op clCreateBuffer/destroy and no per-op weights re-upload.
+        cl.ggml_gemv_dispatch(
+            kernel,
+            label,
+            matrix.nrows,
+            matrix.ncols,
+            matrix.data(),
+            input,
+            output,
+        )
+        .map_err(OrchestratorError::from)
     }
 
     /// Begin async GEMV on a specific pool device (host weight bytes).

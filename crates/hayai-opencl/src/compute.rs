@@ -258,7 +258,7 @@ impl OpenClEngine {
         self.ggml_gemv_dispatch(&self.gemv_q5_k, "q5_k", m, n, weights, input, output)
     }
 
-    fn ggml_gemv_dispatch(
+    pub fn ggml_gemv_dispatch(
         &self,
         kernel: &opencl3::kernel::Kernel,
         label: &str,
