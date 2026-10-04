@@ -5,6 +5,17 @@ use opencl3::types::{cl_float, cl_int, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
 use std::ptr;
 use tracing::debug;
 
+/// Persistent device buffers for [`OpenClEngine::ggml_gemv_dispatch`].
+#[derive(Default)]
+pub struct GemvSyncWorkspace {
+    weights: Option<Buffer<cl_uchar>>,
+    input: Option<Buffer<cl_float>>,
+    output: Option<Buffer<cl_float>>,
+    cap_w: usize,
+    cap_n: usize,
+    cap_m: usize,
+}
+
 impl OpenClEngine {
     /// Run Q4 LUT MatMul on the active OpenCL device and write results into `output`.
     ///
@@ -264,31 +275,50 @@ impl OpenClEngine {
         let n_i = n as cl_int;
         let off_i = 0i64; // cl_long (kernel arg)
 
-        let mut weights_buf = unsafe {
-            Buffer::<cl_uchar>::create(
-                &self.context,
-                CL_MEM_READ_ONLY,
-                weights.len(),
-                ptr::null_mut(),
-            )
-            .map_err(|e| OpenClError::ClError(format!("weights buffer: {e}")))?
-        };
-        let mut input_buf = unsafe {
-            Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, n, ptr::null_mut())
-                .map_err(|e| OpenClError::ClError(format!("input buffer: {e}")))?
-        };
-        let output_buf = unsafe {
-            Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, m, ptr::null_mut())
-                .map_err(|e| OpenClError::ClError(format!("output buffer: {e}")))?
-        };
-
-        unsafe {
-            self.queue
-                .enqueue_write_buffer(&mut weights_buf, CL_BLOCKING, 0, weights, &[])
-                .map_err(|e| OpenClError::ClError(format!("write weights: {e}")))?;
-            self.queue
-                .enqueue_write_buffer(&mut input_buf, CL_BLOCKING, 0, input, &[])
-                .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
+        let mut ws = self
+            .sync_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("gemv workspace poisoned".into()))?;
+        // Grow the persistent buffers only when a larger op arrives; otherwise reuse.
+        if ws.cap_w < weights.len().max(1) {
+            let cap = weights.len().max(1);
+            ws.weights = Some(unsafe {
+                Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, cap, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("weights buffer: {e}")))?
+            });
+            ws.cap_w = cap;
+        }
+        if ws.cap_n < n.max(1) {
+            let cap = n.max(1);
+            ws.input = Some(unsafe {
+                Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, cap, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("input buffer: {e}")))?
+            });
+            ws.cap_n = cap;
+        }
+        if ws.cap_m < m.max(1) {
+            let cap = m.max(1);
+            ws.output = Some(unsafe {
+                Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, cap, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("output buffer: {e}")))?
+            });
+            ws.cap_m = cap;
+        }
+        {
+            let wbuf = ws.weights.as_mut().unwrap();
+            unsafe {
+                self.queue
+                    .enqueue_write_buffer(wbuf, CL_BLOCKING, 0, weights, &[])
+                    .map_err(|e| OpenClError::ClError(format!("write weights: {e}")))?;
+            }
+        }
+        {
+            let ibuf = ws.input.as_mut().unwrap();
+            unsafe {
+                self.queue
+                    .enqueue_write_buffer(ibuf, CL_BLOCKING, 0, input, &[])
+                    .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
+            }
         }
 
         let local = preferred_local_size(m, self.device_info.max_work_group_size);
@@ -301,9 +331,9 @@ impl OpenClEngine {
                 .set_arg(&m_i)
                 .set_arg(&n_i)
                 .set_arg(&off_i)
-                .set_arg(&weights_buf)
-                .set_arg(&input_buf)
-                .set_arg(&output_buf)
+                .set_arg(ws.weights.as_ref().unwrap())
+                .set_arg(ws.input.as_ref().unwrap())
+                .set_arg(ws.output.as_ref().unwrap())
                 .set_arg_local_buffer(local_bytes)
                 .set_global_work_size(global)
                 .set_local_work_size(local)
@@ -314,7 +344,13 @@ impl OpenClEngine {
         let wait = [kernel_event.get()];
         unsafe {
             self.queue
-                .enqueue_read_buffer(&output_buf, CL_BLOCKING, 0, output, &wait)
+                .enqueue_read_buffer(
+                    ws.output.as_ref().unwrap(),
+                    CL_BLOCKING,
+                    0,
+                    output,
+                    &wait,
+                )
                 .map_err(|e| OpenClError::ClError(format!("read output: {e}")))?;
         }
         debug!(

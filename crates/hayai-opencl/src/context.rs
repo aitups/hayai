@@ -59,6 +59,9 @@ pub struct OpenClEngine {
     pub dequant_q4_k_to_f32: Kernel,
     /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
     pub ffn_calls: std::sync::atomic::AtomicU64,
+    /// Reusable device buffers for the synchronous GEMV path (no per-call
+    /// `clCreateBuffer`/destroy). Alias-safe because that path waits before returning.
+    pub sync_ws: std::sync::Mutex<crate::compute::GemvSyncWorkspace>,
 }
 
 impl OpenClEngine {
@@ -214,6 +217,7 @@ impl OpenClEngine {
             spmm_adj_batched_q4,
             dequant_q4_k_to_f32,
             ffn_calls: std::sync::atomic::AtomicU64::new(0),
+            sync_ws: std::sync::Mutex::new(Default::default()),
         })
     }
 
