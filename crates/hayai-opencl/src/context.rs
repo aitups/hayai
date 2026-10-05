@@ -57,6 +57,8 @@ pub struct OpenClEngine {
     pub spmm_adj_batched_q4: Kernel,
     /// Dequant Q4_K -> F32 batcheado (encadenado con `spmm_adj_batched`).
     pub dequant_q4_k_to_f32: Kernel,
+    /// Single-query attention decode with online softmax over a device KV cache.
+    pub attn_decode: Kernel,
     /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
     pub ffn_calls: std::sync::atomic::AtomicU64,
     /// Reusable device buffers for the synchronous GEMV path (no per-call
@@ -178,6 +180,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("spmm_adj_batched_q4 kernel: {}", e)))?;
         let dequant_q4_k_to_f32 = Kernel::create(&program, "dequant_q4_k_to_f32")
             .map_err(|e| OpenClError::ClError(format!("dequant_q4_k_to_f32 kernel: {}", e)))?;
+        let attn_decode = Kernel::create(&program, "hayai_attn_decode")
+            .map_err(|e| OpenClError::ClError(format!("attn_decode kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -216,6 +220,7 @@ impl OpenClEngine {
             spmm_adj_batched,
             spmm_adj_batched_q4,
             dequant_q4_k_to_f32,
+            attn_decode,
             ffn_calls: std::sync::atomic::AtomicU64::new(0),
             sync_ws: std::sync::Mutex::new(Default::default()),
         })

@@ -1,4 +1,5 @@
 pub mod async_gemv;
+pub mod attn;
 pub mod compute;
 pub mod context;
 pub mod device;
@@ -7,6 +8,7 @@ pub mod memory;
 pub mod pool;
 
 pub use async_gemv::PendingGemv;
+pub use attn::DeviceKvCache;
 pub use compute::GgmlWeightBind;
 pub use context::{OpenClEngine, OpenClError};
 pub use device::{discover_opencl_devices, DeviceKind, OpenClDeviceInfo};

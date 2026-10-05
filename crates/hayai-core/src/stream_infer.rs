@@ -550,6 +550,9 @@ pub struct StreamingGenerator {
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
     /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
     pub(crate) moe_router_bias: Option<Vec<Option<Vec<f32>>>>,
+    /// Optional per-layer FP32 KV caches resident on a device, used by the OpenCL
+    /// attention decode kernel (`HAYAI_ATTN_GPU=1`). `None` keeps the host INT8 path.
+    pub(crate) device_kv: Option<Vec<Option<hayai_opencl::DeviceKvCache>>>,
     /// MLA attention config (DeepSeek-V2/V3, Kimi); `None` otherwise.
     pub(crate) mla: Option<MlaMeta>,
     /// MLA compressed KV caches (one per layer).
@@ -1152,6 +1155,7 @@ impl StreamingGenerator {
             deltanet_states: None,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
+            device_kv: None,
             mla,
             mla_kv,
             mla_kv_a_norm,

@@ -740,15 +740,44 @@ pub(crate) fn full_attn_apply(
         )));
     }
     let mut attn_out = vec![0.0f32; q_dim];
-    attention_decode_step(
-        &layer_cfg,
-        &mut gen.kv[layer],
-        &mut q,
-        &mut k,
-        &v,
-        pos,
-        &mut attn_out,
-    );
+    // Opt-in device attention: append K/V to a device FP32 cache and run the OpenCL
+    // online-softmax kernel. Default keeps the host INT8 path (bit-identical to before).
+    let mut used_gpu = false;
+    if std::env::var_os("HAYAI_ATTN_GPU").is_some() && pos < 8192 {
+        if let Some(eng) = orch.opencl_engine() {
+            let max_seq = 8192usize;
+            if gen.device_kv.is_none() {
+                gen.device_kv = Some((0..gen.config.num_layers).map(|_| None).collect());
+            }
+            let slots = gen.device_kv.as_mut().unwrap();
+            if slots[layer].is_none() {
+                let c = hayai_opencl::DeviceKvCache::new(eng, n_kv, head_dim, max_seq)
+                    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+                slots[layer] = Some(c);
+            }
+            {
+                let cache = slots[layer].as_mut().unwrap();
+                eng.kv_append(cache, pos, &k, &v)
+                    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            }
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let cache = slots[layer].as_ref().unwrap();
+            eng.attn_decode(&q, cache, &mut attn_out, n_heads, pos + 1, scale)
+                .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            used_gpu = true;
+        }
+    }
+    if !used_gpu {
+        attention_decode_step(
+            &layer_cfg,
+            &mut gen.kv[layer],
+            &mut q,
+            &mut k,
+            &v,
+            pos,
+            &mut attn_out,
+        );
+    }
     if let Some(ref g) = fused_gate {
         for i in 0..attn_out.len().min(g.len()) {
             attn_out[i] *= 1.0 / (1.0 + (-g[i]).exp());

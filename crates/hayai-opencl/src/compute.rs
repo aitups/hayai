@@ -8,12 +8,12 @@ use tracing::debug;
 /// Persistent device buffers for [`OpenClEngine::ggml_gemv_dispatch`].
 #[derive(Default)]
 pub struct GemvSyncWorkspace {
-    weights: Option<Buffer<cl_uchar>>,
-    input: Option<Buffer<cl_float>>,
-    output: Option<Buffer<cl_float>>,
-    cap_w: usize,
-    cap_n: usize,
-    cap_m: usize,
+    pub(crate) weights: Option<Buffer<cl_uchar>>,
+    pub(crate) input: Option<Buffer<cl_float>>,
+    pub(crate) output: Option<Buffer<cl_float>>,
+    pub(crate) cap_w: usize,
+    pub(crate) cap_n: usize,
+    pub(crate) cap_m: usize,
 }
 
 /// Weight source for [`OpenClEngine::ggml_gemv_dispatch_bound`]: a device mirror buffer
