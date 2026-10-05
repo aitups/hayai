@@ -12,6 +12,9 @@ pub const SPMM_CSR_CL: &str = include_str!("../kernels/spmm_csr.cl");
 /// OpenCL C source for single-query attention decode (online softmax, GQA).
 pub const ATTN_DECODE_CL: &str = include_str!("../kernels/attn_decode.cl");
 
+/// OpenCL C source for the DeltaNet recurrent state update (KV-heads, decode step).
+pub const DELTANET_STEP_CL: &str = include_str!("../kernels/deltanet_step.cl");
+
 /// Combined program source built by the OpenCL engine.
 pub fn opencl_program_source() -> String {
     let mut src = String::with_capacity(
@@ -19,6 +22,7 @@ pub fn opencl_program_source() -> String {
             + GGML_GEMV_Q4_CL.len()
             + SPMM_CSR_CL.len()
             + ATTN_DECODE_CL.len()
+            + DELTANET_STEP_CL.len()
             + 16,
     );
     src.push_str(LUT_MATMUL_CL);
@@ -28,6 +32,8 @@ pub fn opencl_program_source() -> String {
     src.push_str(SPMM_CSR_CL);
     src.push('\n');
     src.push_str(ATTN_DECODE_CL);
+    src.push('\n');
+    src.push_str(DELTANET_STEP_CL);
     src
 }
 

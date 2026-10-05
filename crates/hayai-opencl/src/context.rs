@@ -59,6 +59,8 @@ pub struct OpenClEngine {
     pub dequant_q4_k_to_f32: Kernel,
     /// Single-query attention decode with online softmax over a device KV cache.
     pub attn_decode: Kernel,
+    /// DeltaNet recurrent state update (one decode step).
+    pub deltanet_step: Kernel,
     /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
     pub ffn_calls: std::sync::atomic::AtomicU64,
     /// Reusable device buffers for the synchronous GEMV path (no per-call
@@ -182,6 +184,8 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("dequant_q4_k_to_f32 kernel: {}", e)))?;
         let attn_decode = Kernel::create(&program, "hayai_attn_decode")
             .map_err(|e| OpenClError::ClError(format!("attn_decode kernel: {}", e)))?;
+        let deltanet_step = Kernel::create(&program, "hayai_deltanet_step")
+            .map_err(|e| OpenClError::ClError(format!("deltanet_step kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -221,6 +225,7 @@ impl OpenClEngine {
             spmm_adj_batched_q4,
             dequant_q4_k_to_f32,
             attn_decode,
+            deltanet_step,
             ffn_calls: std::sync::atomic::AtomicU64::new(0),
             sync_ws: std::sync::Mutex::new(Default::default()),
         })

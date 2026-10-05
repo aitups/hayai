@@ -8,7 +8,7 @@ pub mod memory;
 pub mod pool;
 
 pub use async_gemv::PendingGemv;
-pub use attn::DeviceKvCache;
+pub use attn::{DeviceDeltanetState, DeviceKvCache};
 pub use compute::GgmlWeightBind;
 pub use context::{OpenClEngine, OpenClError};
 pub use device::{discover_opencl_devices, DeviceKind, OpenClDeviceInfo};

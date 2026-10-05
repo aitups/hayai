@@ -168,6 +168,129 @@ impl OpenClEngine {
     }
 }
 
+/// Recurrent DeltaNet state on the device: `[n_v_heads * h_k * h_v]` f32, per layer.
+pub struct DeviceDeltanetState {
+    s: Buffer<cl_float>,
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+    pub h_k: usize,
+    pub h_v: usize,
+}
+
+impl DeviceDeltanetState {
+    pub fn new(
+        eng: &OpenClEngine,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        h_k: usize,
+        h_v: usize,
+    ) -> Result<Self, OpenClError> {
+        let n = (n_v_heads * h_k * h_v).max(1);
+        let s = unsafe {
+            Buffer::<cl_float>::create(&eng.context, CL_MEM_READ_WRITE, n, ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("deltanet state buffer: {e}")))?
+        };
+        Ok(Self {
+            s,
+            n_k_heads,
+            n_v_heads,
+            h_k,
+            h_v,
+        })
+    }
+
+    /// Reset the recurrent state to zero.
+    pub fn zero(&mut self, eng: &OpenClEngine) -> Result<(), OpenClError> {
+        let z = vec![0.0f32; (self.n_v_heads * self.h_k * self.h_v).max(1)];
+        unsafe {
+            eng.queue
+                .enqueue_write_buffer(&mut self.s, CL_BLOCKING, 0, &z, &[])
+        }
+        .map_err(|e| OpenClError::ClError(format!("deltanet zero: {e}")))?;
+        Ok(())
+    }
+}
+
+impl OpenClEngine {
+    /// One DeltaNet decode step: `decay`/`beta` are the per-value-head scalars the host
+    /// derived; the device `state` is updated in place and `out` (`n_v_heads * h_v`) is
+    /// returned. `q` is post L2-norm/q-scale, `kk`/`v` are the post-conv key/value.
+    pub fn deltanet_step(
+        &self,
+        q: &[f32],
+        kk: &[f32],
+        v: &[f32],
+        decay: &[f32],
+        beta: &[f32],
+        state: &DeviceDeltanetState,
+        out: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        let (n_kh, n_vh, h_k, h_v) = (
+            state.n_k_heads,
+            state.n_v_heads,
+            state.h_k,
+            state.h_v,
+        );
+        if q.len() != n_kh * h_k
+            || kk.len() != n_kh * h_k
+            || v.len() != n_vh * h_v
+            || decay.len() != n_vh
+            || beta.len() != n_vh
+            || out.len() != n_vh * h_v
+        {
+            return Err(OpenClError::ClError("deltanet_step shape mismatch".into()));
+        }
+        let mk = |len: usize, data: &[f32]| -> Result<Buffer<cl_float>, OpenClError> {
+            let mut b = unsafe {
+                Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, len.max(1), ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("deltanet buf: {e}")))?
+            };
+            unsafe {
+                self.queue
+                    .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, data, &[])
+                    .map_err(|e| OpenClError::ClError(format!("deltanet write: {e}")))?;
+            }
+            Ok(b)
+        };
+        let bq = mk(q.len(), q)?;
+        let bkk = mk(kk.len(), kk)?;
+        let bv = mk(v.len(), v)?;
+        let bdecay = mk(decay.len(), decay)?;
+        let bbeta = mk(beta.len(), beta)?;
+        let mut bout = unsafe {
+            Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, out.len().max(1), ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("deltanet out: {e}")))?
+        };
+        let (n_kh_i, n_vh_i, h_k_i, h_v_i) =
+            (n_kh as cl_int, n_vh as cl_int, h_k as cl_int, h_v as cl_int);
+        use opencl3::kernel::ExecuteKernel;
+        let ev = unsafe {
+            let mut exec = ExecuteKernel::new(&self.deltanet_step);
+            exec.set_arg(&bq)
+                .set_arg(&bkk)
+                .set_arg(&bv)
+                .set_arg(&bdecay)
+                .set_arg(&bbeta)
+                .set_arg(&state.s)
+                .set_arg(&bout)
+                .set_arg(&n_kh_i)
+                .set_arg(&n_vh_i)
+                .set_arg(&h_k_i)
+                .set_arg(&h_v_i)
+                .set_global_work_size(n_vh * h_v)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue deltanet_step: {e}")))?
+        };
+        let wait = [ev.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(&bout, CL_BLOCKING, 0, out, &wait)
+                .map_err(|e| OpenClError::ClError(format!("deltanet read out: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +348,59 @@ mod tests {
             .unwrap();
         for (a, b) in out.iter().zip(ref_out.iter()) {
             assert!((a - b).abs() < 1e-4, "attn mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn deltanet_step_matches_reference() {
+        let Ok(eng) = OpenClEngine::try_init_any() else {
+            eprintln!("deltanet parity: SKIP (no OpenCL device)");
+            return;
+        };
+        let (n_k, n_v, h_k, h_v) = (2usize, 4usize, 4usize, 3usize);
+        let q: Vec<f32> = (0..n_k * h_k).map(|i| ((i % 5) as f32 - 2.0) * 0.1).collect();
+        let kk: Vec<f32> = (0..n_k * h_k).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let v: Vec<f32> = (0..n_v * h_v).map(|i| ((i % 6) as f32 - 3.0) * 0.2).collect();
+        let decay: Vec<f32> = vec![0.9, 0.8, 0.7, 0.6];
+        let beta: Vec<f32> = vec![0.5, 0.4, 0.3, 0.2];
+
+        // Reference: two steps from a zero state.
+        let mut ref_state = vec![0.0f32; n_v * h_k * h_v];
+        let step = |state: &mut [f32], out: &mut [f32]| {
+            for vh in 0..n_v {
+                let kh = vh % n_k;
+                let s = &mut state[vh * h_k * h_v..(vh + 1) * h_k * h_v];
+                for vd in 0..h_v {
+                    for ki in 0..h_k {
+                        s[ki * h_v + vd] *= decay[vh];
+                    }
+                    let mut kv_mem = 0.0f32;
+                    for ki in 0..h_k {
+                        kv_mem += s[ki * h_v + vd] * kk[kh * h_k + ki];
+                    }
+                    let delta = (v[vh * h_v + vd] - kv_mem) * beta[vh];
+                    let mut o = 0.0f32;
+                    for ki in 0..h_k {
+                        s[ki * h_v + vd] += kk[kh * h_k + ki] * delta;
+                        o += s[ki * h_v + vd] * q[kh * h_k + ki];
+                    }
+                    out[vh * h_v + vd] = o;
+                }
+            }
+        };
+        let mut ref_out = vec![0.0f32; n_v * h_v];
+        step(&mut ref_state, &mut ref_out); // step 1
+        step(&mut ref_state, &mut ref_out); // step 2 (state carries)
+
+        let mut dev = DeviceDeltanetState::new(&eng, n_k, n_v, h_k, h_v).unwrap();
+        dev.zero(&eng).unwrap();
+        let mut out = vec![0.0f32; n_v * h_v];
+        eng.deltanet_step(&q, &kk, &v, &decay, &beta, &dev, &mut out)
+            .unwrap();
+        eng.deltanet_step(&q, &kk, &v, &decay, &beta, &dev, &mut out)
+            .unwrap();
+        for (a, b) in out.iter().zip(ref_out.iter()) {
+            assert!((a - b).abs() < 1e-4, "deltanet mismatch: {a} vs {b}");
         }
     }
 }
