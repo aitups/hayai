@@ -262,5 +262,16 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   opt-in `HAYAI_ATTN_GPU=1` (the default keeps the host INT8 path bit-identical). Known
   gap: the host step also applies RoPE, so the opt-in GPU path still needs the host RoPE
   before the kernel — it is experimental until validated on the T4.
+- **OpenCL DeltaNet kernel** (`hayai-kernels/kernels/deltanet_step.cl`,
+  `hayai_deltanet_step`) + `DeviceDeltanetState`: one work-item per (value head, value
+  dim) doing the in-place recurrent state decay/read/delta-write/output, llama.cpp order
+  with the `%`-tile KV-head mapping. `OpenClEngine::deltanet_step`; parity test
+  `deltanet_step_matches_reference` over two steps (state carries). **MoE routing needs
+  no new kernel**: the router is a GEMV (already `GpuAsync`/placeable) and the top-k +
+  softmax run on the host (tiny, expert_count-sized).
+- **io_uring** is the production Linux `WeightIo`; the batched scatter path now has a
+  correctness test (`io_uring_read_many_at_scatter_is_correct`, Linux only). A
+  plan-driven prefetch **deeper than one layer** is gated on the N-slot scratch refactor
+  (`StreamingScratch` is a 2-slot ping-pong today); it is the next high-risk item.
 - `PRD.md`, `implementation_plan.md`, and `pr_soporte_gguf_disperso_v3.md` are the design
   sources of truth.

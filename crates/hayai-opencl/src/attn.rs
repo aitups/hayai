@@ -257,7 +257,7 @@ impl OpenClEngine {
         let bv = mk(v.len(), v)?;
         let bdecay = mk(decay.len(), decay)?;
         let bbeta = mk(beta.len(), beta)?;
-        let mut bout = unsafe {
+        let bout = unsafe {
             Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, out.len().max(1), ptr::null_mut())
                 .map_err(|e| OpenClError::ClError(format!("deltanet out: {e}")))?
         };
