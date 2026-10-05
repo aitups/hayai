@@ -1072,7 +1072,9 @@ impl ExecPlan {
     /// Run the cost-driven planner against measured capabilities and store the result.
     pub fn plan_placement(&mut self, caps: &[crate::planner::TargetCaps]) {
         let tasks = self.op_tasks();
-        self.placement = crate::planner::plan_placement(&tasks, caps, false);
+        // Concurrent: the executor runs independent ops on their devices in parallel
+        // (attention Q/K/V, FFN gate∥up), so the planner may spread load across devices.
+        self.placement = crate::planner::plan_placement(&tasks, caps, true);
     }
 
     pub fn format_report(&self) -> String {

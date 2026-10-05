@@ -33,6 +33,25 @@ pub enum OrchestratorError {
     Msg(String),
 }
 
+/// Handle for an op submitted asynchronously ([`EngineOrchestrator::submit_op_bound`]).
+pub enum OpPending {
+    /// In flight on a pool device — join with [`OpPending::wait`].
+    Gpu(PendingGemv),
+    /// Already completed inline (CPU, or a device upload fallback): the caller's output
+    /// buffer is written and no join is needed.
+    Done,
+}
+
+impl OpPending {
+    /// Block until a device op completes, returning its output. `Done` returns `None`.
+    pub fn wait(self) -> Result<Option<Vec<f32>>, OrchestratorError> {
+        match self {
+            OpPending::Gpu(p) => Ok(Some(p.wait()?)),
+            OpPending::Done => Ok(None),
+        }
+    }
+}
+
 pub struct EngineOrchestrator {
     pub mode: ExecutionMode,
     /// All OpenCL GPUs in the pool (empty ⇒ CPU-only).
@@ -334,6 +353,42 @@ impl EngineOrchestrator {
             }
         }
         self.execute_op(op, binding, matrix, input, output)
+    }
+
+    /// Like [`Self::execute_op_bound`] but **non-blocking** for a device placement:
+    /// returns a handle the caller joins later, so several independent ops (e.g.
+    /// attention Q/K/V) can be in flight on their devices at once. `OpPending::Done`
+    /// means the op already completed inline (CPU, or a device upload fallback).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_op_bound(
+        &mut self,
+        op: crate::exec_plan::LayerOpKind,
+        binding: crate::exec_plan::OpBinding,
+        matrix: &QuantMatrix,
+        input: &[f32],
+        output: &mut [f32],
+        scratch: Option<&hayai_opencl::StreamingScratch>,
+        layer: usize,
+        tensor_off: usize,
+    ) -> Result<OpPending, OrchestratorError> {
+        if let Some(crate::planner::ComputeTarget::Device(i)) = self.placement.get(&op).copied() {
+            if let Some(sc) = scratch {
+                // Ping-pong only (macro-chunk offsets differ; see sync_gemv_from_scratch).
+                if sc.block_k <= 1 {
+                    if let Some(eng) = self.pool.engines.get(i) {
+                        if let Ok(p) = crate::stream_infer::begin_gemv_from_scratch(
+                            eng, matrix, input, sc, layer, tensor_off,
+                        ) {
+                            return Ok(OpPending::Gpu(p));
+                        }
+                    }
+                }
+            }
+            self.gpu_gemv_indexed(i, matrix, input, output)?;
+            return Ok(OpPending::Done);
+        }
+        self.execute_op(op, binding, matrix, input, output)?;
+        Ok(OpPending::Done)
     }
 
     fn gpu_gemv(

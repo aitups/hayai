@@ -664,7 +664,7 @@ pub(crate) fn full_attn_apply(
     // (no per-op host upload); otherwise the host-upload path is used.
     let off = layout.map(|l| (l.wq_off, l.wk_off, l.wv_off, l.wo_off));
     let (wq_off, wk_off, wv_off, wo_off) = off.unwrap_or((0, 0, 0, 0));
-    orch.execute_op_bound(
+    let pq = orch.submit_op_bound(
         LayerOpKind::AttnQ,
         op_binding(LayerOpKind::AttnQ),
         &pack.wq,
@@ -674,7 +674,7 @@ pub(crate) fn full_attn_apply(
         layer,
         wq_off,
     )?;
-    orch.execute_op_bound(
+    let pk = orch.submit_op_bound(
         LayerOpKind::AttnK,
         op_binding(LayerOpKind::AttnK),
         &pack.wk,
@@ -684,7 +684,7 @@ pub(crate) fn full_attn_apply(
         layer,
         wk_off,
     )?;
-    orch.execute_op_bound(
+    let pv = orch.submit_op_bound(
         LayerOpKind::AttnV,
         op_binding(LayerOpKind::AttnV),
         &pack.wv,
@@ -694,6 +694,16 @@ pub(crate) fn full_attn_apply(
         layer,
         wv_off,
     )?;
+    // Q/K/V are independent: they run concurrently on their placed devices; join now.
+    if let Some(o) = pq.wait()? {
+        q_full.copy_from_slice(&o);
+    }
+    if let Some(o) = pk.wait()? {
+        k.copy_from_slice(&o);
+    }
+    if let Some(o) = pv.wait()? {
+        v.copy_from_slice(&o);
+    }
 
     // Per-layer dims from this block's tensors (9B/27B may differ from 4B meta defaults).
     let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
