@@ -1631,12 +1631,16 @@ impl StreamingGenerator {
             layout = current.layout();
         }
         let mut prefetch_owned: Option<JoinHandle<Result<PrefetchOk, GgufError>>> = None;
-        let mut prefetch_pending = false;
+        // Streaming prefetch pipeline: depth = scratch slots (2 = classic ping-pong).
+        // Up to `n_slots - 1` layer reads stay in flight, each in its own slot.
+        let n_slots = scratch.as_ref().map(|s| s.n_slots).unwrap_or(2).max(2);
+        let mut prefetch_inflight: usize = 0;
+        let mut prefetch_next: usize = 1;
 
         for layer_idx in 0..n_layers {
             self.act_swap_prepare();
 
-            let slot = layer_idx % 2;
+            let slot = layer_idx % n_slots;
             // Attn needs host-mapped views; start FFN DMA before Attn (overlap).
             if let Some(sc) = scratch.as_mut() {
                 if sc.resident {
@@ -1657,46 +1661,49 @@ impl StreamingGenerator {
                 }
             }
 
-            // Prefetch N+1 **directly** into the other ping-pong slot (no heap staging).
-            // Resident mode skips prefetch: every layer is already in device memory.
+            // Prefetch the next layer reads into their own slots, keeping up to
+            // `n_slots - 1` reads in flight (depth = ping-pong slots). Resident mode
+            // skips prefetch: every layer is already in device memory.
             if !scratch.as_ref().map(|s| s.resident).unwrap_or(false)
-                && layer_idx + 1 < n_layers
-                && !prefetch_pending
-                && prefetch_owned.is_none()
                 && std::env::var_os("HAYAI_NO_PREFETCH").is_none()
             {
-                let next = layer_idx + 1;
-                let next_fused = self.fused_qkv_dims(next);
                 if let Some(sc) = scratch.as_mut() {
-                    if self.prefetch_worker.is_none() {
-                        let cat = self.catalog.fork_reader()?;
-                        self.prefetch_worker = Some(PrefetchWorker::new(cat));
-                    }
-                    let next_slot = (layer_idx + 1) % 2;
-                    let slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
-                    if let Some(m) = self.owned_mem.as_mut() {
-                        m.note_prefetch_staging(0);
-                    }
-                    self.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
-                        read: Box::new(move |cat| {
-                            let dst = unsafe {
-                                std::slice::from_raw_parts_mut(slot_ptr.addr as *mut u8, slot_ptr.len)
-                            };
-                            match next_fused {
-                                Some((q, kv)) => {
-                                    cat.load_layer_pack_into_fused(next, dst, q, kv).map(|_| ())
+                    while prefetch_inflight < n_slots.saturating_sub(1) && prefetch_next < n_layers {
+                        let next = prefetch_next;
+                        let next_fused = self.fused_qkv_dims(next);
+                        if self.prefetch_worker.is_none() {
+                            let cat = self.catalog.fork_reader()?;
+                            self.prefetch_worker = Some(PrefetchWorker::new(cat));
+                        }
+                        let next_slot = next % n_slots;
+                        let slot_ptr = self.prepare_prefetch_slot(orch, sc, next_slot)?;
+                        if let Some(m) = self.owned_mem.as_mut() {
+                            m.note_prefetch_staging(0);
+                        }
+                        self.prefetch_worker.as_ref().unwrap().submit(PrefetchJob {
+                            read: Box::new(move |cat| {
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut(slot_ptr.addr as *mut u8, slot_ptr.len)
+                                };
+                                match next_fused {
+                                    Some((q, kv)) => {
+                                        cat.load_layer_pack_into_fused(next, dst, q, kv).map(|_| ())
+                                    }
+                                    None => cat.load_layer_pack_into(next, dst).map(|_| ()),
                                 }
-                                None => cat.load_layer_pack_into(next, dst).map(|_| ()),
-                            }
-                        }),
-                    })?;
-                    prefetch_pending = true;
-                } else {
+                            }),
+                        })?;
+                        prefetch_inflight += 1;
+                        prefetch_next += 1;
+                    }
+                } else if prefetch_owned.is_none() && layer_idx + 1 < n_layers {
                     // No scratch: the prefetch must return **owned** matrices.
                     // Returning views into a `blob` local to this closure would
                     // dangle the moment the closure returns (the pack is used by
                     // the main thread afterwards). The owned loaders copy every
                     // tensor into its own allocation, so the pack owns its bytes.
+                    let next = layer_idx + 1;
+                    let next_fused = self.fused_qkv_dims(next);
                     let mut cat = self.catalog.fork_reader()?;
                     prefetch_owned = Some(thread::spawn(move || match next_fused {
                         Some((q, kv)) => {
@@ -1860,7 +1867,7 @@ impl StreamingGenerator {
                     Ok(Err(e)) => return Err(e.into()),
                     Err(_) => return Err(StreamInferError::Msg("prefetch join panicked".into())),
                 }
-            } else if prefetch_pending {
+            } else if prefetch_inflight > 0 && layer_idx + 1 < n_layers {
                 let t_join = Instant::now();
                 self.prefetch_worker
                     .as_ref()
@@ -1870,9 +1877,9 @@ impl StreamingGenerator {
                 self.overlap_secs += dt;
                 self.attn_ffn_overlap_secs += dt;
                 self.prefetch_hits += 1;
-                prefetch_pending = false;
+                prefetch_inflight -= 1;
                 if let Some(sc) = scratch.as_mut() {
-                    let next_slot = (layer_idx + 1) % 2;
+                    let next_slot = (layer_idx + 1) % n_slots;
                     let base = sc.host_slot(next_slot);
                     let (pack, lay) = self.pack_views_from_base(layer_idx + 1, base)?;
                     self.io_bytes += lay.total as u64;
@@ -1936,7 +1943,7 @@ impl StreamingGenerator {
                     current = self.bind_prefetched_slot(
                         orch,
                         sc,
-                        (layer_idx + 1) % 2,
+                        (layer_idx + 1) % n_slots,
                         &layout,
                         &pack,
                     )?;
@@ -1945,7 +1952,7 @@ impl StreamingGenerator {
                 }
             } else if layer_idx + 1 < n_layers {
                 if let Some(sc) = scratch.as_mut() {
-                    let (p, lay) = self.stage_pack(orch, sc, (layer_idx + 1) % 2, layer_idx + 1)?;
+                    let (p, lay) = self.stage_pack(orch, sc, (layer_idx + 1) % n_slots, layer_idx + 1)?;
                     current = p;
                     layout = lay;
                 } else {
@@ -2405,7 +2412,21 @@ impl StreamingGenerator {
                 self.config.num_layers,
             )?
         } else {
-            hayai_opencl::StreamingScratch::allocate_for_pool(&orch.pool, layer_bytes, win.k_chunk)?
+            // Prefetch depth (slots). Default 2 (classic ping-pong); override with
+            // HAYAI_PREFETCH_DEPTH. Depth > 2 is only enabled with no device mirror: the
+            // GPU mirror DMA path is validated at depth 2 and needs work for N slots.
+            let max_slots = if orch.pool.is_empty() { 8 } else { 2 };
+            let n_slots: usize = std::env::var("HAYAI_PREFETCH_DEPTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2)
+                .clamp(2, max_slots);
+            hayai_opencl::StreamingScratch::allocate_for_pool(
+                &orch.pool,
+                layer_bytes,
+                win.k_chunk,
+                n_slots,
+            )?
         };
         self.transfer_path = Some(xfer);
         let budget = crate::metrics::StreamingMemoryBudget::estimate(
@@ -4591,4 +4612,5 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
 

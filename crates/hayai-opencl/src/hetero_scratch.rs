@@ -22,32 +22,38 @@ use tracing::{info, warn};
 /// Per-dGPU VRAM mirror of the host layer-pack (one DMA target per ping-pong slot).
 pub struct DgpuMirror {
     pub device_id: cl_device_id,
-    pub slots: [DeviceLayerBuffer; 2],
+    pub slots: Vec<DeviceLayerBuffer>,
 }
 
 enum HostBase {
     /// APU-first SVM (expert recommended).
     Svm {
-        slots: [OwnedSvmBuffer; 2],
+        slots: Vec<OwnedSvmBuffer>,
         owner_id: cl_device_id,
     },
     /// No SVM in pool: pinned host + primary device mirrors live in [`StreamingScratch::dgpu_mirrors`].
     Pinned {
-        pinned: [PinnedHostBuffer; 2],
+        pinned: Vec<PinnedHostBuffer>,
     },
     Host {
-        slots: [AlignedBuffer; 2],
+        slots: Vec<AlignedBuffer>,
     },
 }
 
-/// Dual-slot hetero scratch for generate (owned; no engine lifetime).
+/// Multi-slot hetero scratch for generate (owned; no engine lifetime).
+///
+/// `n_slots` is the prefetch depth (`2` = classic ping-pong; larger lets the streaming
+/// loop read ahead more layers). Slots are addressed by `idx % n_slots` (or
+/// `(layer / block_k) % n_slots` in macro-chunk); resident mode always uses slot 0.
 pub struct StreamingScratch {
     host: HostBase,
-    /// Discrete-GPU VRAM copies of each ping-pong slot (full pack layout; FFN slices DMA'd).
+    /// Discrete-GPU VRAM copies of each slot (full pack layout; FFN/attn slices DMA'd).
     pub dgpu_mirrors: Vec<DgpuMirror>,
     pub path: TransferPath,
+    /// Number of ping-pong slots (prefetch depth).
+    pub n_slots: usize,
     /// Resident mode: one base allocation of `resident_layers × resident_stride`
-    /// holding every layer pack; layers are addressed by index (never `% 2`) and
+    /// holding every layer pack; layers are addressed by index (never `% n_slots`) and
     /// never re-read from disk nor re-DMA'd per token.
     pub resident: bool,
     pub resident_stride: usize,
@@ -55,9 +61,9 @@ pub struct StreamingScratch {
     /// Macro-chunk mode (1 < block_k < resident_layers): ping-pong slots hold
     /// `block_k × resident_stride` and are loaded once per block per token.
     pub block_k: usize,
-    /// Which block (1-based) is currently staged in each ping-pong slot
-    /// (macro-chunk only). `0` = slot empty / stale.
-    pub block_staged: [usize; 2],
+    /// Which block (1-based) is currently staged in each slot (macro-chunk only).
+    /// `0` = slot empty / stale.
+    pub block_staged: Vec<usize>,
     /// In-flight `WriteBufferRect` DMAs reading from host memory into device
     /// mirrors. They must complete before the host region they read is
     /// overwritten (`prepare_host_write`) or unmapped/for device use.
@@ -82,26 +88,27 @@ impl StreamingScratch {
         pool: &OpenClDevicePool,
         layer_bytes: usize,
         k_chunk: usize,
+        n_slots: usize,
     ) -> Result<(TransferPath, Self), OpenClError> {
         let k_chunk = k_chunk.max(1);
+        let n_slots = n_slots.max(2);
         let slot_bytes = layer_bytes.saturating_mul(k_chunk);
         if pool.is_empty() {
+            let slots = (0..n_slots)
+                .map(|_| AlignedBuffer::zeroed(slot_bytes))
+                .collect();
             return Ok((
                 TransferPath::HostRam,
                 Self {
-                    host: HostBase::Host {
-                        slots: [
-                            AlignedBuffer::zeroed(slot_bytes),
-                            AlignedBuffer::zeroed(slot_bytes),
-                        ],
-                    },
+                    host: HostBase::Host { slots },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
+                    n_slots,
                     resident: false,
                     resident_stride: layer_bytes,
                     resident_layers: 0,
                     block_k: k_chunk,
-                    block_staged: [0, 0],
+                    block_staged: vec![0; n_slots],
                     dma_inflight: Vec::new(),
                 },
             ));
@@ -114,11 +121,19 @@ impl StreamingScratch {
         });
 
         let (path, host) = if let Some(apu) = svm_owner {
-            match (
-                OwnedSvmBuffer::new(apu, slot_bytes),
-                OwnedSvmBuffer::new(apu, slot_bytes),
-            ) {
-                (Ok(a), Ok(b)) => {
+            let mut svm_slots = Vec::with_capacity(n_slots);
+            let mut svm_err: Option<String> = None;
+            for _ in 0..n_slots {
+                match OwnedSvmBuffer::new(apu, slot_bytes) {
+                    Ok(b) => svm_slots.push(b),
+                    Err(e) => {
+                        svm_err = Some(format!("{e}"));
+                        break;
+                    }
+                }
+            }
+            match svm_err {
+                None => {
                     info!(
                         "HeteroScratch host base: SVM on {} (coarse preferred)",
                         apu.device_info.device_name
@@ -126,23 +141,18 @@ impl StreamingScratch {
                     (
                         TransferPath::SvmZeroCopy,
                         HostBase::Svm {
-                            slots: [a, b],
+                            slots: svm_slots,
                             owner_id: apu.device_info.device_id,
                         },
                     )
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Some(e) => {
                     warn!("SVM host base failed ({e}); pinned fallback on primary");
                     let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
-                    (
-                        TransferPath::PinnedDma,
-                        HostBase::Pinned {
-                            pinned: [
-                                PinnedHostBuffer::new(prim, slot_bytes)?,
-                                PinnedHostBuffer::new(prim, slot_bytes)?,
-                            ],
-                        },
-                    )
+                    let pinned = (0..n_slots)
+                        .map(|_| PinnedHostBuffer::new(prim, slot_bytes))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (TransferPath::PinnedDma, HostBase::Pinned { pinned })
                 }
             }
         } else {
@@ -151,15 +161,10 @@ impl StreamingScratch {
                 "HeteroScratch host base: pinned on {} (no SVM in pool)",
                 prim.device_info.device_name
             );
-            (
-                TransferPath::PinnedDma,
-                HostBase::Pinned {
-                    pinned: [
-                        PinnedHostBuffer::new(prim, slot_bytes)?,
-                        PinnedHostBuffer::new(prim, slot_bytes)?,
-                    ],
-                },
-            )
+            let pinned = (0..n_slots)
+                .map(|_| PinnedHostBuffer::new(prim, slot_bytes))
+                .collect::<Result<Vec<_>, _>>()?;
+            (TransferPath::PinnedDma, HostBase::Pinned { pinned })
         };
 
         let mut dgpu_mirrors = Vec::new();
@@ -176,17 +181,18 @@ impl StreamingScratch {
                 );
                 continue;
             }
+            let slots = (0..n_slots)
+                .map(|_| DeviceLayerBuffer::new(eng, slot_bytes))
+                .collect::<Result<Vec<_>, _>>()?;
             dgpu_mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
-                slots: [
-                    DeviceLayerBuffer::new(eng, slot_bytes)?,
-                    DeviceLayerBuffer::new(eng, slot_bytes)?,
-                ],
+                slots,
             });
             info!(
-                "HeteroScratch dGPU mirror: {} ({} KiB × 2, FFN-slice DMA)",
+                "HeteroScratch dGPU mirror: {} ({} KiB × {}, FFN-slice DMA)",
                 eng.device_info.device_name,
-                slot_bytes / 1024
+                slot_bytes / 1024,
+                n_slots
             );
         }
 
@@ -195,12 +201,12 @@ impl StreamingScratch {
             if let HostBase::Pinned { .. } = &host {
                 if let Some(prim) = pool.primary() {
                     if mirror_fits(prim, slot_bytes) {
+                        let slots = (0..n_slots)
+                            .map(|_| DeviceLayerBuffer::new(prim, slot_bytes))
+                            .collect::<Result<Vec<_>, _>>()?;
                         dgpu_mirrors.push(DgpuMirror {
                             device_id: prim.device_info.device_id,
-                            slots: [
-                                DeviceLayerBuffer::new(prim, slot_bytes)?,
-                                DeviceLayerBuffer::new(prim, slot_bytes)?,
-                            ],
+                            slots,
                         });
                     } else {
                         warn!(
@@ -218,11 +224,12 @@ impl StreamingScratch {
                 host,
                 dgpu_mirrors,
                 path,
+                n_slots,
                 resident: false,
                 resident_stride: layer_bytes,
                 resident_layers: 0,
                 block_k: k_chunk,
-                block_staged: [0, 0],
+                block_staged: vec![0; n_slots],
                 dma_inflight: Vec::new(),
             },
         ))
@@ -244,15 +251,16 @@ impl StreamingScratch {
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [AlignedBuffer::zeroed(total), AlignedBuffer::zeroed(1)],
+                        slots: vec![AlignedBuffer::zeroed(total), AlignedBuffer::zeroed(1)],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
+                    n_slots: 2,
                     resident: true,
                     resident_stride: layer_bytes,
                     resident_layers: n_layers,
                     block_k: 1,
-                    block_staged: [0, 0],
+                    block_staged: vec![0, 0],
                     dma_inflight: Vec::new(),
                 },
             ));
@@ -279,7 +287,7 @@ impl StreamingScratch {
                         {
                             mirrors.push(DgpuMirror {
                                 device_id: prim.device_info.device_id,
-                                slots: [
+                                slots: vec![
                                     DeviceLayerBuffer::new(prim, total)?,
                                     DeviceLayerBuffer::new(prim, 1)?,
                                 ],
@@ -296,17 +304,18 @@ impl StreamingScratch {
                         TransferPath::SvmZeroCopy,
                         Self {
                             host: HostBase::Svm {
-                                slots: [buf, OwnedSvmBuffer::new(apu, 1)?],
+                                slots: vec![buf, OwnedSvmBuffer::new(apu, 1)?],
                                 owner_id: apu.device_info.device_id,
                             },
                             dgpu_mirrors: mirrors,
                             path: TransferPath::SvmZeroCopy,
+                            n_slots: 2,
                             resident: true,
                             resident_stride: layer_bytes,
                             resident_layers: n_layers,
                             block_k: 1,
-                            block_staged: [0, 0],
-                    dma_inflight: Vec::new(),
+                            block_staged: vec![0, 0],
+                            dma_inflight: Vec::new(),
                         },
                     ));
                 }
@@ -321,7 +330,7 @@ impl StreamingScratch {
         if mirrors.is_empty() && mirror_fits(prim, total) {
             mirrors.push(DgpuMirror {
                 device_id: prim.device_info.device_id,
-                slots: [
+                slots: vec![
                     DeviceLayerBuffer::new(prim, total)?,
                     DeviceLayerBuffer::new(prim, 1)?,
                 ],
@@ -337,18 +346,19 @@ impl StreamingScratch {
             TransferPath::PinnedDma,
             Self {
                 host: HostBase::Pinned {
-                    pinned: [
+                    pinned: vec![
                         PinnedHostBuffer::new(prim, total)?,
                         PinnedHostBuffer::new(prim, 1)?,
                     ],
                 },
                 dgpu_mirrors: mirrors,
                 path: TransferPath::PinnedDma,
+                n_slots: 2,
                 resident: true,
                 resident_stride: layer_bytes,
                 resident_layers: n_layers,
                 block_k: 1,
-                block_staged: [0, 0],
+                block_staged: vec![0, 0],
                 dma_inflight: Vec::new(),
             },
         ))
@@ -375,7 +385,7 @@ impl StreamingScratch {
             }
             mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
-                slots: [
+                slots: vec![
                     DeviceLayerBuffer::new(eng, total)?,
                     DeviceLayerBuffer::new(eng, 1)?,
                 ],
@@ -394,18 +404,19 @@ impl StreamingScratch {
                 TransferPath::HostRam,
                 Self {
                     host: HostBase::Host {
-                        slots: [
+                        slots: vec![
                             AlignedBuffer::zeroed(layer_bytes),
                             AlignedBuffer::zeroed(layer_bytes),
                         ],
                     },
                     dgpu_mirrors: Vec::new(),
                     path: TransferPath::HostRam,
+                    n_slots: 2,
                     resident: false,
                     resident_stride: layer_bytes,
                     resident_layers: 0,
                     block_k: 1,
-                    block_staged: [0, 0],
+                    block_staged: vec![0, 0],
                     dma_inflight: Vec::new(),
                 },
             ));
@@ -420,7 +431,7 @@ impl StreamingScratch {
                     if engine.device_info.device_kind == DeviceKind::DiscreteGpu {
                         mirrors.push(DgpuMirror {
                             device_id: engine.device_info.device_id,
-                            slots: [
+                            slots: vec![
                                 DeviceLayerBuffer::new(engine, layer_bytes)?,
                                 DeviceLayerBuffer::new(engine, layer_bytes)?,
                             ],
@@ -430,17 +441,18 @@ impl StreamingScratch {
                         TransferPath::SvmZeroCopy,
                         Self {
                             host: HostBase::Svm {
-                                slots: [a, b],
+                                slots: vec![a, b],
                                 owner_id: engine.device_info.device_id,
                             },
                             dgpu_mirrors: mirrors,
                             path: TransferPath::SvmZeroCopy,
+                            n_slots: 2,
                             resident: false,
                             resident_stride: layer_bytes,
                             resident_layers: 0,
                             block_k: 1,
-                            block_staged: [0, 0],
-                    dma_inflight: Vec::new(),
+                            block_staged: vec![0, 0],
+                            dma_inflight: Vec::new(),
                         },
                     ));
                 }
@@ -454,7 +466,7 @@ impl StreamingScratch {
         if engine.device_info.device_kind == DeviceKind::DiscreteGpu {
             mirrors.push(DgpuMirror {
                 device_id: engine.device_info.device_id,
-                slots: [
+                slots: vec![
                     DeviceLayerBuffer::new(engine, layer_bytes)?,
                     DeviceLayerBuffer::new(engine, layer_bytes)?,
                 ],
@@ -464,18 +476,19 @@ impl StreamingScratch {
             path,
             Self {
                 host: HostBase::Pinned {
-                    pinned: [
+                    pinned: vec![
                         PinnedHostBuffer::new(engine, layer_bytes)?,
                         PinnedHostBuffer::new(engine, layer_bytes)?,
                     ],
                 },
                 dgpu_mirrors: mirrors,
                 path,
+                n_slots: 2,
                 resident: false,
                 resident_stride: layer_bytes,
                 resident_layers: 0,
                 block_k: 1,
-                block_staged: [0, 0],
+                block_staged: vec![0, 0],
                 dma_inflight: Vec::new(),
             },
         ))
@@ -507,7 +520,7 @@ impl StreamingScratch {
             let off = (idx % self.block_k).saturating_mul(s).min(len);
             return &mut base[off..(off + s).min(len)];
         }
-        let slot = idx % 2;
+        let slot = idx % self.n_slots;
         match &mut self.host {
             HostBase::Svm { slots, .. } => slots[slot].as_mut_slice(),
             HostBase::Pinned { pinned } => pinned[slot].as_mut_slice(),
@@ -539,7 +552,7 @@ impl StreamingScratch {
             let off = (idx % self.block_k).saturating_mul(s).min(len);
             return &base[off..(off + s).min(len)];
         }
-        let slot = idx % 2;
+        let slot = idx % self.n_slots;
         match &self.host {
             HostBase::Svm { slots, .. } => slots[slot].as_slice(),
             HostBase::Pinned { pinned } => pinned[slot].as_slice(),
@@ -547,19 +560,19 @@ impl StreamingScratch {
         }
     }
 
-    /// Ping-pong slot that owns `layer` (streaming: `layer % 2`; macro-chunk:
-    /// `(layer / block_k) % 2`; resident: always `0`).
+    /// Ping-pong slot that owns `layer` (streaming: `layer % self.n_slots`; macro-chunk:
+    /// `(layer / block_k) % self.n_slots`; resident: always `0`).
     pub fn slot_for(&self, layer: usize) -> usize {
         if self.resident {
             0
         } else {
-            (layer / self.block_k.max(1)) % 2
+            (layer / self.block_k.max(1)) % self.n_slots
         }
     }
 
     /// Raw pointer to a whole macro-chunk block slot (for block prefetch threads).
     pub fn host_slot_block_ptr_mut(&mut self, block_slot: usize) -> (*mut u8, usize) {
-        let slot = block_slot % 2;
+        let slot = block_slot % self.n_slots;
         let slice = match &mut self.host {
             HostBase::Svm { slots, .. } => slots[slot].as_mut_slice(),
             HostBase::Pinned { pinned } => pinned[slot].as_mut_slice(),
@@ -570,7 +583,7 @@ impl StreamingScratch {
 
     /// Mark a ping-pong slot as holding `block` (1-based index stored).
     pub fn mark_block_staged(&mut self, block_slot: usize, block: usize) {
-        self.block_staged[block_slot % 2] = block + 1;
+        self.block_staged[block_slot % self.n_slots] = block + 1;
     }
 
     /// Byte capacity of one ping-pong slot (does not require SVM host-map).
@@ -589,7 +602,7 @@ impl StreamingScratch {
     }
 
     fn slot_len(&self, idx: usize) -> usize {
-        let _ = idx % 2;
+        let _ = idx % self.n_slots;
         self.slot_capacity()
     }
 
@@ -655,7 +668,7 @@ impl StreamingScratch {
     /// Raw host-slot pointer for direct I/O prefetch (caller maps first).
     /// Safe to use concurrently with the other ping-pong slot.
     pub fn host_slot_ptr_mut(&mut self, idx: usize) -> (*mut u8, usize) {
-        let slot = idx % 2;
+        let slot = idx % self.n_slots;
         let slice = self.host_slot_mut(slot);
         (slice.as_mut_ptr(), slice.len())
     }
@@ -712,7 +725,7 @@ impl StreamingScratch {
         src: &[u8],
         layout: &LayerPackLayout,
     ) -> Result<(), OpenClError> {
-        let slot = idx % 2;
+        let slot = idx % self.n_slots;
         let n = src.len().min(self.slot_len(slot)).min(layout.total);
         self.prepare_host_write(pool, slot)?;
         self.host_slot_mut(slot)[..n].copy_from_slice(&src[..n]);
@@ -726,7 +739,7 @@ impl StreamingScratch {
         idx: usize,
         src: &[u8],
     ) -> Result<(), OpenClError> {
-        let slot = idx % 2;
+        let slot = idx % self.n_slots;
         let n = src.len().min(self.slot_len(slot));
         if let (HostBase::Svm { slots, .. }, Some(eng)) = (&mut self.host, engine) {
             slots[slot].prepare_for_host(eng)?;
@@ -977,7 +990,7 @@ impl StreamingScratch {
     pub fn device_slot(&self, idx: usize) -> Option<&DeviceLayerBuffer> {
         self.dgpu_mirrors
             .first()
-            .map(|m| &m.slots[idx % 2])
+            .map(|m| &m.slots[idx % self.n_slots])
     }
 }
 
@@ -1029,18 +1042,19 @@ mod tests {
         let slot_bytes = if resident { stride } else { stride * k };
         StreamingScratch {
             host: HostBase::Host {
-                slots: [
+                slots: vec![
                     AlignedBuffer::zeroed(slot_bytes),
                     AlignedBuffer::zeroed(slot_bytes),
                 ],
             },
             dgpu_mirrors: Vec::new(),
             path: TransferPath::HostRam,
+            n_slots: 2,
             resident,
             resident_stride: stride,
             resident_layers: if resident { 1 } else { 0 },
             block_k: k,
-            block_staged: [0, 0],
+            block_staged: vec![0, 0],
             dma_inflight: Vec::new(),
         }
     }
@@ -1096,3 +1110,4 @@ mod tests {
         assert!(s.dma_ffn_keep_mapped(&pool, 0, &layout).is_ok());
     }
 }
+
