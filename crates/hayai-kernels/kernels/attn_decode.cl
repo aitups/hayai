@@ -20,6 +20,7 @@ __kernel void hayai_attn_decode(
     __global float* restrict out,       // [n_heads * head_dim]
     const int n_heads,
     const int n_kv,
+    const int groups,                   // n_heads / n_kv
     const int head_dim,
     const int seq,                      // number of valid positions (0 => empty)
     const float scale)
@@ -28,7 +29,9 @@ __kernel void hayai_attn_decode(
     if (h >= n_heads || head_dim > HAYAI_MAX_HEAD_DIM) {
         return;
     }
-    int kh = h % n_kv;
+    // GQA mapping used by the host engine: query head h reads KV head h / groups
+    // (HF `repeat_interleave`), NOT h % n_kv.
+    int kh = (groups > 0) ? (h / groups) : 0;
 
     __private float qv[HAYAI_MAX_HEAD_DIM];
     __private float acc[HAYAI_MAX_HEAD_DIM];

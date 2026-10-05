@@ -133,6 +133,7 @@ impl OpenClEngine {
         }
         let n_heads_i = n_heads as cl_int;
         let n_kv_i = cache.n_kv as cl_int;
+        let groups_i = (n_heads / cache.n_kv.max(1)).max(1) as cl_int;
         let hd_i = hd as cl_int;
         let seq_i = seq as cl_int;
         let scale_f = scale;
@@ -148,6 +149,7 @@ impl OpenClEngine {
                 .set_arg(ws.output.as_ref().unwrap())
                 .set_arg(&n_heads_i)
                 .set_arg(&n_kv_i)
+                .set_arg(&groups_i)
                 .set_arg(&hd_i)
                 .set_arg(&seq_i)
                 .set_arg(&scale_f)
@@ -184,9 +186,10 @@ mod tests {
         let v: Vec<f32> = (0..seq * n_kv * hd).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2).collect();
 
         // Reference (host).
+        let groups = n_heads / n_kv;
         let mut ref_out = vec![0.0f32; n_heads * hd];
         for h in 0..n_heads {
-            let kh = h % n_kv;
+            let kh = h / groups;
             let mut scores = vec![0.0f32; seq];
             let mut m = f32::NEG_INFINITY;
             for j in 0..seq {

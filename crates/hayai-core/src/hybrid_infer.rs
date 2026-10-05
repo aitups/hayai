@@ -746,6 +746,35 @@ pub(crate) fn full_attn_apply(
     if std::env::var_os("HAYAI_ATTN_GPU").is_some() && pos < 8192 {
         if let Some(eng) = orch.opencl_engine() {
             let max_seq = 8192usize;
+            // The host attention step applies RoPE to q/k before caching; the kernel
+            // reads them raw, so apply the same rotation here first.
+            if layer_cfg.use_rope {
+                let rd = layer_cfg.rope_dim.max(1).min(head_dim);
+                for h in 0..n_heads {
+                    let s = h * head_dim;
+                    hayai_cpu::apply_rope_partial_factors_scaled(
+                        &mut q[s..s + head_dim],
+                        pos,
+                        head_dim,
+                        rd,
+                        layer_cfg.rope_theta,
+                        None,
+                        layer_cfg.rope,
+                    );
+                }
+                for h in 0..n_kv {
+                    let s = h * head_dim;
+                    hayai_cpu::apply_rope_partial_factors_scaled(
+                        &mut k[s..s + head_dim],
+                        pos,
+                        head_dim,
+                        rd,
+                        layer_cfg.rope_theta,
+                        None,
+                        layer_cfg.rope,
+                    );
+                }
+            }
             if gen.device_kv.is_none() {
                 gen.device_kv = Some((0..gen.config.num_layers).map(|_| None).collect());
             }
@@ -760,7 +789,9 @@ pub(crate) fn full_attn_apply(
                 eng.kv_append(cache, pos, &k, &v)
                     .map_err(|e| StreamInferError::Msg(e.to_string()))?;
             }
-            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let scale = layer_cfg
+                .scale_override
+                .unwrap_or(1.0f32 / (head_dim as f32).sqrt());
             let cache = slots[layer].as_ref().unwrap();
             eng.attn_decode(&q, cache, &mut attn_out, n_heads, pos + 1, scale)
                 .map_err(|e| StreamInferError::Msg(e.to_string()))?;
