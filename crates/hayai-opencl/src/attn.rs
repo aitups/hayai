@@ -72,10 +72,10 @@ impl OpenClEngine {
         }
         unsafe {
             self.queue
-                .enqueue_write_buffer(&mut cache.k, CL_BLOCKING, (pos * row * std::mem::size_of::<cl_float>()), k, &[])
+                .enqueue_write_buffer(&mut cache.k, CL_BLOCKING, pos * row * std::mem::size_of::<cl_float>(), k, &[])
                 .map_err(|e| OpenClError::ClError(format!("kv write k: {e}")))?;
             self.queue
-                .enqueue_write_buffer(&mut cache.v, CL_BLOCKING, (pos * row * std::mem::size_of::<cl_float>()), v, &[])
+                .enqueue_write_buffer(&mut cache.v, CL_BLOCKING, pos * row * std::mem::size_of::<cl_float>(), v, &[])
                 .map_err(|e| OpenClError::ClError(format!("kv write v: {e}")))?;
         }
         cache.len = cache.len.max(pos + 1);

@@ -245,5 +245,22 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   predictable the next token so it ~doubled I/O (11506 → 23862 MiB, 1.74 → 1.30 tok/s),
   and the 512 MiB cache (128 packs vs 1024 experts) thrashes. Needs a better predictor
   (global frequency / grouped routing) and a native Linux host to measure.
+- **Hardware-aware planner** (`hayai-core/src/planner.rs`): the engine no longer hardcodes
+  "attention→CPU, FFN→GPU". At session start `prepare_session` calibrates the host + every
+  device (host RAM, disk, per-device effective *and resident* GEMV bandwidth, per-op launch
+  overhead, DMA link — new `OpenClEngine::bench_*`) and runs a cost-driven list scheduler
+  that assigns **every placeable op** to a concrete `ComputeTarget::Cpu | Device(i)`
+  (`ExecPlan.placement`). `orchestrator::execute_op` honors it; `execute_op_bound`/
+  `submit_op_bound` run an op from the layer's device mirror (no per-op host upload) and
+  let independent ops (attention Q/K/V) run concurrently across devices. Ops are placed by
+  measured bytes/bandwidth, not by name, so a novel architecture is planned by the same
+  code. `HAYAI_FFN_MIN_GPU_PARAMS` (the old `auto→CPU` patch) is gone.
+- **OpenCL attention kernel** (`hayai-kernels/kernels/attn_decode.cl`, `hayai_attn_decode`)
+  + `DeviceKvCache` (FP32, per layer): single-query online-softmax attention, GQA-aware.
+  `OpenClEngine::kv_append`/`attn_decode`; parity test `attn_decode_matches_reference`
+  (auto-skips without a device). Wired into the hybrid full-attention path behind the
+  opt-in `HAYAI_ATTN_GPU=1` (the default keeps the host INT8 path bit-identical). Known
+  gap: the host step also applies RoPE, so the opt-in GPU path still needs the host RoPE
+  before the kernel — it is experimental until validated on the T4.
 - `PRD.md`, `implementation_plan.md`, and `pr_soporte_gguf_disperso_v3.md` are the design
   sources of truth.
