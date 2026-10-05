@@ -270,8 +270,12 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   no new kernel**: the router is a GEMV (already `GpuAsync`/placeable) and the top-k +
   softmax run on the host (tiny, expert_count-sized).
 - **io_uring** is the production Linux `WeightIo`; the batched scatter path now has a
-  correctness test (`io_uring_read_many_at_scatter_is_correct`, Linux only). A
-  plan-driven prefetch **deeper than one layer** is gated on the N-slot scratch refactor
-  (`StreamingScratch` is a 2-slot ping-pong today); it is the next high-risk item.
+  correctness test (`io_uring_read_many_at_scatter_is_correct`, Linux only).
+- **N-slot scratch + prefetch pipeline** (`StreamingScratch.n_slots`, `HAYAI_PREFETCH_DEPTH`
+  default 2): slots are a `Vec` addressed by `idx % n_slots` (macro-chunk:
+  `(layer/block_k) % n_slots`), and the Dense streaming loop keeps up to `n_slots - 1`
+  layer reads in flight. Depth > 2 is enabled only with no device mirror (the CPU path is
+  validated at depth 3); the GPU mirror DMA path is validated at depth 2 and N-slot
+  mirrors still need work.
 - `PRD.md`, `implementation_plan.md`, and `pr_soporte_gguf_disperso_v3.md` are the design
   sources of truth.
