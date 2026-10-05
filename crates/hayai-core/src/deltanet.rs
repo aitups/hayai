@@ -203,11 +203,16 @@ impl DeltaNetLayerWeights {
     }
 
     /// Decode step: `y += DeltaNet(x)` (caller applies residual).
+    ///
+    /// `gpu` (opt-in, `HAYAI_DN_GPU=1`) runs the recurrent state update on a device via
+    /// the `hayai_deltanet_step` kernel; `None` keeps the host implementation. The
+    /// device state is the source of truth on the GPU path (the host `ssm` is untouched).
     pub fn decode_step(
         &self,
         x: &[f32],
         state: &mut DeltaNetState,
         y: &mut [f32],
+        gpu: Option<(&hayai_opencl::OpenClEngine, *const hayai_opencl::DeviceDeltanetState)>,
     ) -> Result<(), GgufError> {
         let n_embd = x.len();
         let mix_dim = self.qkv.nrows;
@@ -259,50 +264,67 @@ impl DeltaNetLayerWeights {
         self.alpha.gemv(x, &mut alpha_h)?;
         self.beta.gemv(x, &mut beta_h)?;
 
-        let mut o = vec![0.0f32; value_dim];
-        let hv = self.head_v;
-        let hk = self.head_k;
-        // GQA over V-heads: llama.cpp expands K-heads with `ggml_repeat` (tile),
-        // so V-head `vh` maps to K-head `vh % n_k` — NOT HF `repeat_interleave`
-        // (`vh / ratio`). Wrong mapping yields coherent-looking garbage until fixed.
+        // Per-head decay / beta (host, tiny) — shared by both paths.
+        let mut decay = vec![0.0f32; self.n_v_heads];
+        let mut beta = vec![0.0f32; self.n_v_heads];
         for vh in 0..self.n_v_heads {
-            let kh = vh % self.n_k_heads;
             let a = self.a[vh.min(self.a.len() - 1)];
             let soft = softplus(self.dt_bias.get(vh).copied().unwrap_or(0.0) + alpha_h[vh]);
-            let decay = (a * soft).exp();
-            let b = sigmoid(beta_h[vh]);
+            decay[vh] = (a * soft).exp();
+            beta[vh] = sigmoid(beta_h[vh]);
+        }
 
-            let s = &mut state.ssm[vh * hk * hv..(vh + 1) * hk * hv];
-            let qh = &q[kh * hk..kh * hk + hk];
-            let khv = &kk[kh * hk..kh * hk + hk];
-            let vv = &v[vh * hv..(vh + 1) * hv];
+        let hv = self.head_v;
+        let hk = self.head_k;
+        let mut o = vec![0.0f32; value_dim];
+        if let Some((eng, dev)) = gpu {
+            // Recurrent state decay/read/delta-write/output on the device. `dev` is a
+            // raw pointer to the generator's per-layer state (the caller holds it out of
+            // the aliased `state` borrow, same trick as the weight/state pointers).
+            let dev = unsafe { &*dev };
+            eng.deltanet_step(&q, &kk, &v, &decay, &beta, dev, &mut o)
+                .map_err(|e| GgufError::Msg(format!("deltanet_step: {e}")))?;
+        } else {
+            // GQA over V-heads: llama.cpp expands K-heads with `ggml_repeat` (tile),
+            // so V-head `vh` maps to K-head `vh % n_k` — NOT HF `repeat_interleave`
+            // (`vh / ratio`). Wrong mapping yields coherent-looking garbage until fixed.
+            for vh in 0..self.n_v_heads {
+                let kh = vh % self.n_k_heads;
+                let decay = decay[vh];
+                let b = beta[vh];
 
-            for e in s.iter_mut() {
-                *e *= decay;
-            }
-            let mut kv_mem = vec![0.0f32; hv];
-            for ki in 0..hk {
-                let ks = khv[ki];
-                let row = ki * hv;
-                for vi in 0..hv {
-                    kv_mem[vi] += s[row + vi] * ks;
+                let s = &mut state.ssm[vh * hk * hv..(vh + 1) * hk * hv];
+                let qh = &q[kh * hk..kh * hk + hk];
+                let khv = &kk[kh * hk..kh * hk + hk];
+                let vv = &v[vh * hv..(vh + 1) * hv];
+
+                for e in s.iter_mut() {
+                    *e *= decay;
                 }
-            }
-            for ki in 0..hk {
-                let ks = khv[ki];
-                let row = ki * hv;
-                for vi in 0..hv {
-                    let delta = (vv[vi] - kv_mem[vi]) * b;
-                    s[row + vi] += ks * delta;
-                }
-            }
-            let oh = &mut o[vh * hv..(vh + 1) * hv];
-            for vi in 0..hv {
-                let mut acc = 0.0;
+                let mut kv_mem = vec![0.0f32; hv];
                 for ki in 0..hk {
-                    acc += s[ki * hv + vi] * qh[ki];
+                    let ks = khv[ki];
+                    let row = ki * hv;
+                    for vi in 0..hv {
+                        kv_mem[vi] += s[row + vi] * ks;
+                    }
                 }
-                oh[vi] = acc;
+                for ki in 0..hk {
+                    let ks = khv[ki];
+                    let row = ki * hv;
+                    for vi in 0..hv {
+                        let delta = (vv[vi] - kv_mem[vi]) * b;
+                        s[row + vi] += ks * delta;
+                    }
+                }
+                let oh = &mut o[vh * hv..(vh + 1) * hv];
+                for vi in 0..hv {
+                    let mut acc = 0.0;
+                    for ki in 0..hk {
+                        acc += s[ki * hv + vi] * qh[ki];
+                    }
+                    oh[vi] = acc;
+                }
             }
         }
 

@@ -484,17 +484,49 @@ fn run_deltanet_block(
         let _ = weights;
     }
     let t0 = Instant::now();
+    // Opt-in device DeltaNet: create the per-layer recurrent state on the device.
+    let use_dn_gpu = std::env::var_os("HAYAI_DN_GPU").is_some() && orch.opencl_engine().is_some();
+    if use_dn_gpu {
+        let (nk, nv, hk, hv) = {
+            let w = gen
+                .deltanet_weights
+                .as_ref()
+                .and_then(|w| w[layer].as_ref())
+                .ok_or_else(|| StreamInferError::Msg("missing DeltaNet weights".into()))?;
+            (w.n_k_heads, w.n_v_heads, w.head_k, w.head_v)
+        };
+        if gen.device_deltanet.is_none() {
+            gen.device_deltanet = Some((0..gen.config.num_layers).map(|_| None).collect());
+        }
+        if gen.device_deltanet.as_ref().unwrap()[layer].is_none() {
+            let eng = orch.opencl_engine().unwrap();
+            let mut st = hayai_opencl::DeviceDeltanetState::new(eng, nk, nv, hk, hv)
+                .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            st.zero(eng).map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            gen.device_deltanet.as_mut().unwrap()[layer] = Some(st);
+        }
+    }
     {
-        let (w_ptr, s_ptr) = {
+        let (w_ptr, s_ptr, dev_ptr) = {
             let w = gen.deltanet_weights.as_mut().unwrap();
             let s = gen.deltanet_states.as_mut().unwrap();
+            let d = gen
+                .device_deltanet
+                .as_ref()
+                .and_then(|v| v[layer].as_ref())
+                .map(|d| d as *const hayai_opencl::DeviceDeltanetState);
             (
                 w[layer].as_ref().unwrap() as *const DeltaNetLayerWeights,
                 s[layer].as_mut().unwrap() as *mut DeltaNetState,
+                d,
             )
         };
+        let gpu = match (use_dn_gpu, dev_ptr) {
+            (true, Some(d)) => Some((orch.opencl_engine().unwrap(), d)),
+            _ => None,
+        };
         unsafe {
-            (*w_ptr).decode_step(&xn, &mut *s_ptr, x)?;
+            (*w_ptr).decode_step(&xn, &mut *s_ptr, x, gpu)?;
         }
     }
     if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") && gen.position == 0 {
@@ -1078,7 +1110,7 @@ pub(crate) fn forward_batched_hybrid_gemm(
                         .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
                     let mut xn = x[c].clone();
                     rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
-                    w.decode_step(&xn, s, &mut x[c])?;
+                    w.decode_step(&xn, s, &mut x[c], None)?;
                 }
             }
             HybridLayerKind::FullAttn => {
@@ -1374,7 +1406,7 @@ pub(crate) fn forward_batched_hybrid_seq(
                             .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
                         let mut xn = x[c][t * h..(t + 1) * h].to_vec();
                         rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
-                        w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h])?;
+                        w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h], None)?;
                     }
                 }
                 if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") {

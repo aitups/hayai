@@ -553,6 +553,8 @@ pub struct StreamingGenerator {
     /// Optional per-layer FP32 KV caches resident on a device, used by the OpenCL
     /// attention decode kernel (`HAYAI_ATTN_GPU=1`). `None` keeps the host INT8 path.
     pub(crate) device_kv: Option<Vec<Option<hayai_opencl::DeviceKvCache>>>,
+    /// Optional per-layer DeltaNet recurrent state on a device (`HAYAI_DN_GPU=1`).
+    pub(crate) device_deltanet: Option<Vec<Option<hayai_opencl::DeviceDeltanetState>>>,
     /// MLA attention config (DeepSeek-V2/V3, Kimi); `None` otherwise.
     pub(crate) mla: Option<MlaMeta>,
     /// MLA compressed KV caches (one per layer).
@@ -1156,6 +1158,7 @@ impl StreamingGenerator {
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
             device_kv: None,
+            device_deltanet: None,
             mla,
             mla_kv,
             mla_kv_a_norm,
