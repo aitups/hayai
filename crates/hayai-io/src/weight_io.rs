@@ -532,6 +532,45 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_uring_read_many_at_scatter_is_correct() {
+        // The production Linux path: batched io_uring reads scattered into arbitrary
+        // `dst` offsets. Verifies the batched SQE path, not just backend selection.
+        let path = std::env::temp_dir().join("hayai_iouring_many.bin");
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(&data).unwrap();
+        }
+        std::env::remove_var("HAYAI_FORCE_TOKIO_IO");
+        let mut io = open_weight_io(&path).unwrap();
+        assert_eq!(io.backend(), IoBackend::IoUring, "expected io_uring on Linux");
+        let mut dst = vec![0u8; 96];
+        let reqs = [
+            IoRange {
+                offset: 100,
+                start: 64,
+                end: 96,
+            },
+            IoRange {
+                offset: 0,
+                start: 0,
+                end: 32,
+            },
+            IoRange {
+                offset: 200,
+                start: 32,
+                end: 64,
+            },
+        ];
+        io.read_many_at(&mut dst, &reqs).unwrap();
+        assert_eq!(&dst[0..32], &data[0..32]);
+        assert_eq!(&dst[32..64], &data[200..232]);
+        assert_eq!(&dst[64..96], &data[100..132]);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn read_many_at_falls_back_when_ranges_are_sparse() {
         let path = std::env::temp_dir().join("hayai_weight_io_sparse.bin");
