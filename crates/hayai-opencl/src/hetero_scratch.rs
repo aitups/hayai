@@ -603,6 +603,12 @@ impl StreamingScratch {
         }
     }
 
+    /// Public wrapper: block until the layer's mirror DMA has landed. Required before a
+    /// device kernel reads the mirror (the DMA is issued async to overlap CPU attention).
+    pub fn wait_pending_dma(&mut self) {
+        self.wait_dma();
+    }
+
     /// Map SVM (if any) so the host can write/read the layer pack (Attn CPU GEMV).
     pub fn prepare_host_write(
         &mut self,
@@ -786,6 +792,17 @@ impl StreamingScratch {
                     continue;
                 }
                 jobs.push((mirror.device_id, dest_base + off, off, len));
+            }
+            // Mirror the pre-FFN region (norms + attention Q/K/V/O) so the planner can
+            // run attention on this device with no per-op host upload. Small next to the
+            // FFN slices, and it makes the mirror a complete, self-consistent layer copy.
+            if ffn_base > 0 {
+                jobs.push((mirror.device_id, dest_base, 0, ffn_base));
+            }
+            // Qwen3.5's fused attention gate sits after the FFN in the pack.
+            let (ag0, agl) = (layout.attn_gate_off, layout.attn_gate_len);
+            if agl > 0 && ag0 + agl <= n {
+                jobs.push((mirror.device_id, dest_base + ag0, ag0, agl));
             }
         }
         let mut events: Vec<opencl3::event::Event> = Vec::new();

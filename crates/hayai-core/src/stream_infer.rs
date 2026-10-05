@@ -2283,6 +2283,16 @@ impl StreamingGenerator {
                             Some(self.catalog.path.as_path()),
                         );
                         let caps = crate::planner::caps_from_profile(&profile, u64::MAX);
+                        for c in &caps {
+                            debug!(
+                                "candidate {}: gemv {:.1} GB/s, launch {:.0} µs, link {:.1} GB/s, vram {} MiB",
+                                c.name,
+                                c.gemv_bw / 1e9,
+                                c.launch_s * 1e6,
+                                c.link_bw / 1e9,
+                                c.resident_bytes / (1024 * 1024),
+                            );
+                        }
                         plan.plan_placement(&caps);
                         info!(
                             "Planner: {:.0} ms | host {:.1} GB/s disk {:.1} GB/s | makespan {:.2} ms/layer",
@@ -3545,7 +3555,7 @@ fn begin_gemv(
     Ok(crate::orchestrator::begin_gemv_engine(eng, m, xn)?)
 }
 
-fn begin_gemv_from_scratch(
+pub(crate) fn begin_gemv_from_scratch(
     eng: &hayai_opencl::OpenClEngine,
     m: &QuantMatrix,
     xn: &[f32],
@@ -3607,6 +3617,66 @@ fn begin_gemv_from_scratch(
         // host bytes for this GEMV instead of failing. Correct, just slower.
         Err(_) => begin_gemv(eng, m, xn),
     }
+}
+
+/// Synchronous GEMV from the layer's device mirror / owned SVM using persistent device
+/// buffers (no per-op `clCreateBuffer`, no host weight upload). Returns `Ok(false)`
+/// when there is no device binding for this layer, so the caller can host-upload.
+pub(crate) fn sync_gemv_from_scratch(
+    eng: &hayai_opencl::OpenClEngine,
+    m: &QuantMatrix,
+    xn: &[f32],
+    out: &mut [f32],
+    scratch: &hayai_opencl::StreamingScratch,
+    layer: usize,
+    tensor_off: usize,
+) -> Result<bool, StreamInferError> {
+    use hayai_opencl::{GgmlWeightBind, WeightBind};
+    let (kernel, label) = match m.ggml_type {
+        GgmlType::Q4_0 => (&eng.gemv_q4_0, "q4_0"),
+        GgmlType::Q4_1 => (&eng.gemv_q4_1, "q4_1"),
+        GgmlType::Q8_0 => (&eng.gemv_q8_0, "q8_0"),
+        GgmlType::Q5_0 => (&eng.gemv_q5_0, "q5_0"),
+        GgmlType::Q5_1 => (&eng.gemv_q5_1, "q5_1"),
+        GgmlType::Q2_K => (&eng.gemv_q2_k, "q2_k"),
+        GgmlType::Q3_K => (&eng.gemv_q3_k, "q3_k"),
+        GgmlType::Q4_K => (&eng.gemv_q4_k, "q4_k"),
+        GgmlType::Q5_K => (&eng.gemv_q5_k, "q5_k"),
+        GgmlType::Q6_K => (&eng.gemv_q6_k, "q6_k"),
+        GgmlType::IQ4_NL => (&eng.gemv_iq4_nl, "iq4_nl"),
+        GgmlType::IQ4_XS => (&eng.gemv_iq4_xs, "iq4_xs"),
+        GgmlType::IQ3_XXS => (&eng.gemv_iq3_xxs, "iq3_xxs"),
+        GgmlType::IQ3_S => (&eng.gemv_iq3_s, "iq3_s"),
+        GgmlType::IQ2_XXS => (&eng.gemv_iq2_xxs, "iq2_xxs"),
+        GgmlType::IQ2_XS => (&eng.gemv_iq2_xs, "iq2_xs"),
+        GgmlType::IQ2_S => (&eng.gemv_iq2_s, "iq2_s"),
+        GgmlType::F32 => (&eng.gemv_f32, "f32"),
+        GgmlType::F16 => (&eng.gemv_f16, "f16"),
+        GgmlType::BF16 => (&eng.gemv_bf16, "bf16"),
+        GgmlType::Q8_1 => (&eng.gemv_q8_1, "q8_1"),
+        GgmlType::Q8_K => (&eng.gemv_q8_k, "q8_k"),
+        other => {
+            return Err(StreamInferError::Msg(format!(
+                "OpenCL GEMV missing for {other:?} (no CPU fallback with GPU pool)"
+            )));
+        }
+    };
+    let woff = scratch.weight_offset(layer, tensor_off);
+    // Only the ping-pong layout maps a device mirror to the same offsets the read uses.
+    // In macro-chunk a layer sits at `(layer % block_k) * stride` and the per-role DMA
+    // destinations are slot-based, so a direct mirror read would be mis-offset: fall
+    // back to the (correct) host-upload path there.
+    if scratch.block_k > 1 {
+        return Ok(false);
+    }
+    let bind = match scratch.weight_bind(eng, layer) {
+        Ok(WeightBind::Device { buf }) => GgmlWeightBind::Device(buf),
+        Ok(WeightBind::Svm { ptr }) => GgmlWeightBind::Svm(ptr),
+        Err(_) => return Ok(false),
+    };
+    eng.ggml_gemv_dispatch_bound(kernel, label, m.nrows, m.ncols, bind, woff, xn, out)
+        .map_err(StreamInferError::from)?;
+    Ok(true)
 }
 
 pub(crate) enum GateUpInflight {

@@ -302,6 +302,40 @@ impl EngineOrchestrator {
         self.gpu_gemv(cl, matrix, input, output)
     }
 
+    /// Like [`Self::execute_op`] but, for a device placement, first tries to run the
+    /// GEMV **from the layer's device mirror / owned SVM** (`scratch` + `layer` +
+    /// `tensor_off`) so the weights are not re-uploaded from host per op. Falls back to
+    /// the host-upload path when the device has no binding for that layer. This is what
+    /// lets the planner place attention (or any op) on a GPU at full resident bandwidth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_op_bound(
+        &mut self,
+        op: crate::exec_plan::LayerOpKind,
+        binding: crate::exec_plan::OpBinding,
+        matrix: &QuantMatrix,
+        input: &[f32],
+        output: &mut [f32],
+        scratch: Option<&hayai_opencl::StreamingScratch>,
+        layer: usize,
+        tensor_off: usize,
+    ) -> Result<(), OrchestratorError> {
+        if let (Some(crate::planner::ComputeTarget::Device(i)), Some(sc)) =
+            (self.placement.get(&op).copied(), scratch)
+        {
+            if let Some(eng) = self.pool.engines.get(i) {
+                let ran = crate::stream_infer::sync_gemv_from_scratch(
+                    eng, matrix, input, output, sc, layer, tensor_off,
+                )
+                .map_err(|e| OrchestratorError::Msg(e.to_string()))?;
+                if ran {
+                    return Ok(());
+                }
+                return self.gpu_gemv_indexed(i, matrix, input, output);
+            }
+        }
+        self.execute_op(op, binding, matrix, input, output)
+    }
+
     fn gpu_gemv(
         &self,
         cl: &OpenClEngine,

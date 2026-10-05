@@ -16,6 +16,16 @@ pub struct GemvSyncWorkspace {
     cap_m: usize,
 }
 
+/// Weight source for [`OpenClEngine::ggml_gemv_dispatch_bound`]: a device mirror buffer
+/// at a byte offset, or an owned SVM base pointer at a byte offset.
+pub enum GgmlWeightBind<'a> {
+    Device(&'a Buffer<cl_uchar>),
+    /// # Safety
+    /// The caller guarantees `*const u8` is a valid owned SVM allocation readable by
+    /// this engine's device (the same contract as `ggml_gemv_async_from_svm`).
+    Svm(*const u8),
+}
+
 impl OpenClEngine {
     /// Run Q4 LUT MatMul on the active OpenCL device and write results into `output`.
     ///
@@ -357,6 +367,82 @@ impl OpenClEngine {
             "OpenCL ggml_gemv_{label} [{m}×{n}] on {}",
             self.device_info.device_name
         );
+        Ok(())
+    }
+
+    /// Synchronous GEMV reading the weights from a device mirror / owned SVM, reusing
+    /// the persistent input/output workspace. No per-op `clCreateBuffer` and no weight
+    /// upload — this is the resident path the planner prices.
+    pub fn ggml_gemv_dispatch_bound(
+        &self,
+        kernel: &opencl3::kernel::Kernel,
+        label: &str,
+        m: usize,
+        n: usize,
+        weights: GgmlWeightBind<'_>,
+        weight_off: usize,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        assert_eq!(input.len(), n);
+        assert_eq!(output.len(), m);
+        validate_gemv_shape(label, m, n)?;
+        let m_i = m as cl_int;
+        let n_i = n as cl_int;
+        let off_i = weight_off as i64;
+        let mut ws = self
+            .sync_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("gemv workspace poisoned".into()))?;
+        if ws.cap_n < n.max(1) {
+            let cap = n.max(1);
+            ws.input = Some(unsafe {
+                Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, cap, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("input buffer: {e}")))?
+            });
+            ws.cap_n = cap;
+        }
+        if ws.cap_m < m.max(1) {
+            let cap = m.max(1);
+            ws.output = Some(unsafe {
+                Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, cap, ptr::null_mut())
+                    .map_err(|e| OpenClError::ClError(format!("output buffer: {e}")))?
+            });
+            ws.cap_m = cap;
+        }
+        {
+            let ib = ws.input.as_mut().unwrap();
+            unsafe {
+                self.queue
+                    .enqueue_write_buffer(ib, CL_BLOCKING, 0, input, &[])
+                    .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
+            }
+        }
+        let local = preferred_local_size(m, self.device_info.max_work_group_size);
+        let global = ((m + local - 1) / local) * local;
+        let local_bytes = 2048 * std::mem::size_of::<cl_float>();
+        let ev = unsafe {
+            let mut exec = ExecuteKernel::new(kernel);
+            exec.set_arg(&m_i).set_arg(&n_i).set_arg(&off_i);
+            let exec_ref = match weights {
+                GgmlWeightBind::Device(b) => exec.set_arg(b),
+                GgmlWeightBind::Svm(p) => exec.set_arg_svm(p),
+            };
+            exec_ref
+                .set_arg(ws.input.as_ref().unwrap())
+                .set_arg(ws.output.as_ref().unwrap())
+                .set_arg_local_buffer(local_bytes)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue bound {label}: {e}")))?
+        };
+        let wait = [ev.get()];
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(ws.output.as_ref().unwrap(), CL_BLOCKING, 0, output, &wait)
+                .map_err(|e| OpenClError::ClError(format!("read output: {e}")))?;
+        }
         Ok(())
     }
 

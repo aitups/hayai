@@ -7,6 +7,7 @@ pub mod memory;
 pub mod pool;
 
 pub use async_gemv::PendingGemv;
+pub use compute::GgmlWeightBind;
 pub use context::{OpenClEngine, OpenClError};
 pub use device::{discover_opencl_devices, DeviceKind, OpenClDeviceInfo};
 /// Re-exported so callers can name the GEMV kernel type when selecting one.

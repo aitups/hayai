@@ -245,18 +245,18 @@ pub fn caps_from_profile(
         } else {
             stream
         };
+        // The product GEMV path reads the layer from the device mirror (streaming) or
+        // the owned SVM/resident mirror (resident), so the *usable* bandwidth is the
+        // resident one, not the per-op host-upload figure. `link` is kept for the rare
+        // host-upload fallback. This is what makes a real GPU attractive to the planner.
         caps.push(TargetCaps {
             target: ComputeTarget::Device(d.device_index),
             name: d.name.clone(),
-            gemv_bw: stream,
+            gemv_bw: resident,
             resident_gemv_bw: resident,
             launch_s: d.launch_us.max(0.0) * 1e-6,
             link_bw: link,
-            // Residency is per dispatch path, not per device: only ops that read from a
-            // VRAM mirror get the resident bandwidth. Ops dispatched through
-            // `execute_op` stream/upload from host, so no device is assumed resident
-            // here. This is enabled once that path reads a mirror (dispatch work).
-            resident_bytes: 0,
+            resident_bytes: d.global_mem_bytes,
             is_gpu: true,
         });
     }

@@ -127,7 +127,7 @@ impl StreamingGenerator {
         orch.execute_quant_gemv(&cache.eh, &cat, &mut x)?;
 
         // The draft block itself (full attention + FFN), on its own KV cache.
-        full_attn_apply(self, orch, layer, pos, eps, &cache.pack, &mut x)?;
+        full_attn_apply(self, orch, layer, pos, eps, &cache.pack, None, None, &mut x)?;
         ffn_apply(self, orch, None, layer, eps, &cache.pack, None, &mut x, None)?;
         rms_norm(&mut x, &cache.shared_norm, eps);
         self.mtp_cache = Some(cache);

@@ -95,7 +95,17 @@ pub(crate) fn prefill_hybrid_all(
                 let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
                 gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
                 for (t, x) in xs.iter_mut().enumerate() {
-                    full_attn_apply(gen, orch, layer, base_pos + t, eps, &pack, x)?;
+                    full_attn_apply(
+                        gen,
+                        orch,
+                        layer,
+                        base_pos + t,
+                        eps,
+                        &pack,
+                        Some(scratch),
+                        Some(&layout),
+                        x,
+                    )?;
                     ffn_apply(
                         gen,
                         orch,
@@ -594,7 +604,7 @@ fn run_full_attn_block(
     let slot = layer % 2;
     let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
     gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
-    full_attn_apply(gen, orch, layer, pos, eps, &pack, x)?;
+    full_attn_apply(gen, orch, layer, pos, eps, &pack, Some(&mut *scratch), Some(&layout), x)?;
     gen.finish_ffn_unmap(orch, scratch, slot)?;
     ffn_apply(
         gen,
@@ -617,9 +627,28 @@ pub(crate) fn full_attn_apply(
     pos: usize,
     eps: f32,
     pack: &hayai_model::LayerWeightPack,
+    scratch: Option<&mut hayai_opencl::StreamingScratch>,
+    layout: Option<&hayai_model::LayerPackLayout>,
     x: &mut [f32],
 ) -> Result<(), StreamInferError> {
     use crate::exec_plan::{op_binding, LayerOpKind};
+    // If the planner runs any attention GEMV on a device, the layer's mirror DMA must
+    // have landed before the kernel reads it (the DMA is issued async to overlap the
+    // host path). Otherwise the device would read stale mirror weights.
+    let mut scratch = scratch;
+    let attn_on_device = [
+        LayerOpKind::AttnQ,
+        LayerOpKind::AttnK,
+        LayerOpKind::AttnV,
+        LayerOpKind::AttnO,
+    ]
+    .iter()
+    .any(|&k| matches!(orch.placed_target(k), Some(crate::planner::ComputeTarget::Device(_))));
+    if attn_on_device {
+        if let Some(sc) = scratch.as_deref_mut() {
+            sc.wait_pending_dma();
+        }
+    }
     let h = x.len();
     let t_attn = Instant::now();
     let mut xn = x.to_vec();
@@ -630,11 +659,41 @@ pub(crate) fn full_attn_apply(
     let mut q_full = vec![0.0f32; pack.wq.nrows];
     let mut k = vec![0.0f32; pack.wk.nrows];
     let mut v = vec![0.0f32; pack.wv.nrows];
-    // Attention GEMVs go through the orchestrator so the planner places them where
-    // they are fastest (they are not pinned to the CPU).
-    orch.execute_op(LayerOpKind::AttnQ, op_binding(LayerOpKind::AttnQ), &pack.wq, &xn, &mut q_full)?;
-    orch.execute_op(LayerOpKind::AttnK, op_binding(LayerOpKind::AttnK), &pack.wk, &xn, &mut k)?;
-    orch.execute_op(LayerOpKind::AttnV, op_binding(LayerOpKind::AttnV), &pack.wv, &xn, &mut v)?;
+    // Attention GEMVs go through the orchestrator so the planner places them where they
+    // are fastest. When the layer is in a device mirror (`scratch`) they run resident
+    // (no per-op host upload); otherwise the host-upload path is used.
+    let off = layout.map(|l| (l.wq_off, l.wk_off, l.wv_off, l.wo_off));
+    let (wq_off, wk_off, wv_off, wo_off) = off.unwrap_or((0, 0, 0, 0));
+    orch.execute_op_bound(
+        LayerOpKind::AttnQ,
+        op_binding(LayerOpKind::AttnQ),
+        &pack.wq,
+        &xn,
+        &mut q_full,
+        scratch.as_deref(),
+        layer,
+        wq_off,
+    )?;
+    orch.execute_op_bound(
+        LayerOpKind::AttnK,
+        op_binding(LayerOpKind::AttnK),
+        &pack.wk,
+        &xn,
+        &mut k,
+        scratch.as_deref(),
+        layer,
+        wk_off,
+    )?;
+    orch.execute_op_bound(
+        LayerOpKind::AttnV,
+        op_binding(LayerOpKind::AttnV),
+        &pack.wv,
+        &xn,
+        &mut v,
+        scratch.as_deref(),
+        layer,
+        wv_off,
+    )?;
 
     // Per-layer dims from this block's tensors (9B/27B may differ from 4B meta defaults).
     let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
@@ -693,12 +752,15 @@ pub(crate) fn full_attn_apply(
     }
     attn_out.resize(wo_in, 0.0);
     let mut attn_proj = vec![0.0f32; h];
-    orch.execute_op(
+    orch.execute_op_bound(
         LayerOpKind::AttnO,
         op_binding(LayerOpKind::AttnO),
         &pack.wo,
         &attn_out,
         &mut attn_proj,
+        scratch.as_deref(),
+        layer,
+        wo_off,
     )?;
     for i in 0..h {
         x[i] += attn_proj[i];

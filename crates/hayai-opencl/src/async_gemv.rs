@@ -343,15 +343,30 @@ impl OpenClEngine {
         }
         .map_err(|e| OpenClError::ClError(format!("bench write: {e}")))?;
         let input = vec![0.01f32; n];
-        let _ = self
-            .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
-            .wait()?;
+        let mut out = vec![0.0f32; m];
+        let _ = self.ggml_gemv_dispatch_bound(
+            &self.gemv_f32,
+            "f32",
+            m,
+            n,
+            crate::compute::GgmlWeightBind::Device(&wbuf),
+            0,
+            &input,
+            &mut out,
+        )?;
         let iters = 10usize;
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
-            let _ = self
-                .ggml_gemv_begin_dev(&self.gemv_f32, "f32", m, n, &wbuf, 0, &input)?
-                .wait()?;
+            let _ = self.ggml_gemv_dispatch_bound(
+                &self.gemv_f32,
+                "f32",
+                m,
+                n,
+                crate::compute::GgmlWeightBind::Device(&wbuf),
+                0,
+                &input,
+                &mut out,
+            )?;
         }
         let dt = t0.elapsed().as_secs_f64();
         if dt <= 0.0 {
