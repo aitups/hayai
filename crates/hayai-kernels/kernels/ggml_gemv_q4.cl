@@ -274,15 +274,13 @@ inline void hayai_get_scale_min_k4(int j, __global const uchar* scales, uchar* s
     }
 }
 
-// Q4_K GEMV, split across work-items. The old one-work-item-per-row version had only
-// `M` work-items (low occupancy: a T4 ran it at ~3 GB/s) and strided, uncoalesced
-// weight reads. Here HAYAI_Q4K_SPLIT work-items cooperate on each row (≥ M*SPLIT
-// work-items), the input is read from global (small, L2-shared across all rows), and the
-// partial sums are reduced in `__local`. The host launches `global = M * HAYAI_Q4K_SPLIT`
-// for this kernel.
-#ifndef HAYAI_Q4K_SPLIT
-#define HAYAI_Q4K_SPLIT 8
-#endif
+// Q4_K GEMV, warp-striped for coalesced weight reads. One warp (32 lanes) cooperates on
+// a row: lane `l` reads the 4 `q` bytes at byte offset `16 + 4*l` of each 144-byte block,
+// i.e. bytes `16+4*l .. 16+4*l+4` — contiguous across the 32 lanes (one coalesced 128-byte
+// read per block). Each lane dequantises its 8 nibbles and accumulates; the 32 partials
+// are reduced in `__local`. The host launches `global = M * 32` for this kernel.
+// (The old one-WI-per-row version read rows with a stride of `row_bytes` across lanes:
+// uncoalesced, ~5 GB/s on a T4.)
 #ifndef HAYAI_WG_MAX
 #define HAYAI_WG_MAX 1024
 #endif
@@ -297,62 +295,36 @@ __kernel void ggml_gemv_q4_k(
     __local float* restrict local_input
 ) {
     int lid = (int)get_local_id(0);
-    int lsize = (int)get_local_size(0);
-    int wg = (int)get_group_id(0);
-    int rows_per_wg = lsize / HAYAI_Q4K_SPLIT;
-    int r_local = lid / HAYAI_Q4K_SPLIT;
-    int part = lid - r_local * HAYAI_Q4K_SPLIT;
-    int row = wg * rows_per_wg + r_local;
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
 
     float sum = 0.0f;
     if (row < M) {
         int blocks = N / 256;
         __global const uchar* wbase = weights + weight_off + (long)row * blocks * 144;
-        int b0 = part * blocks / HAYAI_Q4K_SPLIT;
-        int b1 = (part + 1) * blocks / HAYAI_Q4K_SPLIT;
-        for (int bi = b0; bi < b1; bi++) {
+        int sub = lane / 8;          // sub-block (0..3) that owns this lane's scales
+        int moff = (lane % 8) * 4;   // byte offset within the sub-block's 32 q bytes
+        for (int bi = 0; bi < blocks; bi++) {
             __global const uchar* block = wbase + bi * 144;
             float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
             float minv = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
             __global const uchar* scales = block + 4;
-            __global const uchar* q = block + 16;
-            int x_base = bi * 256;
-            int is = 0;
-            int qo = 0;
-            for (int sub = 0; sub < 4; sub++) {
-                uchar sc0, m0, sc1, m1;
-                hayai_get_scale_min_k4(is, scales, &sc0, &m0);
-                hayai_get_scale_min_k4(is + 1, scales, &sc1, &m1);
-                float d1 = d * (float)sc0;
-                float m1v = minv * (float)m0;
-                float d2 = d * (float)sc1;
-                float m2v = minv * (float)m1;
-                union { uchar8 v; uchar a[8]; } qv0u, qv1u, qv2u, qv3u;
-                qv0u.v = vload8(0, &q[qo]);
-                qv1u.v = vload8(0, &q[qo + 8]);
-                qv2u.v = vload8(0, &q[qo + 16]);
-                qv3u.v = vload8(0, &q[qo + 24]);
-                for (int l = 0; l < 8; l++) {
-                    int c0 = qv0u.a[l] & 0x0F;
-                    int c1 = qv0u.a[l] >> 4;
-                    int c2 = qv1u.a[l] & 0x0F;
-                    int c3 = qv1u.a[l] >> 4;
-                    int c4 = qv2u.a[l] & 0x0F;
-                    int c5 = qv2u.a[l] >> 4;
-                    int c6 = qv3u.a[l] & 0x0F;
-                    int c7 = qv3u.a[l] >> 4;
-                    int xb = x_base + sub * 64;
-                    sum += (d1 * (float)c0 - m1v) * input[xb + l];
-                    sum += (d2 * (float)c1 - m2v) * input[xb + 32 + l];
-                    sum += (d1 * (float)c2 - m1v) * input[xb + 8 + l];
-                    sum += (d2 * (float)c3 - m2v) * input[xb + 40 + l];
-                    sum += (d1 * (float)c4 - m1v) * input[xb + 16 + l];
-                    sum += (d2 * (float)c5 - m2v) * input[xb + 48 + l];
-                    sum += (d1 * (float)c6 - m1v) * input[xb + 24 + l];
-                    sum += (d2 * (float)c7 - m2v) * input[xb + 56 + l];
-                }
-                qo += 32;
-                is += 2;
+            uchar sc0, m0, sc1, m1;
+            hayai_get_scale_min_k4(2 * sub, scales, &sc0, &m0);
+            hayai_get_scale_min_k4(2 * sub + 1, scales, &sc1, &m1);
+            float d1 = d * (float)sc0;
+            float m1v = minv * (float)m0;
+            float d2 = d * (float)sc1;
+            float m2v = minv * (float)m1;
+            union { uchar4 v; uchar a[4]; } qv;
+            qv.v = vload4(0, &block[16 + sub * 32 + moff]);
+            int xb = bi * 256 + sub * 64 + moff;
+            for (int k = 0; k < 4; k++) {
+                int cl = qv.a[k] & 0x0F;
+                int ch = qv.a[k] >> 4;
+                sum += (d1 * (float)cl - m1v) * input[xb + k];
+                sum += (d2 * (float)ch - m2v) * input[xb + 32 + k];
             }
         }
     }
@@ -360,9 +332,9 @@ __kernel void ggml_gemv_q4_k(
     __local float red[HAYAI_WG_MAX];
     red[lid] = sum;
     barrier(CLK_LOCAL_MEM_FENCE);
-    if (part == 0 && row < M) {
+    if (lane == 0 && row < M) {
         float s = 0.0f;
-        for (int p = 0; p < HAYAI_Q4K_SPLIT; p++) {
+        for (int p = 0; p < 32; p++) {
             s += red[lid + p];
         }
         output[row] = s;
@@ -499,6 +471,11 @@ __kernel void ggml_gemv_q6_k(
     output[row] = sum;
 }
 
+// F32 GEMV, warp-striped for coalesced weight reads. The old one-WI-per-row version
+// read each row with a stride of N floats across lanes (uncoalesced, ~15 GB/s on a T4).
+// Here a warp (32 lanes) cooperates on a row with `c = lane; c += 32`, so at every
+// instruction the 32 lanes read 32 consecutive floats, then reduce in `__local`.
+// The host launches `global = M * 32` for this kernel.
 __kernel void ggml_gemv_f32(
     const int M,
     const int N,
@@ -508,13 +485,28 @@ __kernel void ggml_gemv_f32(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const float* w = (__global const float*)(weights + weight_off + row * N * 4);
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int c = 0; c < N; c++) sum += w[c] * input[c];
-    output[row] = sum;
+    if (row < M) {
+        __global const float* w =
+            (__global const float*)(weights + weight_off + (long)row * N * 4);
+        for (int c = lane; c < N; c += 32) {
+            sum += w[c] * input[c];
+        }
+    }
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_f16(
