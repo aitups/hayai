@@ -3750,6 +3750,17 @@ pub(crate) fn ffn_begin_gate_up_scratch(
         *used_apu = true;
     }
 
+    // Persistent-buffer synchronous dispatch from the layer mirror. `begin_dev`
+    // (async) assigns fresh input/output buffers per op; for small ops that churn
+    // dominates the kernel time on a discrete GPU, so prefer the bound path.
+    if let (Some(sc), Some(lay)) = (scratch, layout) {
+        if sync_gemv_from_scratch(gate_eng, gate, xn, _gate_out, sc, layer, lay.gate_off)? {
+            if sync_gemv_from_scratch(up_eng, up, xn, _up_out, sc, layer, lay.up_off)? {
+                return Ok(GateUpInflight::Done);
+            }
+        }
+    }
+
     let g = if let (Some(sc), Some(lay)) = (scratch, layout) {
         begin_gemv_from_scratch(gate_eng, gate, xn, sc, layer, lay.gate_off)?
     } else {
@@ -3803,6 +3814,11 @@ pub(crate) fn ffn_finish_scratch(
             .for_role(2)
             .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
         *used_dgpu = true;
+        if let (Some(sc), Some(lay)) = (scratch, layout) {
+            if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, lay.down_off)? {
+                return Ok(());
+            }
+        }
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
             begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
         } else {
@@ -3853,6 +3869,11 @@ pub(crate) fn ffn_finish_gelu_scratch(
             .for_role(2)
             .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
         *used_dgpu = true;
+        if let (Some(sc), Some(lay)) = (scratch, layout) {
+            if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, lay.down_off)? {
+                return Ok(());
+            }
+        }
         let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
             begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
         } else {
