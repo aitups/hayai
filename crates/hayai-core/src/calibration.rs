@@ -28,6 +28,8 @@ pub struct DeviceProfile {
     pub effective_gemv_gbytes_s: f64,
     /// Effective GEMV bandwidth (bytes/s) with weights already resident on the device.
     pub resident_gemv_gbytes_s: f64,
+    /// Resident GEMV bandwidth (bytes/s) for the Q4_K quant (the real FFN weights).
+    pub resident_gemv_q4k_gbytes_s: f64,
     /// Fixed per-op launch overhead (µs).
     pub launch_us: f64,
     /// Host→device transfer bandwidth (bytes/s).
@@ -110,10 +112,11 @@ impl HwProfile {
         ));
         for d in &self.devices {
             s.push_str(&format!(
-                "Device {:<24} GEMV stream {:>6.2} GB/s | resident {:>6.2} GB/s | launch {:>5.0} us | DMA {:>5.2} GB/s  ({} MiB, {})\n",
+                "Device {:<24} GEMV stream {:>6.2} GB/s | resident {:>6.2} GB/s | q4_k {:>6.2} GB/s | launch {:>5.0} us | DMA {:>5.2} GB/s  ({} MiB, {})\n",
                 d.name,
                 d.effective_gemv_gbytes_s,
                 d.resident_gemv_gbytes_s,
+                d.resident_gemv_q4k_gbytes_s,
                 d.launch_us,
                 d.dma_gbytes_s,
                 d.global_mem_bytes / (1024 * 1024),
@@ -234,7 +237,12 @@ pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile
     let mut devices = Vec::new();
     for (idx, e) in pool.engines.iter().enumerate() {
         let bw = measure_device_gemv_gbytes_s(e).unwrap_or(0.0);
-        let resident_bw = e.bench_resident_gemv_gbytes_s(2048, 2048).unwrap_or(bw);
+        // Use a large GEMV so the fixed per-launch overhead (~100 us) is amortised;
+        // a 2048x2048 problem is dominated by launch, not bandwidth.
+        let resident_bw = e.bench_resident_gemv_gbytes_s(8192, 4096).unwrap_or(bw);
+        let resident_q4k_bw = e
+            .bench_resident_gemv_q4k_gbytes_s(8192, 4096)
+            .unwrap_or(resident_bw);
         let launch_us = e
             .bench_launch_seconds()
             .map(|s| s * 1e6)
@@ -249,6 +257,7 @@ pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile
             global_mem_bytes: e.device_info.global_mem_size,
             effective_gemv_gbytes_s: bw,
             resident_gemv_gbytes_s: resident_bw,
+            resident_gemv_q4k_gbytes_s: resident_q4k_bw,
             launch_us,
             dma_gbytes_s: dma_bw,
         });

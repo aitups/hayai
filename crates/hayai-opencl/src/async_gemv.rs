@@ -335,7 +335,29 @@ impl OpenClEngine {
     /// Effective GEMV bandwidth (bytes/s) with the weights **already resident** on the
     /// device (no per-call upload) — the mirror/SVM-owned path the planner prices.
     pub fn bench_resident_gemv_gbytes_s(&self, m: usize, n: usize) -> Result<f64, OpenClError> {
-        let nbytes = m * n * 4;
+        self.bench_resident_gemv_label_gbytes_s(&self.gemv_f32, "f32", m, n)
+    }
+
+    /// Resident GEMV bandwidth for the 4-bit K-quant that dominates real FFN weights.
+    pub fn bench_resident_gemv_q4k_gbytes_s(&self, m: usize, n: usize) -> Result<f64, OpenClError> {
+        if n % 256 != 0 {
+            return Ok(0.0);
+        }
+        self.bench_resident_gemv_label_gbytes_s(&self.gemv_q4_k, "q4_k", m, n)
+    }
+
+    pub fn bench_resident_gemv_label_gbytes_s(
+        &self,
+        kernel: &Kernel,
+        label: &str,
+        m: usize,
+        n: usize,
+    ) -> Result<f64, OpenClError> {
+        let row_bytes = match label {
+            "q4_k" => (n / 256) * 144,
+            _ => n * 4,
+        };
+        let nbytes = m * row_bytes;
         let weights = vec![0u8; nbytes];
         let mut wbuf = unsafe {
             Buffer::<cl_uchar>::create(&self.context, CL_MEM_READ_ONLY, nbytes, ptr::null_mut())
@@ -349,8 +371,8 @@ impl OpenClEngine {
         let input = vec![0.01f32; n];
         let mut out = vec![0.0f32; m];
         let _ = self.ggml_gemv_dispatch_bound(
-            &self.gemv_f32,
-            "f32",
+            kernel,
+            label,
             m,
             n,
             crate::compute::GgmlWeightBind::Device(&wbuf),
@@ -362,8 +384,8 @@ impl OpenClEngine {
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
             let _ = self.ggml_gemv_dispatch_bound(
-                &self.gemv_f32,
-                "f32",
+                kernel,
+                label,
                 m,
                 n,
                 crate::compute::GgmlWeightBind::Device(&wbuf),
