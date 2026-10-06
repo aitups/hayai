@@ -274,6 +274,19 @@ inline void hayai_get_scale_min_k4(int j, __global const uchar* scales, uchar* s
     }
 }
 
+// Q4_K GEMV, split across work-items. The old one-work-item-per-row version had only
+// `M` work-items (low occupancy: a T4 ran it at ~3 GB/s) and strided, uncoalesced
+// weight reads. Here HAYAI_Q4K_SPLIT work-items cooperate on each row (≥ M*SPLIT
+// work-items), the input is read from global (small, L2-shared across all rows), and the
+// partial sums are reduced in `__local`. The host launches `global = M * HAYAI_Q4K_SPLIT`
+// for this kernel.
+#ifndef HAYAI_Q4K_SPLIT
+#define HAYAI_Q4K_SPLIT 8
+#endif
+#ifndef HAYAI_WG_MAX
+#define HAYAI_WG_MAX 1024
+#endif
+
 __kernel void ggml_gemv_q4_k(
     const int M,
     const int N,
@@ -283,68 +296,77 @@ __kernel void ggml_gemv_q4_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 144;
+    int lid = (int)get_local_id(0);
+    int lsize = (int)get_local_size(0);
+    int wg = (int)get_group_id(0);
+    int rows_per_wg = lsize / HAYAI_Q4K_SPLIT;
+    int r_local = lid / HAYAI_Q4K_SPLIT;
+    int part = lid - r_local * HAYAI_Q4K_SPLIT;
+    int row = wg * rows_per_wg + r_local;
+
     float sum = 0.0f;
-    for (int t0 = 0; t0 < N; t0 += HAYAI_X_TILE) {
-        int ntile = min(HAYAI_X_TILE, N - t0);
-        hayai_load_input_tile(t0, ntile, input, local_input);
-        if (row < M) {
-            int bi0 = t0 / 256;
-            int bi1 = (t0 + ntile) / 256;
-            int row_base = row * row_bytes;
-            for (int bi = bi0; bi < bi1; bi++) {
-                __global const uchar* block = wbase + row_base + bi * 144;
-                float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-                float minv = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
-                __global const uchar* scales = block + 4;
-                __global const uchar* q = block + 16;
-                int x_base = bi * 256 - t0;
-                int is = 0;
-                int qo = 0;
-                for (int sub = 0; sub < 4; sub++) {
-                    uchar sc0, m0, sc1, m1;
-                    hayai_get_scale_min_k4(is, scales, &sc0, &m0);
-                    hayai_get_scale_min_k4(is + 1, scales, &sc1, &m1);
-                    float d1 = d * (float)sc0;
-                    float m1v = minv * (float)m0;
-                    float d2 = d * (float)sc1;
-                    float m2v = minv * (float)m1;
-                    // Vectorized loads: 4 × vload8 cover the 32 qs bytes of the sub-block.
-                    union { uchar8 v; uchar a[8]; } qv0u, qv1u, qv2u, qv3u;
-                    qv0u.v = vload8(0, &q[qo]);
-                    qv1u.v = vload8(0, &q[qo + 8]);
-                    qv2u.v = vload8(0, &q[qo + 16]);
-                    qv3u.v = vload8(0, &q[qo + 24]);
-                    for (int l = 0; l < 8; l++) {
-                        int c0 = qv0u.a[l] & 0x0F;
-                        int c1 = qv0u.a[l] >> 4;
-                        int c2 = qv1u.a[l] & 0x0F;
-                        int c3 = qv1u.a[l] >> 4;
-                        int c4 = qv2u.a[l] & 0x0F;
-                        int c5 = qv2u.a[l] >> 4;
-                        int c6 = qv3u.a[l] & 0x0F;
-                        int c7 = qv3u.a[l] >> 4;
-                        int xb = x_base + sub * 64;
-                        sum += (d1 * (float)c0 - m1v) * local_input[xb + l];
-                        sum += (d2 * (float)c1 - m2v) * local_input[xb + 32 + l];
-                        sum += (d1 * (float)c2 - m1v) * local_input[xb + 8 + l];
-                        sum += (d2 * (float)c3 - m2v) * local_input[xb + 40 + l];
-                        sum += (d1 * (float)c4 - m1v) * local_input[xb + 16 + l];
-                        sum += (d2 * (float)c5 - m2v) * local_input[xb + 48 + l];
-                        sum += (d1 * (float)c6 - m1v) * local_input[xb + 24 + l];
-                        sum += (d2 * (float)c7 - m2v) * local_input[xb + 56 + l];
-                    }
-                    qo += 32;
-                    is += 2;
+    if (row < M) {
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 144;
+        int b0 = part * blocks / HAYAI_Q4K_SPLIT;
+        int b1 = (part + 1) * blocks / HAYAI_Q4K_SPLIT;
+        for (int bi = b0; bi < b1; bi++) {
+            __global const uchar* block = wbase + bi * 144;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            float minv = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
+            __global const uchar* scales = block + 4;
+            __global const uchar* q = block + 16;
+            int x_base = bi * 256;
+            int is = 0;
+            int qo = 0;
+            for (int sub = 0; sub < 4; sub++) {
+                uchar sc0, m0, sc1, m1;
+                hayai_get_scale_min_k4(is, scales, &sc0, &m0);
+                hayai_get_scale_min_k4(is + 1, scales, &sc1, &m1);
+                float d1 = d * (float)sc0;
+                float m1v = minv * (float)m0;
+                float d2 = d * (float)sc1;
+                float m2v = minv * (float)m1;
+                union { uchar8 v; uchar a[8]; } qv0u, qv1u, qv2u, qv3u;
+                qv0u.v = vload8(0, &q[qo]);
+                qv1u.v = vload8(0, &q[qo + 8]);
+                qv2u.v = vload8(0, &q[qo + 16]);
+                qv3u.v = vload8(0, &q[qo + 24]);
+                for (int l = 0; l < 8; l++) {
+                    int c0 = qv0u.a[l] & 0x0F;
+                    int c1 = qv0u.a[l] >> 4;
+                    int c2 = qv1u.a[l] & 0x0F;
+                    int c3 = qv1u.a[l] >> 4;
+                    int c4 = qv2u.a[l] & 0x0F;
+                    int c5 = qv2u.a[l] >> 4;
+                    int c6 = qv3u.a[l] & 0x0F;
+                    int c7 = qv3u.a[l] >> 4;
+                    int xb = x_base + sub * 64;
+                    sum += (d1 * (float)c0 - m1v) * input[xb + l];
+                    sum += (d2 * (float)c1 - m2v) * input[xb + 32 + l];
+                    sum += (d1 * (float)c2 - m1v) * input[xb + 8 + l];
+                    sum += (d2 * (float)c3 - m2v) * input[xb + 40 + l];
+                    sum += (d1 * (float)c4 - m1v) * input[xb + 16 + l];
+                    sum += (d2 * (float)c5 - m2v) * input[xb + 48 + l];
+                    sum += (d1 * (float)c6 - m1v) * input[xb + 24 + l];
+                    sum += (d2 * (float)c7 - m2v) * input[xb + 56 + l];
                 }
+                qo += 32;
+                is += 2;
             }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (row < M) output[row] = sum;
+
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (part == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < HAYAI_Q4K_SPLIT; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 

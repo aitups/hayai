@@ -110,9 +110,12 @@ impl HwProfile {
         ));
         for d in &self.devices {
             s.push_str(&format!(
-                "Device {:<24} {:>7.2} GB/s  ({} MiB, {})\n",
+                "Device {:<24} GEMV stream {:>6.2} GB/s | resident {:>6.2} GB/s | launch {:>5.0} us | DMA {:>5.2} GB/s  ({} MiB, {})\n",
                 d.name,
                 d.effective_gemv_gbytes_s,
+                d.resident_gemv_gbytes_s,
+                d.launch_us,
+                d.dma_gbytes_s,
                 d.global_mem_bytes / (1024 * 1024),
                 d.kind
             ));

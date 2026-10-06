@@ -151,7 +151,7 @@ impl OpenClEngine {
         }
 
         let local = preferred_local_async(m, self.device_info.max_work_group_size);
-        let global = ((m + local - 1) / local) * local;
+        let global = ((m.saturating_mul(crate::compute::gemv_split(label)) + local - 1) / local) * local;
 
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let kernel_event = unsafe {
@@ -258,7 +258,7 @@ impl OpenClEngine {
         }
 
         let local = preferred_local_async(m, self.device_info.max_work_group_size);
-        let global = ((m + local - 1) / local) * local;
+        let global = ((m.saturating_mul(crate::compute::gemv_split(label)) + local - 1) / local) * local;
 
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let kernel_event = unsafe {
@@ -411,3 +411,4 @@ fn preferred_local_async(m: usize, max_work_group: usize) -> usize {
     }
     64.min(m.max(16)).min(cap)
 }
+

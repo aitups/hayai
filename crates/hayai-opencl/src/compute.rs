@@ -26,6 +26,15 @@ pub enum GgmlWeightBind<'a> {
     Svm(*const u8),
 }
 
+/// Work-items cooperating per output row for the row-split GEMV kernels. The host must
+/// launch `global = M * split` for the matching kernel (see `ggml_gemv_q4_k`).
+pub(crate) fn gemv_split(label: &str) -> usize {
+    match label {
+        "q4_k" => 8,
+        _ => 1,
+    }
+}
+
 impl OpenClEngine {
     /// Run Q4 LUT MatMul on the active OpenCL device and write results into `output`.
     ///
@@ -332,7 +341,7 @@ impl OpenClEngine {
         }
 
         let local = preferred_local_size(m, self.device_info.max_work_group_size);
-        let global = ((m + local - 1) / local) * local;
+        let global = ((m.saturating_mul(gemv_split(label)) + local - 1) / local) * local;
 
         // Must match HAYAI_X_TILE in ggml_gemv_q4.cl (tiled __local input).
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
@@ -419,7 +428,7 @@ impl OpenClEngine {
             }
         }
         let local = preferred_local_size(m, self.device_info.max_work_group_size);
-        let global = ((m + local - 1) / local) * local;
+        let global = ((m.saturating_mul(gemv_split(label)) + local - 1) / local) * local;
         let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let ev = unsafe {
             let mut exec = ExecuteKernel::new(kernel);
@@ -1743,4 +1752,5 @@ mod tests {
         );
     }
 }
+
 
