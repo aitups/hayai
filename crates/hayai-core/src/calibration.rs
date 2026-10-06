@@ -40,6 +40,8 @@ pub struct DeviceProfile {
 #[derive(Debug, Clone)]
 pub struct HwProfile {
     pub host_bw_gbytes_s: f64,
+    /// Measured CPU Q4_K GEMV bandwidth (the real host compute rate).
+    pub host_gemv_gbytes_s: f64,
     pub disk_bw_gbytes_s: f64,
     pub devices: Vec<DeviceProfile>,
 }
@@ -107,6 +109,10 @@ impl HwProfile {
             self.host_bw_gbytes_s
         ));
         s.push_str(&format!(
+            "Host Q4_K GEMV        : {:6.2} GB/s\n",
+            self.host_gemv_gbytes_s
+        ));
+        s.push_str(&format!(
             "Disk read bandwidth   : {:6.2} GB/s\n",
             self.disk_bw_gbytes_s
         ));
@@ -161,6 +167,32 @@ pub fn measure_host_bandwidth_gbytes_s() -> f64 {
     }
     // read + write
     2.0 * (len * iters) as f64 / dt / 1e9
+}
+
+/// Host (CPU) Q4_K GEMV bandwidth in GB/s — the rate the real CPU compute path
+/// achieves, not the RAM memcpy peak. The planner must price the CPU by this, or it
+/// over-values the host and leaves a fast GPU idle.
+pub fn measure_host_gemv_gbytes_s() -> f64 {
+    const M: usize = 4096;
+    const N: usize = 4096;
+    let blocks_per_row = N / 256;
+    let row_bytes = blocks_per_row * 144;
+    let weights = vec![0x11u8; M * row_bytes];
+    let input = vec![0.01f32; N];
+    let mut out = vec![0.0f32; M];
+    // Warm up (rayon thread pool + branch predictor).
+    let _ = hayai_model::q4k::gemv_q4_k(M, N, &weights, &input, &mut out);
+    let iters = 5usize;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        hayai_model::q4k::gemv_q4_k(M, N, &weights, &input, &mut out).ok();
+        std::hint::black_box(&out);
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    (M * row_bytes * iters) as f64 / dt / 1e9
 }
 
 /// Sequential disk read bandwidth through the production [`hayai_io`] path.
@@ -231,6 +263,7 @@ pub fn measure_device_gemv_gbytes_s(engine: &OpenClEngine) -> Result<f64, String
 /// Run the full calibration over the OpenCL pool and (optionally) a model file.
 pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile {
     let host_bw_gbytes_s = measure_host_bandwidth_gbytes_s();
+    let host_gemv_gbytes_s = measure_host_gemv_gbytes_s();
     let disk_bw_gbytes_s = disk_path
         .and_then(|p| measure_disk_bandwidth_gbytes_s(p).ok())
         .unwrap_or(0.0);
@@ -264,6 +297,7 @@ pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile
     }
     HwProfile {
         host_bw_gbytes_s,
+        host_gemv_gbytes_s,
         disk_bw_gbytes_s,
         devices,
     }

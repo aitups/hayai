@@ -845,7 +845,13 @@ pub(crate) fn full_attn_apply(
         }
     } else if let Some(ref gate_w) = pack.attn_gate {
         let mut gate = vec![0.0f32; gate_w.nrows];
-        gate_w.gemv(&xn, &mut gate)?;
+        orch.execute_op(
+            LayerOpKind::AttnGate,
+            op_binding(LayerOpKind::AttnGate),
+            gate_w,
+            &xn,
+            &mut gate,
+        )?;
         for i in 0..attn_out.len().min(gate.len()) {
             attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
         }

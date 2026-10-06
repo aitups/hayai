@@ -25,6 +25,7 @@ use tracing::{debug, info};
 use crate::adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
 use crate::infer::{spmm_adj, FfnOverride, GenerateStats, SparseAdj};
 use crate::orchestrator::EngineOrchestrator;
+use crate::exec_plan::{op_binding, LayerOpKind};
 
 /// Raw host-slot pointer for prefetch threads (other ping-pong slot only).
 /// Stored as `usize` so the handle is `Send` without relying on raw-pointer auto traits.
@@ -1738,9 +1739,27 @@ impl StreamingGenerator {
             self.scratch_q.resize(q_dim, 0.0);
             self.scratch_k.resize(kv_dim, 0.0);
             self.scratch_v.resize(kv_dim, 0.0);
-            current.wq.gemv(&self.scratch_xn, &mut self.scratch_q)?;
-            current.wk.gemv(&self.scratch_xn, &mut self.scratch_k)?;
-            current.wv.gemv(&self.scratch_xn, &mut self.scratch_v)?;
+            orch.execute_op(
+                LayerOpKind::AttnQ,
+                op_binding(LayerOpKind::AttnQ),
+                &current.wq,
+                &self.scratch_xn,
+                &mut self.scratch_q,
+            )?;
+            orch.execute_op(
+                LayerOpKind::AttnK,
+                op_binding(LayerOpKind::AttnK),
+                &current.wk,
+                &self.scratch_xn,
+                &mut self.scratch_k,
+            )?;
+            orch.execute_op(
+                LayerOpKind::AttnV,
+                op_binding(LayerOpKind::AttnV),
+                &current.wv,
+                &self.scratch_xn,
+                &mut self.scratch_v,
+            )?;
             if let Some(b) = self.attn_bias.get(layer_idx) {
                 add_qkv_bias(b, &mut self.scratch_q, &mut self.scratch_k, &mut self.scratch_v);
             }
@@ -1761,13 +1780,25 @@ impl StreamingGenerator {
             );
             if let Some(ref gate_w) = current.attn_gate {
                 self.scratch_gate.resize(q_dim, 0.0);
-                gate_w.gemv(&self.scratch_xn, &mut self.scratch_gate)?;
+                orch.execute_op(
+                    LayerOpKind::AttnGate,
+                    op_binding(LayerOpKind::AttnGate),
+                    gate_w,
+                    &self.scratch_xn,
+                    &mut self.scratch_gate,
+                )?;
                 for i in 0..q_dim {
                     self.scratch_attn[i] *= 1.0 / (1.0 + (-self.scratch_gate[i]).exp());
                 }
             }
             self.scratch_proj.resize(h, 0.0);
-            current.wo.gemv(&self.scratch_attn, &mut self.scratch_proj)?;
+            orch.execute_op(
+                LayerOpKind::AttnO,
+                op_binding(LayerOpKind::AttnO),
+                &current.wo,
+                &self.scratch_attn,
+                &mut self.scratch_proj,
+            )?;
             if let Some(b) = self.attn_bias.get(layer_idx) {
                 add_bias(&mut self.scratch_proj, &b.o);
             }

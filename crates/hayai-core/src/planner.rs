@@ -223,11 +223,18 @@ pub fn caps_from_profile(
     cpu_resident_bytes: u64,
 ) -> Vec<TargetCaps> {
     let host = profile.host_bw_gbytes_s.max(0.0) * 1e9;
+    // The CPU runs a dequantising GEMV, whose real rate is far below the RAM memcpy
+    // peak. Price the host with the measured compute rate so a GPU is not passed over.
+    let host_gemv = if profile.host_gemv_gbytes_s > 0.0 {
+        profile.host_gemv_gbytes_s * 1e9
+    } else {
+        host
+    };
     let mut caps = vec![TargetCaps {
         target: ComputeTarget::Cpu,
         name: "CPU".into(),
-        gemv_bw: host,
-        resident_gemv_bw: host,
+        gemv_bw: host_gemv,
+        resident_gemv_bw: host_gemv,
         launch_s: 0.0,
         link_bw: host,
         resident_bytes: cpu_resident_bytes,
