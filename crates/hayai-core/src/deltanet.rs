@@ -204,20 +204,27 @@ impl DeltaNetLayerWeights {
 
     /// Decode step: `y += DeltaNet(x)` (caller applies residual).
     ///
-    /// `gpu` (opt-in, `HAYAI_DN_GPU=1`) runs the recurrent state update on a device via
-    /// the `hayai_deltanet_step` kernel; `None` keeps the host implementation. The
+    /// `orch` (opt-in, `HAYAI_DN_GPU=1`) routes the DeltaNet GEMVs (qkv/alpha/beta/gate/
+    /// out) through the planner's device pool; `dev` runs the recurrent state update on
+    /// the `hayai_deltanet_step` kernel. `None`/`None` keep the host implementation. The
     /// device state is the source of truth on the GPU path (the host `ssm` is untouched).
     pub fn decode_step(
         &self,
         x: &[f32],
         state: &mut DeltaNetState,
         y: &mut [f32],
-        gpu: Option<(&hayai_opencl::OpenClEngine, *const hayai_opencl::DeviceDeltanetState)>,
+        mut orch: Option<&mut crate::orchestrator::EngineOrchestrator>,
+        dev: Option<*const hayai_opencl::DeviceDeltanetState>,
     ) -> Result<(), GgufError> {
         let n_embd = x.len();
         let mix_dim = self.qkv.nrows;
         let mut mixed = vec![0.0f32; mix_dim];
-        self.qkv.gemv(x, &mut mixed)?;
+        match orch.as_deref_mut() {
+            Some(o) => o
+                .execute_quant_gemv(&self.qkv, x, &mut mixed)
+                .map_err(|e| GgufError::Msg(e.to_string()))?,
+            None => self.qkv.gemv(x, &mut mixed)?,
+        }
 
         let k = self.conv_k;
         let cd = self.conv_dim.min(mix_dim);
@@ -261,8 +268,18 @@ impl DeltaNetLayerWeights {
 
         let mut alpha_h = vec![0.0f32; self.n_v_heads];
         let mut beta_h = vec![0.0f32; self.n_v_heads];
-        self.alpha.gemv(x, &mut alpha_h)?;
-        self.beta.gemv(x, &mut beta_h)?;
+        match orch.as_deref_mut() {
+            Some(o) => {
+                o.execute_quant_gemv(&self.alpha, x, &mut alpha_h)
+                    .map_err(|e| GgufError::Msg(e.to_string()))?;
+                o.execute_quant_gemv(&self.beta, x, &mut beta_h)
+                    .map_err(|e| GgufError::Msg(e.to_string()))?;
+            }
+            None => {
+                self.alpha.gemv(x, &mut alpha_h)?;
+                self.beta.gemv(x, &mut beta_h)?;
+            }
+        }
 
         // Per-head decay / beta (host, tiny) — shared by both paths.
         let mut decay = vec![0.0f32; self.n_v_heads];
@@ -277,11 +294,14 @@ impl DeltaNetLayerWeights {
         let hv = self.head_v;
         let hk = self.head_k;
         let mut o = vec![0.0f32; value_dim];
-        if let Some((eng, dev)) = gpu {
-            // Recurrent state decay/read/delta-write/output on the device. `dev` is a
-            // raw pointer to the generator's per-layer state (the caller holds it out of
-            // the aliased `state` borrow, same trick as the weight/state pointers).
-            let dev = unsafe { &*dev };
+        if let (Some(orch_ref), Some(d)) = (orch.as_deref_mut(), dev) {
+            // Recurrent state decay/read/delta-write/output on the device. `d` is a raw
+            // pointer to the generator's per-layer state (held out of the aliased
+            // weight/state borrows, same trick as `w_ptr`/`s_ptr`).
+            let eng = orch_ref
+                .opencl_engine()
+                .ok_or_else(|| GgufError::Msg("deltanet gpu: no device".into()))?;
+            let dev = unsafe { &*d };
             eng.deltanet_step(&q, &kk, &v, &decay, &beta, dev, &mut o)
                 .map_err(|e| GgufError::Msg(format!("deltanet_step: {e}")))?;
         } else {
@@ -329,7 +349,12 @@ impl DeltaNetLayerWeights {
         }
 
         let mut z = vec![0.0f32; value_dim];
-        self.gate.gemv(x, &mut z)?;
+        match orch.as_deref_mut() {
+            Some(o) => o
+                .execute_quant_gemv(&self.gate, x, &mut z)
+                .map_err(|e| GgufError::Msg(e.to_string()))?,
+            None => self.gate.gemv(x, &mut z)?,
+        }
         for vh in 0..self.n_v_heads {
             let base = vh * hv;
             let oh = &mut o[base..base + hv];
@@ -345,7 +370,12 @@ impl DeltaNetLayerWeights {
         }
 
         let mut proj = vec![0.0f32; n_embd];
-        self.out.gemv(&o, &mut proj)?;
+        match orch.as_deref_mut() {
+            Some(orch_ref) => orch_ref
+                .execute_quant_gemv(&self.out, &o, &mut proj)
+                .map_err(|e| GgufError::Msg(e.to_string()))?,
+            None => self.out.gemv(&o, &mut proj)?,
+        }
         for i in 0..n_embd {
             y[i] += proj[i];
         }

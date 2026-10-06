@@ -521,12 +521,10 @@ fn run_deltanet_block(
                 d,
             )
         };
-        let gpu = match (use_dn_gpu, dev_ptr) {
-            (true, Some(d)) => Some((orch.opencl_engine().unwrap(), d)),
-            _ => None,
-        };
+        let dn_orch = if use_dn_gpu { Some(&mut *orch) } else { None };
+        let dn_dev = if use_dn_gpu { dev_ptr } else { None };
         unsafe {
-            (*w_ptr).decode_step(&xn, &mut *s_ptr, x, gpu)?;
+            (*w_ptr).decode_step(&xn, &mut *s_ptr, x, dn_orch, dn_dev)?;
         }
     }
     if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") && gen.position == 0 {
@@ -1110,7 +1108,7 @@ pub(crate) fn forward_batched_hybrid_gemm(
                         .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
                     let mut xn = x[c].clone();
                     rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
-                    w.decode_step(&xn, s, &mut x[c], None)?;
+                    w.decode_step(&xn, s, &mut x[c], None, None)?;
                 }
             }
             HybridLayerKind::FullAttn => {
@@ -1406,7 +1404,7 @@ pub(crate) fn forward_batched_hybrid_seq(
                             .ok_or_else(|| StreamInferError::Msg("deltanet state ausente".into()))?;
                         let mut xn = x[c][t * h..(t + 1) * h].to_vec();
                         rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
-                        w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h], None)?;
+                        w.decode_step(&xn, s, &mut x[c][t * h..(t + 1) * h], None, None)?;
                     }
                 }
                 if std::env::var("HAYAI_DUMP_LAYER_RMS").ok().as_deref() == Some("1") {
