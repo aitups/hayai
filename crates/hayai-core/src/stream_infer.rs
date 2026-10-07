@@ -518,6 +518,8 @@ pub struct StreamingGenerator {
     pub memory_strategy: MemoryStrategy,
     /// Last computed adaptive window plan (k_chunk / resident / window_bytes).
     pub window_plan: Option<WindowPlan>,
+    /// Joint residency + cadence + placement decision from the measured hardware.
+    pub session_plan: Option<crate::planner::SessionPlan>,
     /// Resident mode: cached final projection matrix (`output.weight`) for zero-I/O
     /// decode. `None` in streaming mode.
     pub(crate) resident_output: Option<QuantMatrix>,
@@ -1166,6 +1168,7 @@ impl StreamingGenerator {
             mla_q_a_norm,
             memory_strategy: MemoryStrategy::AutoFit,
             window_plan: None,
+            session_plan: None,
             resident_output: None,
             resident_embed: None,
         })
@@ -2328,6 +2331,17 @@ impl StreamingGenerator {
                             Some(self.catalog.path.as_path()),
                         );
                         let caps = crate::planner::caps_from_profile(&profile, u64::MAX);
+                        // The host is not an infinite-residency target: cap the CPU's
+                        // resident set at its usable RAM so it must stream the rest.
+                        let host_ram = crate::adaptive_window::system_available_ram_bytes()
+                            .map(|b| ((b as f64) * 0.75) as u64)
+                            .unwrap_or(0);
+                        let mut caps = caps;
+                        if host_ram > 0 {
+                            if let Some(c) = caps.iter_mut().find(|c| !c.is_gpu) {
+                                c.resident_bytes = host_ram;
+                            }
+                        }
                         for c in &caps {
                             debug!(
                                 "candidate {}: gemv {:.1} GB/s, launch {:.0} µs, link {:.1} GB/s, vram {} MiB",
@@ -2346,6 +2360,24 @@ impl StreamingGenerator {
                             profile.disk_bw_gbytes_s,
                             plan.placement.makespan_s * 1e3,
                         );
+                        // Joint decision: what stays resident, what streams and how
+                        // fast, and where each op runs — all from measured caps.
+                        let layer_bytes = plan.max_full_block_bytes.max(1) as u64;
+                        let total_weight_bytes =
+                            layer_bytes.saturating_mul(self.config.num_layers as u64);
+                        let tasks = plan.op_tasks();
+                        let session = crate::planner::plan_session(
+                            &caps,
+                            &tasks,
+                            total_weight_bytes,
+                            layer_bytes,
+                            self.config.num_layers,
+                            profile.disk_bw_gbytes_s * 1e9,
+                            0,
+                        );
+                        info!("Session plan: {}", session.summary());
+                        plan.placement = session.placement.clone();
+                        self.session_plan = Some(session);
                         for (kind, target) in &plan.placement.assignments {
                             info!("placement: {kind:?} → {target}");
                         }
@@ -2419,13 +2451,29 @@ impl StreamingGenerator {
             self.kv_sinks,
             self.kv_window,
         ) + 64 * 1024 * 1024;
-        let win = compute_window_plan(
+        let mut win = compute_window_plan(
             &orch.pool,
             full_bytes,
             self.config.num_layers,
             self.memory_strategy,
             reserve_bytes,
         );
+        // AutoFit defers to the joint session plan: it decides residency and the window
+        // from measured caps + the cost model (disk vs compute), not a fixed host/device
+        // min. Minimal/CapBytes keep the user's explicit choice.
+        if self.memory_strategy == MemoryStrategy::AutoFit {
+            if let Some(sp) = &self.session_plan {
+                win = WindowPlan {
+                    k_chunk: sp.window_layers.max(1),
+                    resident: sp.resident,
+                    window_bytes: if sp.resident {
+                        full_bytes as u64 * self.config.num_layers as u64
+                    } else {
+                        2 * full_bytes as u64 * sp.window_layers.max(1) as u64
+                    },
+                };
+            }
+        }
         self.window_plan = Some(win);
         let resident = win.resident && win.k_chunk >= self.config.num_layers;
         let layer_bytes = if resident { full_bytes } else { window_bytes };

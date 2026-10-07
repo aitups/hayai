@@ -213,6 +213,152 @@ fn kernel_of(kind: LayerOpKind) -> OpKernel {
     op_binding(kind).kernel
 }
 
+/// The joint per-session plan: what stays resident, what streams and how fast, where
+/// the compute goes and the resulting steady-state throughput. Everything is derived
+/// from measured hardware capabilities and the model's weight sizes — there are no
+/// per-model or per-vendor constants, so any hardware is planned on its measured merits.
+#[derive(Debug, Clone)]
+pub struct SessionPlan {
+    /// Target that runs the weights.
+    pub compute: ComputeTarget,
+    /// Weight bytes kept resident on `compute` (device VRAM/SVM or host RAM).
+    pub resident_bytes: u64,
+    /// Weight bytes that must be (re)streamed from disk each token.
+    pub stream_bytes: u64,
+    /// Layers held in one window; `>= n_layers` means fully resident.
+    pub window_layers: usize,
+    /// True when the whole weight set is resident (I/O-free decode).
+    pub resident: bool,
+    /// In-flight layer reads the stream loop keeps to overlap disk with compute.
+    pub prefetch_depth: usize,
+    pub placement: Placement,
+    /// Estimated steady-state tokens/s (1 / max(compute_time, io_time)).
+    pub est_tokens_per_s: f64,
+    /// The limiting resource: `"disk"` | `"compute"`.
+    pub bottleneck: &'static str,
+}
+
+impl SessionPlan {
+    pub fn summary(&self) -> String {
+        format!(
+            "compute={} resident={:.0} MiB stream={:.0} MiB window_layers={} prefetch={} est={:.2} tok/s (limited by {})",
+            self.compute,
+            self.resident_bytes as f64 / 1_048_576.0,
+            self.stream_bytes as f64 / 1_048_576.0,
+            self.window_layers,
+            self.prefetch_depth,
+            self.est_tokens_per_s,
+            self.bottleneck,
+        )
+    }
+}
+
+/// Jointly decide residency, streaming cadence and compute placement.
+///
+/// For every measured target it prices the *whole* weight set when the largest
+/// residency that target can hold is used: the resident part runs at the target's
+/// resident bandwidth, the remainder streams from disk and must be moved over the
+/// target's link (folded into `gemv_bw` for the non-resident device path, which is what
+/// the calibration measures). Compute and disk I/O overlap, so the steady-state token
+/// time is `max(compute, io)`; the target with the smallest makespan wins. The window
+/// (cadence) and prefetch depth follow from how much fits resident and the per-layer
+/// I/O vs compute ratio — again, only measured numbers.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_session(
+    caps: &[TargetCaps],
+    tasks: &[OpTask],
+    total_weight_bytes: u64,
+    layer_bytes: u64,
+    n_layers: usize,
+    disk_bw: f64,
+    reserve_bytes: u64,
+) -> SessionPlan {
+    let w = total_weight_bytes.max(1);
+    let layered = layer_bytes > 0 && n_layers > 0;
+    let mut best: Option<(ComputeTarget, u64, f64, f64, f64)> = None;
+    for c in caps {
+        let cap = c.resident_bytes.saturating_sub(reserve_bytes);
+        let r = w.min(cap);
+        let streamed = w - r;
+        let t_res = if c.resident_gemv_bw > 0.0 {
+            r as f64 / c.resident_gemv_bw
+        } else {
+            f64::INFINITY
+        };
+        let t_str = if c.gemv_bw > 0.0 {
+            streamed as f64 / c.gemv_bw
+        } else {
+            f64::INFINITY
+        };
+        let t_compute = t_res + t_str;
+        let t_io = if disk_bw > 0.0 {
+            streamed as f64 / disk_bw
+        } else {
+            0.0
+        };
+        let makespan = t_compute.max(t_io);
+        if !makespan.is_finite() {
+            continue;
+        }
+        if best.map(|(_, _, _, _, m)| makespan < m).unwrap_or(true) {
+            best = Some((c.target, r, t_compute, t_io, makespan));
+        }
+    }
+    let (compute, resident_bytes, t_compute, t_io, makespan) = best.unwrap_or((
+        ComputeTarget::Cpu,
+        0,
+        f64::INFINITY,
+        0.0,
+        f64::INFINITY,
+    ));
+    let stream_bytes = w - resident_bytes;
+    let resident = stream_bytes == 0;
+    let window_layers = if resident {
+        n_layers
+    } else if layered {
+        ((resident_bytes / layer_bytes).max(1) as usize).min(n_layers.saturating_sub(1).max(1))
+    } else {
+        1
+    };
+    // Cadence: enough in-flight reads to keep the disk busy through one compute slice.
+    let per_layer_compute = if layered && makespan.is_finite() {
+        makespan / n_layers as f64
+    } else {
+        0.0
+    };
+    let per_layer_io = if layered && disk_bw > 0.0 {
+        layer_bytes as f64 / disk_bw
+    } else {
+        0.0
+    };
+    let depth = if per_layer_compute > 0.0 {
+        (per_layer_io / per_layer_compute).ceil() as usize
+    } else {
+        2
+    };
+    let prefetch_depth = depth.clamp(2, 8);
+    let bottleneck = if t_io >= t_compute { "disk" } else { "compute" };
+
+    // Price each target with the residency actually assigned to it, then place the ops.
+    let mut priced = caps.to_vec();
+    for c in &mut priced {
+        c.resident_bytes = if c.target == compute { resident_bytes } else { 0 };
+    }
+    let placement = plan_placement(tasks, &priced, true);
+
+    SessionPlan {
+        compute,
+        resident_bytes,
+        stream_bytes,
+        window_layers,
+        resident,
+        prefetch_depth,
+        placement,
+        est_tokens_per_s: if makespan > 0.0 { 1.0 / makespan } else { 0.0 },
+        bottleneck,
+    }
+}
+
 /// Build the planner's target list from a measured [`crate::calibration::HwProfile`].
 ///
 /// Every number comes from the calibration (host RAM bandwidth, per-device effective
@@ -242,7 +388,11 @@ pub fn caps_from_profile(
     }];
     for d in &profile.devices {
         let stream = d.effective_gemv_gbytes_s.max(0.0) * 1e9;
-        let resident = if d.resident_gemv_gbytes_s > 0.0 {
+        // Resident rate: prefer the real Q4_K figure (the quant real FFNs use — F32
+        // overstates an integer-dequant kernel), else the F32 resident figure.
+        let resident = if d.resident_gemv_q4k_gbytes_s > 0.0 {
+            d.resident_gemv_q4k_gbytes_s * 1e9
+        } else if d.resident_gemv_gbytes_s > 0.0 {
             d.resident_gemv_gbytes_s * 1e9
         } else {
             stream
@@ -252,14 +402,15 @@ pub fn caps_from_profile(
         } else {
             stream
         };
-        // The product GEMV path reads the layer from the device mirror (streaming) or
-        // the owned SVM/resident mirror (resident), so the *usable* bandwidth is the
-        // resident one, not the per-op host-upload figure. `link` is kept for the rare
-        // host-upload fallback. This is what makes a real GPU attractive to the planner.
+        // `gemv_bw` is the *streamed* rate (weights re-moved per op — what the
+        // calibration measures end to end); `resident_gemv_bw` is the rate once the
+        // weights live on the device. The planner decides which applies per layer from
+        // the residency it assigns, so both must be the measured truth — pricing the
+        // streamed path at the resident rate is what let an idle GPU look attractive.
         caps.push(TargetCaps {
             target: ComputeTarget::Device(d.device_index),
             name: d.name.clone(),
-            gemv_bw: resident,
+            gemv_bw: stream,
             resident_gemv_bw: resident,
             launch_s: d.launch_us.max(0.0) * 1e-6,
             link_bw: link,
@@ -390,5 +541,87 @@ mod tests {
         let p = plan_placement(&tasks, &cpu_only, false);
         assert_eq!(p.target_of(LayerOpKind::FfnGate), Some(ComputeTarget::Cpu));
         assert_eq!(p.target_of(LayerOpKind::AttnQ), Some(ComputeTarget::Cpu));
+    }
+
+    fn cpu_cap(gemv: f64) -> TargetCaps {
+        TargetCaps {
+            target: ComputeTarget::Cpu,
+            name: "cpu".into(),
+            gemv_bw: gemv,
+            resident_gemv_bw: gemv,
+            launch_s: 0.0,
+            link_bw: 10e9,
+            resident_bytes: u64::MAX,
+            is_gpu: false,
+        }
+    }
+
+    fn gpu_cap(resident_bw: f64, vram: u64) -> TargetCaps {
+        TargetCaps {
+            target: ComputeTarget::Device(0),
+            name: "gpu".into(),
+            gemv_bw: 3e9,
+            resident_gemv_bw: resident_bw,
+            launch_s: 5e-5,
+            link_bw: 12e9,
+            resident_bytes: vram,
+            is_gpu: true,
+        }
+    }
+
+    #[test]
+    fn session_resident_when_device_holds_the_model() {
+        // 32 layers × 10 MB = 320 MB; the device holds it all → resident, compute-bound.
+        let caps = vec![cpu_cap(10e9), gpu_cap(200e9, 2_000_000_000)];
+        let tasks = vec![task(LayerOpKind::FfnGate, 10_000_000)];
+        let p = plan_session(&caps, &tasks, 320_000_000, 10_000_000, 32, 1e9, 0);
+        assert!(p.resident);
+        assert_eq!(p.compute, ComputeTarget::Device(0));
+        assert_eq!(p.window_layers, 32);
+        assert_eq!(p.stream_bytes, 0);
+        assert_eq!(p.bottleneck, "compute");
+    }
+
+    #[test]
+    fn session_streams_when_the_device_is_too_small() {
+        // 100 MB model, both targets hold 40 MB → the rest streams; disk is not the
+        // limit here (fast disk) but the slow streaming GEMV is → device still wins.
+        let cpu = TargetCaps {
+            target: ComputeTarget::Cpu,
+            name: "cpu".into(),
+            gemv_bw: 3e9,
+            resident_gemv_bw: 3e9,
+            launch_s: 0.0,
+            link_bw: 10e9,
+            resident_bytes: 40_000_000,
+            is_gpu: false,
+        };
+        let gpu = TargetCaps {
+            target: ComputeTarget::Device(0),
+            name: "gpu".into(),
+            gemv_bw: 5e9,
+            resident_gemv_bw: 200e9,
+            launch_s: 5e-5,
+            link_bw: 12e9,
+            resident_bytes: 40_000_000,
+            is_gpu: true,
+        };
+        let tasks = vec![task(LayerOpKind::FfnGate, 10_000_000)];
+        let p = plan_session(&[cpu, gpu], &tasks, 100_000_000, 10_000_000, 10, 10e9, 0);
+        assert!(!p.resident);
+        assert_eq!(p.compute, ComputeTarget::Device(0));
+        assert_eq!(p.resident_bytes, 40_000_000);
+        assert_eq!(p.stream_bytes, 60_000_000);
+        assert!(p.window_layers >= 1 && p.window_layers < 10);
+    }
+
+    #[test]
+    fn session_prefers_the_faster_target() {
+        // CPU far faster than the tiny/spinning device → CPU wins, stays resident.
+        let caps = vec![cpu_cap(50e9), gpu_cap(200e9, 0)];
+        let tasks = vec![task(LayerOpKind::FfnGate, 10_000_000)];
+        let p = plan_session(&caps, &tasks, 100_000_000, 10_000_000, 10, 1e9, 0);
+        assert_eq!(p.compute, ComputeTarget::Cpu);
+        assert!(p.resident);
     }
 }

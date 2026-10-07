@@ -182,7 +182,7 @@ pub fn plan_from_available(
 }
 
 /// Estimate available system RAM (best-effort, platform-specific).
-fn system_available_ram_bytes() -> Option<u64> {
+pub(crate) fn system_available_ram_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
         windows_available_ram()
