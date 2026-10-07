@@ -423,7 +423,7 @@ fn run_ffn_only_block(
             up_csr: m.4.clone(),
             down_csr: m.5.clone(),
         };
-        gen.run_ffn_block(orch, &pack, &xn, ov)?;
+        gen.run_ffn_block(orch, &pack, &xn, ov, Some(&*scratch), layer)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
@@ -581,7 +581,7 @@ fn run_deltanet_block(
             up_csr: m.4.clone(),
             down_csr: m.5.clone(),
         };
-        gen.run_ffn_block(orch, &pack, &xn, ov)?;
+        gen.run_ffn_block(orch, &pack, &xn, ov, Some(&*scratch), layer)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
@@ -915,7 +915,7 @@ pub(crate) fn ffn_apply(
     let has_ov = ov.map(|o| o.gate.is_some() || o.up.is_some() || o.down.is_some()).unwrap_or(false);
     if sparse_ffn || has_ov {
         // FFN disperso embebido (D16) u override de evolución: CSR.
-        gen.run_ffn_block(orch, pack, &xn, ov)?;
+        gen.run_ffn_block(orch, pack, &xn, ov, scratch.as_deref(), layer)?;
     } else {
         let inflight = ffn_begin_gate_up_scratch(
             orch,
@@ -1726,5 +1726,6 @@ fn batch_ffn_hybrid_seq(
     }
     Ok(())
 }
+
 
 

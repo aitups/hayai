@@ -579,20 +579,46 @@ impl StreamingGenerator {
         pack: &hayai_model::LayerWeightPack,
         xn: &[f32],
         ov: Option<&FfnOverride>,
+        scratch: Option<&hayai_opencl::StreamingScratch>,
+        layer: usize,
     ) -> Result<(), StreamInferError> {
+        // Run each FFN GEMV from the layer's device mirror when there is one
+        // (`execute_op_bound`): the weights are already on the device (resident or a
+        // freshly DMA'd ping-pong slot), so there is no per-op host→device re-upload.
+        // Without a mirror the bound path falls back to the orchestrator's upload path.
         let gate_csr = ov.and_then(|o| o.gate.as_ref()).or(pack.gate_csr.as_ref());
         if let Some(c) = gate_csr {
             let out = self.spmm_csr(orch, xn, c)?;
             self.ws_gate.copy_from_slice(&out);
         } else {
-            orch.execute_quant_gemv(&pack.gate, xn, &mut self.ws_gate)?;
+            let off = pack.layout().gate_off;
+            orch.execute_op_bound(
+                LayerOpKind::FfnGate,
+                op_binding(LayerOpKind::FfnGate),
+                &pack.gate,
+                xn,
+                &mut self.ws_gate,
+                scratch,
+                layer,
+                off,
+            )?;
         }
         let up_csr = ov.and_then(|o| o.up.as_ref()).or(pack.up_csr.as_ref());
         if let Some(c) = up_csr {
             let out = self.spmm_csr(orch, xn, c)?;
             self.ws_up.copy_from_slice(&out);
         } else {
-            orch.execute_quant_gemv(&pack.up, xn, &mut self.ws_up)?;
+            let off = pack.layout().up_off;
+            orch.execute_op_bound(
+                LayerOpKind::FfnUp,
+                op_binding(LayerOpKind::FfnUp),
+                &pack.up,
+                xn,
+                &mut self.ws_up,
+                scratch,
+                layer,
+                off,
+            )?;
         }
         for i in 0..self.ws_gate.len() {
             let g = self.ws_gate[i];
@@ -603,7 +629,17 @@ impl StreamingGenerator {
             let out = self.spmm_csr(orch, &self.ws_gate, c)?;
             self.ws_down.copy_from_slice(&out);
         } else {
-            orch.execute_quant_gemv(&pack.down, &self.ws_gate, &mut self.ws_down)?;
+            let off = pack.layout().down_off;
+            orch.execute_op_bound(
+                LayerOpKind::FfnDown,
+                op_binding(LayerOpKind::FfnDown),
+                &pack.down,
+                &self.ws_gate,
+                &mut self.ws_down,
+                scratch,
+                layer,
+                off,
+            )?;
         }
         Ok(())
     }
@@ -1953,7 +1989,7 @@ impl StreamingGenerator {
             } else {
                 // FFN disperso embebido (D16) u override de evolución: CSR en GPU/CPU.
                 let xn = self.scratch_xn.clone();
-                self.run_ffn_block(orch, &current, &xn, ov)?;
+                self.run_ffn_block(orch, &current, &xn, ov, scratch.as_deref(), layer_idx)?;
             }
             self.ffn_secs += t_ffn_fin.elapsed().as_secs_f64();
 
@@ -2179,7 +2215,7 @@ impl StreamingGenerator {
                     || current.down_csr.is_some();
                 if sparse_ffn {
                     // FFN disperso embebido (D16): gate/up/down vía CSR en CPU.
-                    self.run_ffn_block(orch, &current, &xn, None)?;
+                    self.run_ffn_block(orch, &current, &xn, None, Some(&*scratch), layer)?;
                 } else {
                     let inflight = ffn_begin_gate_up_scratch(
                         orch,
@@ -4712,5 +4748,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+
 
 

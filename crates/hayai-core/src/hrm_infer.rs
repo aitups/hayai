@@ -189,7 +189,7 @@ impl StreamingGenerator {
             pack.gate_csr.is_some() || pack.up_csr.is_some() || pack.down_csr.is_some();
         if sparse_ffn {
             // Embedded sparse FFN (CSR) — reuse the shared FFN-block runner.
-            self.run_ffn_block(orch, &pack, &xn, None)?;
+            self.run_ffn_block(orch, &pack, &xn, None, None, 0)?;
         } else {
             let inflight = ffn_begin_gate_up_scratch(
                 orch,
@@ -224,3 +224,5 @@ impl StreamingGenerator {
         Ok(())
     }
 }
+
+

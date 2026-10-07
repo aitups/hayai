@@ -560,7 +560,7 @@ impl StreamingGenerator {
                 for t in 0..t_count {
                     let mut xn = xs[t].clone();
                     rms_norm(&mut xn, &self.layer_norms[layer_idx].ffn_norm, eps);
-                    self.run_ffn_block(orch, &pack, &xn, None)?;
+                    self.run_ffn_block(orch, &pack, &xn, None, None, 0)?;
                     for i in 0..h {
                         xs[t][i] += self.residual_scale * self.ws_down[i];
                     }
@@ -637,3 +637,5 @@ impl StreamingGenerator {
         Ok(logits)
     }
 }
+
+
