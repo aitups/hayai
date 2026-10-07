@@ -694,6 +694,7 @@ pub(crate) fn full_attn_apply(
     // (no per-op host upload); otherwise the host-upload path is used.
     let off = layout.map(|l| (l.wq_off, l.wk_off, l.wv_off, l.wo_off));
     let (wq_off, wk_off, wv_off, wo_off) = off.unwrap_or((0, 0, 0, 0));
+    let t_qkv = Instant::now();
     let pq = orch.submit_op_bound(
         LayerOpKind::AttnQ,
         op_binding(LayerOpKind::AttnQ),
@@ -734,6 +735,13 @@ pub(crate) fn full_attn_apply(
     if let Some(o) = pv.wait()? {
         v.copy_from_slice(&o);
     }
+    tracing::debug!(
+        "attn blk.{layer} pos {pos}: QKV gemv {:.2} ms (placement Q/K/V = {:?}/{:?}/{:?})",
+        t_qkv.elapsed().as_secs_f64() * 1e3,
+        orch.placed_target(LayerOpKind::AttnQ),
+        orch.placed_target(LayerOpKind::AttnK),
+        orch.placed_target(LayerOpKind::AttnV),
+    );
 
     // Per-layer dims from this block's tensors (9B/27B may differ from 4B meta defaults).
     let layer_cfg = resolve_full_attn_cfg(&gen.catalog, layer, &gen.config)?;
@@ -872,6 +880,11 @@ pub(crate) fn full_attn_apply(
         x[i] += attn_proj[i];
     }
     gen.attn_secs += t_attn.elapsed().as_secs_f64();
+    tracing::debug!(
+        "attn blk.{layer} pos {pos}: total {:.2} ms (QKV was {:.2} ms)",
+        t_attn.elapsed().as_secs_f64() * 1e3,
+        t_qkv.elapsed().as_secs_f64() * 1e3
+    );
     // Optional depthwise causal short-conv residual (generic `Conv` op).
     gen.apply_conv(layer, x)?;
     Ok(())

@@ -2347,7 +2347,7 @@ impl StreamingGenerator {
                             plan.placement.makespan_s * 1e3,
                         );
                         for (kind, target) in &plan.placement.assignments {
-                            debug!("placement: {kind:?} → {target}");
+                            info!("placement: {kind:?} → {target}");
                         }
                         orch.set_placement(plan.placement.clone());
                     }
