@@ -24,6 +24,8 @@ pub struct DeviceProfile {
     /// Index into the OpenCL pool (the planner's `ComputeTarget::Device(i)`).
     pub device_index: usize,
     pub global_mem_bytes: u64,
+    /// `CL_DEVICE_MAX_MEM_ALLOC_SIZE` — the largest single buffer the device allows.
+    pub max_alloc_bytes: u64,
     /// Effective streaming GEMV bandwidth (bytes/s) including host→device upload.
     pub effective_gemv_gbytes_s: f64,
     /// Effective GEMV bandwidth (bytes/s) with weights already resident on the device.
@@ -355,6 +357,7 @@ pub fn calibrate_fresh(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwP
             kind: format!("{:?}", e.device_info.device_kind),
             device_index: idx,
             global_mem_bytes: e.device_info.global_mem_size,
+            max_alloc_bytes: e.device_info.max_alloc_size,
             effective_gemv_gbytes_s: bw,
             resident_gemv_gbytes_s: resident_bw,
             resident_gemv_q4k_gbytes_s: resident_q4k_bw,

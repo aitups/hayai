@@ -407,6 +407,14 @@ pub fn caps_from_profile(
         // weights live on the device. The planner decides which applies per layer from
         // the residency it assigns, so both must be the measured truth — pricing the
         // streamed path at the resident rate is what let an idle GPU look attractive.
+        let mut vram_budget =
+            (d.global_mem_bytes as f64 * crate::adaptive_window::DEFAULT_UTILIZATION) as u64;
+        // A single resident allocation cannot exceed CL_DEVICE_MAX_MEM_ALLOC_SIZE; without
+        // per-layer buffers, pricing a bigger model as resident makes the mirror fail and
+        // silently re-upload the whole model every token (audit A.3.3).
+        if d.max_alloc_bytes > 0 {
+            vram_budget = vram_budget.min(d.max_alloc_bytes);
+        }
         caps.push(TargetCaps {
             target: ComputeTarget::Device(d.device_index),
             name: d.name.clone(),
@@ -414,7 +422,7 @@ pub fn caps_from_profile(
             resident_gemv_bw: resident,
             launch_s: d.launch_us.max(0.0) * 1e-6,
             link_bw: link,
-            resident_bytes: d.global_mem_bytes,
+            resident_bytes: vram_budget,
             is_gpu: true,
         });
     }
