@@ -130,6 +130,58 @@ pub enum LayerOpKind {
     Aux,
 }
 
+/// Kind-level prerequisites of the per-layer op DAG, used by the planner so it prices a
+/// *sequential* decode chain instead of assuming every op runs concurrently. Only kinds
+/// actually present in the plan become edges. (Audit A.4.1: `OpTask.deps` was never read.)
+pub fn kind_deps(kind: LayerOpKind) -> &'static [LayerOpKind] {
+    use LayerOpKind::*;
+    match kind {
+        // Inputs / embeddings.
+        TokenEmbed | AttnNorm | Recurrence | Aux | RelPosBias | ExpertScale | RouterScale
+        | NextN => &[],
+        TokenEmbedNorm => &[TokenEmbed],
+        PositionEmbed => &[TokenEmbed],
+        // Attention projections all read the normalised hidden state.
+        AttnQ | AttnK | AttnV | AttnQkv | AttnGate | MlaQa | MlaKvA | DeltaNet | Mamba => {
+            &[AttnNorm]
+        }
+        AttnQNorm => &[AttnQ, AttnQkv],
+        AttnKNorm => &[AttnK, AttnQkv],
+        MlaQaNorm => &[MlaQa],
+        MlaQb => &[MlaQaNorm],
+        MlaKvANorm => &[MlaKvA],
+        MlaKb | MlaVb | MlaKvB => &[MlaKvANorm],
+        // The attention output consumes every Q/K/V path.
+        AttnO => &[
+            AttnQ, AttnK, AttnV, AttnQkv, AttnQNorm, AttnKNorm, AttnGate, MlaQb, MlaVb, MlaKvB,
+            DeltaNet, Mamba,
+        ],
+        // Encoder-decoder cross attention.
+        CrossAttnNorm => &[AttnO],
+        CrossAttnK | CrossAttnV | CrossAttnQ => &[CrossAttnNorm],
+        CrossAttnO => &[CrossAttnQ, CrossAttnK, CrossAttnV],
+        // Post-attention norm / conv, then the FFN.
+        PostAttnNorm | Conv => &[AttnO],
+        FfnNorm => &[AttnO, PostAttnNorm, DeltaNet, Mamba],
+        FfnGate | FfnUp | FfnGateUp | Router | SharedExpert | FfnDagAdjacency => &[FfnNorm],
+        FfnDagWeights => &[FfnDagAdjacency],
+        RouterBias | ExpertGate | ExpertUp | ExpertGateUp => &[Router],
+        ExpertDown => &[ExpertGate, ExpertUp, ExpertGateUp],
+        FfnDown => &[FfnGate, FfnUp, FfnGateUp, SharedExpert],
+        PostFfnNorm | LayerOutputScale => &[FfnDown],
+        // Gemma PLE chain.
+        PleEmbed => &[TokenEmbed],
+        PleModelProj => &[PleEmbed],
+        PleProjNorm => &[PleModelProj],
+        PleGate | PleProj => &[PleProjNorm, AttnNorm],
+        PlePostNorm => &[PleProj],
+        // Output head.
+        OutputNorm => &[FfnDown, AttnO, DeltaNet, Mamba],
+        OutputProj => &[OutputNorm, TokenEmbed],
+        EncOutputNorm | DecOutputNorm => &[FfnDown, CrossAttnO],
+    }
+}
+
 /// Hardware class an op is bound to (the executor consumes this, not prose).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpDevice {
@@ -1055,7 +1107,7 @@ impl ExecPlan {
                 }
             }
         }
-        bytes
+        let mut tasks: Vec<crate::planner::OpTask> = bytes
             .into_iter()
             .map(|(kind, nbytes)| {
                 let b = op_binding(kind);
@@ -1066,7 +1118,28 @@ impl ExecPlan {
                     deps: Vec::new(),
                 }
             })
-            .collect()
+            .collect();
+        // Populate the kind-level DAG so the planner schedules the real (mostly
+        // sequential) chain instead of assuming all ops run in parallel (audit A.4.1).
+        let idx_of: BTreeMap<LayerOpKind, usize> =
+            tasks.iter().enumerate().map(|(i, t)| (t.kind, i)).collect();
+        let deps: Vec<Vec<usize>> = tasks
+            .iter()
+            .map(|t| {
+                let mut d: Vec<usize> = kind_deps(t.kind)
+                    .iter()
+                    .filter_map(|k| idx_of.get(k).copied())
+                    .filter(|&j| tasks[j].kind != t.kind)
+                    .collect();
+                d.sort_unstable();
+                d.dedup();
+                d
+            })
+            .collect();
+        for (t, d) in tasks.iter_mut().zip(deps) {
+            t.deps = d;
+        }
+        tasks
     }
 
     /// Run the cost-driven planner against measured capabilities and store the result.

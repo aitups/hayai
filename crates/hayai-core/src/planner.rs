@@ -115,15 +115,6 @@ impl Placement {
     }
 }
 
-/// Total bytes of one op kind across the DAG.
-fn bytes_by_kind(tasks: &[OpTask]) -> BTreeMap<LayerOpKind, u64> {
-    let mut m: BTreeMap<LayerOpKind, u64> = BTreeMap::new();
-    for t in tasks {
-        *m.entry(t.kind).or_insert(0) += t.bytes;
-    }
-    m
-}
-
 /// Plan where each op kind runs.
 ///
 /// Strategy: list scheduling over kinds ordered by **descending total bytes** (heavy
@@ -140,8 +131,6 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
     if tasks.is_empty() || caps.is_empty() {
         return out;
     }
-    let by_kind = bytes_by_kind(tasks);
-
     // Which targets can hold this layer's placeable weight set resident.
     let placeable_layer_bytes: u64 = tasks
         .iter()
@@ -149,56 +138,118 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
         .map(|t| t.bytes)
         .sum();
 
-    // Heavy first: the kinds that dominate the layer's bytes are the ones worth moving.
-    let mut order: Vec<(LayerOpKind, u64)> = by_kind.iter().map(|(k, b)| (*k, *b)).collect();
-    order.sort_by(|a, b| b.1.cmp(&a.1));
+    // Resolve the kind-level DAG (explicit `deps` ∪ implicit `kind_deps`) to task
+    // indices. `adj[j]` holds the dependents of `j`. Only genuinely independent ops
+    // (AttnQ∥K∥V, Gate∥Up, top-k experts) end up able to run on different devices.
+    let idx_of: BTreeMap<LayerOpKind, usize> =
+        tasks.iter().enumerate().map(|(i, t)| (t.kind, i)).collect();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+    let mut indeg = vec![0usize; tasks.len()];
+    for (i, t) in tasks.iter().enumerate() {
+        let mut dep_idx: Vec<usize> = t.deps.iter().copied().filter(|&d| d < tasks.len()).collect();
+        for &k in crate::exec_plan::kind_deps(t.kind) {
+            if let Some(&j) = idx_of.get(&k) {
+                if j != i {
+                    dep_idx.push(j);
+                }
+            }
+        }
+        dep_idx.sort_unstable();
+        dep_idx.dedup();
+        for j in dep_idx {
+            indeg[i] += 1;
+            adj[j].push(i);
+        }
+    }
 
-    let mut load: BTreeMap<ComputeTarget, f64> = caps.iter().map(|c| (c.target, 0.0)).collect();
+    // Kahn topological order, heavy-first among ready nodes (dominant kinds get first
+    // pick of the fastest target). Fall back to byte order if the graph is cyclic.
+    let mut ready: Vec<usize> = (0..tasks.len()).filter(|&i| indeg[i] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(tasks.len());
+    while !ready.is_empty() {
+        let pos = (0..ready.len())
+            .max_by_key(|&p| tasks[ready[p]].bytes)
+            .unwrap();
+        let i = ready.swap_remove(pos);
+        order.push(i);
+        for &j in &adj[i] {
+            indeg[j] -= 1;
+            if indeg[j] == 0 {
+                ready.push(j);
+            }
+        }
+    }
+    if order.len() != tasks.len() {
+        order = (0..tasks.len()).collect();
+    }
 
-    for (kind, bytes) in order {
-        let class = class_of(kind);
-        let kernel = kernel_of(kind);
-        if !placeable(class, kernel) {
-            // Fixed: CPU or host. Norms / row reads do not move.
-            out.assignments.insert(kind, ComputeTarget::Cpu);
+    let mut busy: BTreeMap<ComputeTarget, f64> = caps.iter().map(|c| (c.target, 0.0)).collect();
+    let mut avail: BTreeMap<ComputeTarget, f64> = busy.clone();
+    let mut finish = vec![0.0f64; tasks.len()];
+
+    for &i in &order {
+        let t = &tasks[i];
+        let start = finish[i]; // max finish over this task's dependencies
+        if !placeable(t.class, kernel_of(t.kind)) {
+            out.assignments.insert(t.kind, ComputeTarget::Cpu);
+            for &j in &adj[i] {
+                if finish[j] < start {
+                    finish[j] = start;
+                }
+            }
+            finish[i] = start;
             continue;
         }
-        // Choose the target for this op.
-        let mut best: Option<(ComputeTarget, f64, f64)> = None; // (target, finish, op_time)
+        let mut best: Option<(ComputeTarget, f64, f64)> = None;
         for c in caps {
             let resident =
                 placeable_layer_bytes > 0 && placeable_layer_bytes <= c.resident_bytes && c.is_gpu;
-            let t = c.gemv_seconds(bytes, resident);
-            if !t.is_finite() {
+            let op_t = c.gemv_seconds(t.bytes, resident);
+            if !op_t.is_finite() {
                 continue;
             }
-            // Concurrent plan: the executor runs devices in parallel, so price the
-            // target's accumulated load. Non-concurrent: pure per-op cost, because the
-            // executor serializes — load-balancing onto a slower device only adds latency.
-            let finish = if concurrent { load[&c.target] + t } else { t };
-            if best.map(|(_, f, _)| finish < f).unwrap_or(true) {
-                best = Some((c.target, finish, t));
+            let begin = if concurrent {
+                start.max(avail[&c.target])
+            } else {
+                start
+            };
+            let fin = begin + op_t;
+            if best.map(|(_, f, _)| fin < f).unwrap_or(true) {
+                best = Some((c.target, fin, op_t));
             }
         }
-        let (chosen, _finish, op_time) = match best {
+        let (chosen, fin, op_t) = match best {
             Some(x) => x,
             None => {
-                out.assignments.insert(kind, ComputeTarget::Cpu);
+                out.assignments.insert(t.kind, ComputeTarget::Cpu);
+                finish[i] = start;
+                for &j in &adj[i] {
+                    if finish[j] < start {
+                        finish[j] = start;
+                    }
+                }
                 continue;
             }
         };
-        *load.entry(chosen).or_insert(0.0) += op_time;
-        out.assignments.insert(kind, chosen);
+        for &j in &adj[i] {
+            if finish[j] < fin {
+                finish[j] = fin;
+            }
+        }
+        *avail.entry(chosen).or_insert(0.0) = fin;
+        *busy.entry(chosen).or_insert(0.0) += op_t;
+        finish[i] = fin;
+        out.assignments.insert(t.kind, chosen);
     }
 
-    // Fallback for GEMV kinds with no target chosen (should not happen): CPU.
+    // Fallback for any kind with no target chosen (isolated / unplaceable): CPU.
     for t in tasks {
         out.assignments.entry(t.kind).or_insert(ComputeTarget::Cpu);
     }
 
-    out.target_load_s = load;
+    out.target_load_s = busy;
     out.makespan_s = if concurrent {
-        out.target_load_s.values().fold(0.0f64, |m, &v| m.max(v))
+        finish.iter().copied().fold(0.0f64, f64::max)
     } else {
         out.target_load_s.values().sum()
     };
@@ -206,9 +257,6 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
 }
 
 use crate::exec_plan::op_binding;
-fn class_of(kind: LayerOpKind) -> OpDevice {
-    op_binding(kind).device
-}
 fn kernel_of(kind: LayerOpKind) -> OpKernel {
     op_binding(kind).kernel
 }
@@ -631,5 +679,21 @@ mod tests {
         let p = plan_session(&caps, &tasks, 100_000_000, 10_000_000, 10, 1e9, 0);
         assert_eq!(p.compute, ComputeTarget::Cpu);
         assert!(p.resident);
+    }
+
+    #[test]
+    fn dependent_chain_is_serialised_not_parallelised() {
+        // A → B (B depends on A). On one fast device the makespan must be t_A + t_B,
+        // not max(t_A, t_B): the planner must not treat the chain as concurrent.
+        let caps = vec![cpu_cap(1e9), gpu_cap(50e9, 0)];
+        let mut a = task(LayerOpKind::AttnQ, 10_000_000);
+        let mut b = task(LayerOpKind::FfnGate, 10_000_000);
+        a.deps = vec![];
+        b.deps = vec![0];
+        let p = plan_placement(&[a, b], &caps, true);
+        assert_eq!(p.target_of(LayerOpKind::AttnQ), Some(ComputeTarget::Device(0)));
+        assert_eq!(p.target_of(LayerOpKind::FfnGate), Some(ComputeTarget::Device(0)));
+        // 2 × 10 MB / 3 GB/s ≈ 6.67 ms; parallel would be ~3.33 ms.
+        assert!(p.makespan_s > 0.005, "chain must be serialised, got {}", p.makespan_s);
     }
 }
