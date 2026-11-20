@@ -3920,6 +3920,39 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     let gate_eng = ffn_device_for(orch, LayerOpKind::FfnGate, 0);
     let up_eng = ffn_device_for(orch, LayerOpKind::FfnUp, 1);
 
+    // Same device (the common case): use the persistent synchronous dispatch (no per-op
+    // buffer churn, audit B.1.4) instead of two async dispatches on one in-order queue.
+    // `gate` is computed exactly once; if `up` is not mirror-bound only `up` falls back.
+    if let (Some(g), Some(u)) = (gate_eng, up_eng) {
+        if g.device_info.device_id == u.device_info.device_id {
+            *used_dgpu = true;
+            if let (Some(sc), Some(lay)) = (scratch, layout) {
+                if sync_gemv_from_scratch(g, gate, xn, gate_out, sc, layer, lay.gate_off)? {
+                    if sync_gemv_from_scratch(g, up, xn, up_out, sc, layer, lay.up_off)? {
+                        return Ok(GateUpInflight::Pending { gate: None, up: None });
+                    }
+                    let u_pending = begin_ffn_gemv(g, up, xn, scratch, layer, lay.up_off)?;
+                    return Ok(GateUpInflight::Pending {
+                        gate: None,
+                        up: Some(u_pending),
+                    });
+                }
+                let g_pending = begin_ffn_gemv(g, gate, xn, scratch, layer, lay.gate_off)?;
+                let u_pending = begin_ffn_gemv(g, up, xn, scratch, layer, lay.up_off)?;
+                return Ok(GateUpInflight::Pending {
+                    gate: Some(g_pending),
+                    up: Some(u_pending),
+                });
+            }
+            let g_pending = begin_ffn_gemv(g, gate, xn, scratch, layer, gate_off)?;
+            let u_pending = begin_ffn_gemv(g, up, xn, scratch, layer, up_off)?;
+            return Ok(GateUpInflight::Pending {
+                gate: Some(g_pending),
+                up: Some(u_pending),
+            });
+        }
+    }
+
     // Gate: run on its placed device (async, from the mirror when bound), or inline on
     // the CPU. Never deferred so that `up` can never force it to run twice.
     let gate_pending = match gate_eng {

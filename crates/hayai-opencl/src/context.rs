@@ -108,9 +108,15 @@ impl OpenClEngine {
         let context =
             Context::from_device(&device).map_err(|e| OpenClError::ClError(e.to_string()))?;
 
-        let queue =
-            CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)
-                .map_err(|e| OpenClError::ClError(e.to_string()))?;
+        // Audit B.1.1: profiling instruments every command (timestamps) and inhibits
+        // driver command batching on the production path. Only enable it on request.
+        let queue_props = if std::env::var_os("HAYAI_OPENCL_PROFILE").is_some() {
+            CL_QUEUE_PROFILING_ENABLE
+        } else {
+            0
+        };
+        let queue = CommandQueue::create_default_with_properties(&context, queue_props, 0)
+            .map_err(|e| OpenClError::ClError(e.to_string()))?;
 
         // Hard requirement: Hayai targets OpenCL 3.0 PLATFORMS. Kernels are written in
         // the mandatory OpenCL C subset (C 1.2) — the ONLY language every OpenCL 3.0
