@@ -373,7 +373,9 @@ impl EngineOrchestrator {
     ) -> Result<OpPending, OrchestratorError> {
         if let Some(crate::planner::ComputeTarget::Device(i)) = self.placement.get(&op).copied() {
             if let Some(sc) = scratch {
-                // Ping-pong only (macro-chunk offsets differ; see sync_gemv_from_scratch).
+                // Ping-pong only: macro-chunk's per-role DMA destinations are slot-based
+                // and do not match `weight_offset` (audit A.3.4 needs this DMA path fixed
+                // before the mirror can be bound for macro-chunk), so host-upload there.
                 if sc.block_k <= 1 {
                     if let Some(eng) = self.pool.engines.get(i) {
                         if let Ok(p) = crate::stream_infer::begin_gemv_from_scratch(

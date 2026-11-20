@@ -3839,8 +3839,8 @@ pub(crate) fn sync_gemv_from_scratch(
     let woff = scratch.weight_offset(layer, tensor_off);
     // Only the ping-pong layout maps a device mirror to the same offsets the read uses.
     // In macro-chunk a layer sits at `(layer % block_k) * stride` and the per-role DMA
-    // destinations are slot-based, so a direct mirror read would be mis-offset: fall
-    // back to the (correct) host-upload path there.
+    // destinations are slot-based, so a direct mirror read is currently mis-offset: fall
+    // back to the (correct) host-upload path (audit A.3.4: fix the DMA offset first).
     if scratch.block_k > 1 {
         return Ok(false);
     }
