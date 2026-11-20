@@ -60,16 +60,29 @@ pub fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
-/// Dot `query` with INT8 vector dequantized by per-channel scales.
+/// Dot `query` with INT8 keys dequantised by **per-block** scales (`block` elements
+/// share one scale). This is the KV-cache layout (audit C.3): ~1.06 bytes/element
+/// instead of one `f32` scale per element (5 bytes/element).
 #[inline]
-pub fn simd_dot_i8_channel(query: &[f32], keys: &[i8], scales: &[f32]) -> f32 {
+pub fn simd_dot_i8_block(query: &[f32], keys: &[i8], scales: &[f32], block: usize) -> f32 {
     assert_eq!(query.len(), keys.len());
-    assert_eq!(query.len(), scales.len());
+    assert!(block > 0);
+    let mut acc = 0.0f32;
+    let mut b = 0;
+    while b < query.len() {
+        let end = (b + block).min(query.len());
+        acc += scales[b / block] * simd_dot_i8_raw(&query[b..end], &keys[b..end]);
+        b = end;
+    }
+    acc
+}
+
+#[inline]
+fn simd_dot_i8_raw(query: &[f32], keys: &[i8]) -> f32 {
     let mut sum = f32x8::splat(0.0);
     let mut i = 0;
     while i + 8 <= query.len() {
         let q = f32x8::from_slice(&query[i..i + 8]);
-        let s = f32x8::from_slice(&scales[i..i + 8]);
         let k = f32x8::from_array([
             keys[i] as f32,
             keys[i + 1] as f32,
@@ -80,12 +93,12 @@ pub fn simd_dot_i8_channel(query: &[f32], keys: &[i8], scales: &[f32]) -> f32 {
             keys[i + 6] as f32,
             keys[i + 7] as f32,
         ]);
-        sum += q * (k * s);
+        sum += q * k;
         i += 8;
     }
     let mut acc = sum.reduce_sum();
     while i < query.len() {
-        acc += query[i] * (keys[i] as f32 * scales[i]);
+        acc += query[i] * keys[i] as f32;
         i += 1;
     }
     acc

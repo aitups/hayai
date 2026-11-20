@@ -5,7 +5,7 @@
 //! - Newest `recent_fp_tokens` also kept in FP32 for attention (small full-precision window).
 //! - Resident token count never exceeds `sinks + window`.
 
-use crate::simd_ops::{simd_dot, simd_dot_i8_channel};
+use crate::simd_ops::{simd_dot, simd_dot_i8_block};
 
 /// Default recent full-precision tokens.
 pub const DEFAULT_RECENT_FP_TOKENS: usize = 32;
@@ -19,9 +19,13 @@ pub struct BoundedKvCache {
     pub recent_fp_tokens: usize,
     pub key_cache: Vec<i8>,
     pub value_cache: Vec<i8>,
-    /// Per-channel scales: `[max_seq_len * dim]`
+    /// Per-block scales: `[max_seq_len * n_blocks]` (audit C.3 — ~1.06 B/elem vs 5).
     pub k_scales: Vec<f32>,
     pub v_scales: Vec<f32>,
+    /// Elements per INT8 scale block (32, or `dim` if smaller).
+    pub k_block: usize,
+    /// Number of scale blocks per vector (`ceil(dim / k_block)`).
+    pub n_blocks: usize,
     /// FP overlay for newest tokens: `[recent_fp_tokens * dim]`
     recent_k: Vec<f32>,
     recent_v: Vec<f32>,
@@ -47,6 +51,8 @@ impl BoundedKvCache {
         assert!(window_size > 0, "window_size must be > 0");
         let recent_fp_tokens = recent_fp_tokens.max(1).min(window_size);
         let max_seq_len = num_sink_tokens + window_size;
+        let k_block = 32usize.min(dim).max(1);
+        let n_blocks = (dim + k_block - 1) / k_block;
         Self {
             max_seq_len,
             num_sink_tokens,
@@ -54,8 +60,10 @@ impl BoundedKvCache {
             recent_fp_tokens,
             key_cache: vec![0; max_seq_len * dim],
             value_cache: vec![0; max_seq_len * dim],
-            k_scales: vec![1.0; max_seq_len * dim],
-            v_scales: vec![1.0; max_seq_len * dim],
+            k_scales: vec![1.0; max_seq_len * n_blocks],
+            v_scales: vec![1.0; max_seq_len * n_blocks],
+            k_block,
+            n_blocks,
             recent_k: vec![0.0; recent_fp_tokens * dim],
             recent_v: vec![0.0; recent_fp_tokens * dim],
             recent_slot: vec![usize::MAX; recent_fp_tokens],
@@ -78,12 +86,20 @@ impl BoundedKvCache {
         }
     }
 
-    fn quantize_channel_wise(src: &[f32], dst: &mut [i8], scales: &mut [f32]) {
-        for i in 0..src.len() {
-            let a = src[i].abs().max(1e-8);
-            let scale = a / 127.0;
-            scales[i] = scale;
-            dst[i] = (src[i] / scale).clamp(-127.0, 127.0) as i8;
+    fn quantize_block_wise(src: &[f32], dst: &mut [i8], scales: &mut [f32], block: usize) {
+        let mut b = 0;
+        while b < src.len() {
+            let end = (b + block).min(src.len());
+            let max_abs = src[b..end]
+                .iter()
+                .fold(0.0f32, |m, &v| m.max(v.abs()))
+                .max(1e-8);
+            let scale = max_abs / 127.0;
+            scales[b / block] = scale;
+            for i in b..end {
+                dst[i] = (src[i] / scale).clamp(-127.0, 127.0) as i8;
+            }
+            b = end;
         }
     }
 
@@ -100,15 +116,18 @@ impl BoundedKvCache {
             self.max_seq_len,
         );
         let start = target_idx * self.dim;
-        Self::quantize_channel_wise(
+        let sb = target_idx * self.n_blocks;
+        Self::quantize_block_wise(
             key,
             &mut self.key_cache[start..start + self.dim],
-            &mut self.k_scales[start..start + self.dim],
+            &mut self.k_scales[sb..sb + self.n_blocks],
+            self.k_block,
         );
-        Self::quantize_channel_wise(
+        Self::quantize_block_wise(
             value,
             &mut self.value_cache[start..start + self.dim],
-            &mut self.v_scales[start..start + self.dim],
+            &mut self.v_scales[sb..sb + self.n_blocks],
+            self.k_block,
         );
 
         // FP overlay (ring).
@@ -182,8 +201,9 @@ impl BoundedKvCache {
             return;
         }
         let start = slot * self.dim;
+        let sb = slot * self.n_blocks;
         for i in 0..self.dim {
-            out[i] = self.key_cache[start + i] as f32 * self.k_scales[start + i];
+            out[i] = self.key_cache[start + i] as f32 * self.k_scales[sb + i / self.k_block];
         }
     }
 
@@ -194,8 +214,9 @@ impl BoundedKvCache {
             return;
         }
         let start = slot * self.dim;
+        let sb = slot * self.n_blocks;
         for i in 0..self.dim {
-            out[i] = self.value_cache[start + i] as f32 * self.v_scales[start + i];
+            out[i] = self.value_cache[start + i] as f32 * self.v_scales[sb + i / self.k_block];
         }
     }
 
@@ -207,10 +228,12 @@ impl BoundedKvCache {
             );
         }
         let start = slot * self.dim;
-        simd_dot_i8_channel(
+        let sb = slot * self.n_blocks;
+        simd_dot_i8_block(
             query,
             &self.key_cache[start..start + self.dim],
-            &self.k_scales[start..start + self.dim],
+            &self.k_scales[sb..sb + self.n_blocks],
+            self.k_block,
         )
     }
 
@@ -223,8 +246,9 @@ impl BoundedKvCache {
             return;
         }
         let start = slot * self.dim;
+        let sb = slot * self.n_blocks;
         for i in 0..self.dim {
-            acc[i] += self.value_cache[start + i] as f32 * self.v_scales[start + i] * weight;
+            acc[i] += self.value_cache[start + i] as f32 * self.v_scales[sb + i / self.k_block] * weight;
         }
     }
 
@@ -354,22 +378,24 @@ mod tests {
     }
 
     #[test]
-    fn channel_wise_preserves_outlier_channel() {
-        let mut cache = BoundedKvCache::with_recent_fp(4, 0, 4, 1);
-        cache.append(&[1.0, 100.0, 0.0, 0.0], &[1.0, 1.0, 1.0, 1.0]);
-        // Force slot 0 out of recent FP by filling recent with another token on same window.
-        cache.append(&[0.0, 0.0, 0.0, 0.0], &[0.0, 0.0, 0.0, 0.0]);
-        // Slot 0 may still be recent if recent_fp=1 holds token1. Append more.
-        cache.append(&[0.5, 0.0, 0.0, 0.0], &[0.0, 0.0, 0.0, 0.0]);
-        let mut out = [0.0f32; 4];
-        // Read INT8 path: slot 0 should be token0 if not overwritten; window size 4 so still there.
-        // recent holds latest slot only — slot 0 uses INT8 channel-wise.
+    fn block_wise_scales_roundtrip() {
+        // Per-block INT8 (audit C.3): dim 64 → 2 blocks of 32, one scale each.
+        let mut cache = BoundedKvCache::with_recent_fp(64, 0, 8, 1);
+        assert_eq!(cache.n_blocks, 2);
+        let mut key = vec![0.0f32; 64];
+        key[0] = 3.0;
+        key[40] = -2.0;
+        let mut val = vec![0.0f32; 64];
+        for (i, v) in val.iter_mut().enumerate() {
+            *v = (i as f32) * 0.1 - 3.0;
+        }
+        cache.append(&key, &val);
+        // Push slot 0 out of the recent FP ring (recent_fp=1 holds the latest token).
+        cache.append(&vec![0.0f32; 64], &vec![0.0f32; 64]);
+        let mut out = vec![0.0f32; 64];
         cache.dequantize_key(0, &mut out);
-        assert!((out[0] - 1.0).abs() < 0.05, "{out:?}");
-        assert!(
-            (out[1] - 100.0).abs() < 0.5,
-            "outlier channel destroyed: {out:?}"
-        );
+        assert!((out[0] - 3.0).abs() < 0.1, "block0 {out:?}");
+        assert!((out[40] + 2.0).abs() < 0.1, "block1 {out:?}");
     }
 
     #[test]
@@ -389,3 +415,5 @@ mod tests {
         }
     }
 }
+
+
