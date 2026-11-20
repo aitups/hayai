@@ -72,9 +72,9 @@ __kernel void ggml_gemv_q4_0(
         if (row < M) {
             int b0 = t0 / 32;
             int b1 = (t0 + ntile) / 32;
-            int row_base = row * row_bytes;
+            long row_base = (long)row * row_bytes;
             for (int b = b0; b < b1; b++) {
-                int base = row_base + b * 18;
+                long base = row_base + b * 18;
                 ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
                 float d = hayai_half_bits_to_float(hd);
                 int x_base = b * 32 - t0;
@@ -121,9 +121,9 @@ __kernel void ggml_gemv_q4_1(
         if (row < M) {
             int b0 = t0 / 32;
             int b1 = (t0 + ntile) / 32;
-            int row_base = row * row_bytes;
+            long row_base = (long)row * row_bytes;
             for (int b = b0; b < b1; b++) {
-                int base = row_base + b * 20;
+                long base = row_base + b * 20;
                 ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
                 ushort hm = (ushort)wbase[base + 2] | ((ushort)wbase[base + 3] << 8);
                 float d = hayai_half_bits_to_float(hd);
@@ -165,10 +165,10 @@ __kernel void ggml_gemv_q8_0(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 32;
     int row_bytes = blocks * 34;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int b = 0; b < blocks; b++) {
-        int base = row_base + b * 34;
+        long base = row_base + b * 34;
         ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
         float d = hayai_half_bits_to_float(hd);
         int x_base = b * 32;
@@ -203,10 +203,10 @@ __kernel void ggml_gemv_q5_0(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 32;
     int row_bytes = blocks * 22;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int b = 0; b < blocks; b++) {
-        int base = row_base + b * 22;
+        long base = row_base + b * 22;
         ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
         float d = hayai_half_bits_to_float(hd);
         uint qh = (uint)wbase[base + 2] | ((uint)wbase[base + 3] << 8)
@@ -240,10 +240,10 @@ __kernel void ggml_gemv_q5_1(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 32;
     int row_bytes = blocks * 24;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int b = 0; b < blocks; b++) {
-        int base = row_base + b * 24;
+        long base = row_base + b * 24;
         ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
         ushort hm = (ushort)wbase[base + 2] | ((ushort)wbase[base + 3] << 8);
         float d = hayai_half_bits_to_float(hd);
@@ -368,7 +368,7 @@ __kernel void ggml_gemv_batched_q4_k(
         int ntile = min(HAYAI_X_TILE, N - t0);
         int bi0 = t0 / 256;
         int bi1 = (t0 + ntile) / 256;
-        int row_base = row * row_bytes;
+        long row_base = (long)row * row_bytes;
         for (int bi = bi0; bi < bi1; bi++) {
             __global const uchar* block = wbase + row_base + bi * 144;
             float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
@@ -434,7 +434,7 @@ __kernel void ggml_gemv_q6_k(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 210;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 210;
@@ -521,7 +521,7 @@ __kernel void ggml_gemv_f16(
     int row = get_global_id(0);
     hayai_wg_barrier(local_input);
     if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off + row * N * 2;
+    __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
     float sum = 0.0f;
     for (int c = 0; c < N; c++) {
         ushort hd = (ushort)wbase[c * 2] | ((ushort)wbase[c * 2 + 1] << 8);
@@ -545,7 +545,7 @@ __kernel void ggml_gemv_q2_k(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 84;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 84;
@@ -597,7 +597,7 @@ __kernel void ggml_gemv_q3_k(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 110;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     const uint kmask1 = 0x03030303u;
     const uint kmask2 = 0x0f0f0f0fu;
@@ -671,7 +671,7 @@ __kernel void ggml_gemv_q5_k(
         if (row < M) {
             int bi0 = t0 / 256;
             int bi1 = (t0 + ntile) / 256;
-            int row_base = row * row_bytes;
+            long row_base = (long)row * row_bytes;
             for (int bi = bi0; bi < bi1; bi++) {
                 __global const uchar* block = wbase + row_base + bi * 176;
                 float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
@@ -734,7 +734,7 @@ __kernel void ggml_gemv_iq4_nl(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 32;
     int row_bytes = blocks * 18;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 18;
@@ -764,7 +764,7 @@ __kernel void ggml_gemv_iq4_xs(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 136;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 136;
@@ -928,7 +928,7 @@ __kernel void ggml_gemv_iq3_xxs(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 98;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 98;
@@ -975,7 +975,7 @@ __kernel void ggml_gemv_iq3_s(
     __global const uchar* wbase = weights + weight_off;
     int blocks = N / 256;
     int row_bytes = blocks * 110;
-    int row_base = row * row_bytes;
+    long row_base = (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + row_base + bi * 110;
@@ -1511,7 +1511,7 @@ __kernel void ggml_gemv_iq2_xxs(
     int row_bytes = blocks * 66;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row * row_bytes + bi * 66;
+        __global const uchar* block = wbase + (long)row * row_bytes + bi * 66;
         float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
         __global const uchar* qs = block + 2;
         int x_base = bi * 256;
@@ -1550,7 +1550,7 @@ __kernel void ggml_gemv_iq2_xs(
     int row_bytes = blocks * 74;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row * row_bytes + bi * 74;
+        __global const uchar* block = wbase + (long)row * row_bytes + bi * 74;
         float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
         __global const uchar* qs = block + 2;
         __global const uchar* scales = block + 66;
@@ -1589,7 +1589,7 @@ __kernel void ggml_gemv_iq2_s(
     int row_bytes = blocks * 82;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row * row_bytes + bi * 82;
+        __global const uchar* block = wbase + (long)row * row_bytes + bi * 82;
         float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
         __global const uchar* qs = block + 2;
         __global const uchar* signs_all = block + 34;
@@ -1632,7 +1632,7 @@ __kernel void ggml_gemv_bf16(
     int row = get_global_id(0);
     hayai_wg_barrier(local_input);
     if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off + row * N * 2;
+    __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
     float sum = 0.0f;
     for (int c = 0; c < N; c++) {
         uint bits = (uint)wbase[c * 2] | ((uint)wbase[c * 2 + 1] << 8);
@@ -1656,7 +1656,7 @@ __kernel void ggml_gemv_q8_1(
     if (row >= M) return;
     int blocks = N / 32;
     int row_bytes = blocks * 36;
-    __global const uchar* wbase = weights + weight_off + row * row_bytes;
+    __global const uchar* wbase = weights + weight_off + (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + bi * 36;
@@ -1685,7 +1685,7 @@ __kernel void ggml_gemv_q8_k(
     if (row >= M) return;
     int blocks = N / 256;
     int row_bytes = blocks * 292;
-    __global const uchar* wbase = weights + weight_off + row * row_bytes;
+    __global const uchar* wbase = weights + weight_off + (long)row * row_bytes;
     float sum = 0.0f;
     for (int bi = 0; bi < blocks; bi++) {
         __global const uchar* block = wbase + bi * 292;
@@ -1699,3 +1699,4 @@ __kernel void ggml_gemv_q8_k(
     }
     output[row] = sum;
 }
+
