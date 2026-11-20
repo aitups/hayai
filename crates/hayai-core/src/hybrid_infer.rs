@@ -33,18 +33,21 @@ pub(crate) fn prefill_hybrid(
     tokens: &[u32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
-    let mut all = prefill_hybrid_all(gen, orch, tokens, scratch)?;
+    let mut all = prefill_hybrid_all(gen, orch, tokens, scratch, true)?;
     all.0.pop().ok_or_else(|| StreamInferError::Msg("empty prefill".into()))
 }
 
 /// Layer-major hybrid prefill returning **per-token** logits and post-norm hidden
 /// states (`t_h_nextn`). Used by speculative decoding to verify a draft batch and
-/// to prime the MTP head.
+/// to prime the MTP head. `last_only` computes `lm_head` for just the final prompt
+/// token (plain generation only needs that one; audit C.4.1 — it was projecting the
+/// 152k-vocab head T times and discarding T-1).
 pub(crate) fn prefill_hybrid_all(
     gen: &mut StreamingGenerator,
     orch: &mut EngineOrchestrator,
     tokens: &[u32],
     scratch: &mut StreamingScratch,
+    last_only: bool,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), StreamInferError> {
     let h = gen.config.hidden_size;
     let eps = gen.config.rms_norm_eps;
@@ -146,7 +149,10 @@ pub(crate) fn prefill_hybrid_all(
     gen.position = base_pos + t_count;
     let mut all_logits = Vec::with_capacity(t_count);
     let mut all_hidden = Vec::with_capacity(t_count);
-    for x in xs.iter_mut() {
+    for (i, x) in xs.iter_mut().enumerate() {
+        if last_only && i + 1 != t_count {
+            continue;
+        }
         let lg = output_logits(gen, orch, x, eps)?;
         all_hidden.push(gen.last_hidden_nextn.clone());
         all_logits.push(lg);

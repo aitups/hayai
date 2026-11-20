@@ -78,7 +78,7 @@ impl StreamingGenerator {
         let wall0 = Instant::now();
 
         // Prefill the prompt (per-token logits + post-norm hidden).
-        let (all_logits, all_h) = prefill_hybrid_all(self, orch, &prompt_ids, &mut scratch)?;
+        let (all_logits, all_h) = prefill_hybrid_all(self, orch, &prompt_ids, &mut scratch, false)?;
 
         // Prime the MTP block's KV over the prompt: position i = token[i], h[i-1].
         for i in 0..prompt_len {
@@ -123,7 +123,7 @@ impl StreamingGenerator {
             let mut batch: Vec<u32> = Vec::with_capacity(k + 1);
             batch.push(x1);
             batch.extend_from_slice(&drafts);
-            let (p, hb) = prefill_hybrid_all(self, orch, &batch, &mut scratch)?;
+            let (p, hb) = prefill_hybrid_all(self, orch, &batch, &mut scratch, false)?;
 
             let mut a = 0usize;
             while a < k && argmax_id(&p[a]) == drafts[a] {
@@ -158,7 +158,7 @@ impl StreamingGenerator {
             } else {
                 // Rejected: roll back and commit only the accepted prefix.
                 self.spec_restore(snap);
-                let (p2, h2) = prefill_hybrid_all(self, orch, &committed, &mut scratch)?;
+                let (p2, h2) = prefill_hybrid_all(self, orch, &committed, &mut scratch, false)?;
                 // Re-prime the MTP KV for the committed prefix.
                 let mut hp = hidden_before.clone();
                 for (idx, &tok) in committed.iter().enumerate() {
@@ -193,3 +193,4 @@ impl StreamingGenerator {
         })
     }
 }
+
