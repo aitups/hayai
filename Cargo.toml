@@ -11,6 +11,13 @@ members = [
     "crates/hayai-api",
 ]
 
+# Audit C.1: thin LTO + a single codegen unit so hot SIMD loops inline across the
+# quant/GEMV crate boundary. Portable (no -C target-cpu), so a build still runs on
+# any x86-64/ARM64 host; per-microarch SIMD uses runtime dispatch (see hayai-model).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 version = "0.2.3"
 edition = "2021"

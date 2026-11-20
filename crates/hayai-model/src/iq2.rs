@@ -609,7 +609,7 @@ macro_rules! iq2_api {
             }
             assert_eq!(input.len(), ncols);
             assert_eq!(output.len(), nrows);
-            output.par_iter_mut().enumerate().for_each(|(row, out)| {
+            output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
                 let row_base = row * row_bytes;
                 let mut sum = 0.0f32;
                 let mut tmp = [0.0f32; QK_K];
@@ -688,3 +688,4 @@ mod tests {
         dequant_iq2_s_block(&vec![0u8; IQ2_S_BLOCK_BYTES], &mut y);
     }
 }
+

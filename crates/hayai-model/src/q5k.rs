@@ -86,7 +86,7 @@ pub fn gemv_q5_k(
     assert_eq!(input.len(), ncols);
     assert_eq!(output.len(), nrows);
 
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -152,3 +152,4 @@ pub fn extract_q5_k_row(
     }
     Ok(())
 }
+

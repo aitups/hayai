@@ -52,7 +52,7 @@ pub fn gemv_q5_0(
     if data.len() < nrows * row_bytes {
         return Err(GgufError::Truncated("q5_0 gemv"));
     }
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -133,7 +133,7 @@ pub fn gemv_q5_1(
     }
     let blocks_per_row = ncols / QK5;
     let row_bytes = blocks_per_row * Q5_1_BLOCK_BYTES;
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -156,3 +156,4 @@ pub fn gemv_q5_1(
     });
     Ok(())
 }
+

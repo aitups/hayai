@@ -356,7 +356,7 @@ impl QuantMatrix {
 }
 
 fn gemv_f32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 4;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -369,7 +369,7 @@ fn gemv_f32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_f16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 2;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -382,7 +382,7 @@ fn gemv_f16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_bf16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 2;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -396,7 +396,7 @@ fn gemv_bf16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_f64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 8;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -409,7 +409,7 @@ fn gemv_f64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_i8(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -420,7 +420,7 @@ fn gemv_i8(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_i16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 2;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -432,7 +432,7 @@ fn gemv_i16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_i32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 4;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -444,7 +444,7 @@ fn gemv_i32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
 }
 
 fn gemv_i64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 8;
         let mut sum = 0.0f32;
         for col in 0..ncols {
@@ -459,7 +459,7 @@ fn gemv_q8_1(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 36;
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -484,7 +484,7 @@ fn gemv_q8_k(nrows: usize, ncols: usize, data: &[u8], input: &[f32], output: &mu
     if data.len() < need {
         return Err(GgufError::Truncated("q8_k weights"));
     }
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -542,7 +542,7 @@ pub fn gemv_q4_0(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 18;
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -577,7 +577,7 @@ pub fn gemv_q4_1(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 20;
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -599,7 +599,7 @@ pub fn gemv_q8_0(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 34;
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
+    output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
         let mut sum = 0.0f32;
         for b in 0..blocks_per_row {
@@ -774,3 +774,4 @@ mod tests {
         assert!((d[0] - 1.0).abs() < 1e-6);
     }
 }
+

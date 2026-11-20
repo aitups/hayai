@@ -71,21 +71,29 @@ pub fn gemv_q6_k(
     if data.len() < nrows * row_bytes {
         return Err(GgufError::Truncated("q6_k gemv"));
     }
-    output.par_iter_mut().enumerate().for_each(|(row, out)| {
-        let mut row_vals = vec![0.0f32; ncols];
-        let row_base = row * row_bytes;
-        for b in 0..blocks_per_row {
-            dequant_q6_k_block(
-                &data[row_base + b * Q6_K_BLOCK_BYTES..],
-                &mut row_vals[b * QK_K..(b + 1) * QK_K],
-            );
-        }
-        let mut sum = 0.0f32;
-        for c in 0..ncols {
-            sum += row_vals[c] * input[c];
-        }
-        *out = sum;
-    });
+    // Audit C.2.1: dequantise one 256-element block into a stack buffer and dot it,
+    // instead of `vec![0.0f32; ncols]` per row (the lm_head fired ~152k malloc+free per
+    // token and thrashed the global allocator across the Rayon threads).
+    output
+        .par_iter_mut()
+        .with_min_len(64)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let row_base = row * row_bytes;
+            let mut sum = 0.0f32;
+            let mut block_vals = [0.0f32; QK_K];
+            for b in 0..blocks_per_row {
+                dequant_q6_k_block(
+                    &data[row_base + b * Q6_K_BLOCK_BYTES..],
+                    &mut block_vals,
+                );
+                let xs = &input[b * QK_K..(b + 1) * QK_K];
+                for c in 0..QK_K {
+                    sum += block_vals[c] * xs[c];
+                }
+            }
+            *out = sum;
+        });
     Ok(())
 }
 
