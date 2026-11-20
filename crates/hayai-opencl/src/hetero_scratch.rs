@@ -168,9 +168,11 @@ impl StreamingScratch {
         };
 
         let mut dgpu_mirrors = Vec::new();
-        for eng in pool.engines.iter().filter(|e| {
-            e.device_info.device_kind == DeviceKind::DiscreteGpu
-        }) {
+        // Discrete and integrated GPUs always; an APU only when it cannot bind its host
+        // base zero-copy via fine-grain SVM (a coarse APU would otherwise host-upload
+        // every op, so one DMA per layer is strictly better; true UMA zero-copy via
+        // CL_MEM_USE_HOST_PTR is the remaining refinement).
+        for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
             if !mirror_fits(eng, slot_bytes) {
                 warn!(
                     "Skipping VRAM mirror on {} ({} KiB > max alloc {} KiB); \
@@ -364,15 +366,13 @@ impl StreamingScratch {
         ))
     }
 
-    /// One big VRAM mirror per discrete GPU for the resident base.
+    /// One big device mirror per discrete or integrated GPU for the resident base.
     fn resident_mirrors(
         pool: &OpenClDevicePool,
         total: usize,
     ) -> Result<Vec<DgpuMirror>, OpenClError> {
         let mut mirrors = Vec::new();
-        for eng in pool.engines.iter().filter(|e| {
-            e.device_info.device_kind == DeviceKind::DiscreteGpu
-        }) {
+        for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
             if !mirror_fits(eng, total) {
                 warn!(
                     "Resident: skipping VRAM mirror on {} ({} MiB > max alloc {} MiB); \
@@ -1000,6 +1000,19 @@ impl StreamingScratch {
 fn mirror_fits(eng: &OpenClEngine, bytes: usize) -> bool {
     let max = eng.device_info.max_alloc_size;
     max == 0 || bytes as u64 <= max
+}
+
+/// Whether to allocate a per-layer device mirror for this engine. Discrete and
+/// integrated GPUs yes; an APU only when it cannot bind its host base zero-copy via
+/// fine-grain SVM (a coarse APU would otherwise host-upload per op).
+fn wants_device_mirror(eng: &OpenClEngine) -> bool {
+    match eng.device_info.device_kind {
+        DeviceKind::DiscreteGpu | DeviceKind::IntegratedGpu => true,
+        DeviceKind::Apu => {
+            !(eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
+        }
+        _ => false,
+    }
 }
 
 fn dma_write_rect(
