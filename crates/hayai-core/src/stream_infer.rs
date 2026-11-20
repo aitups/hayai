@@ -3768,6 +3768,12 @@ pub(crate) fn begin_gemv_from_scratch(
     };
     use hayai_opencl::WeightBind;
     let woff = scratch.weight_offset(layer, tensor_off);
+    // Macro-chunk: the per-role DMA destination does not yet match `weight_offset`, so
+    // binding the mirror would read misaligned bytes; host-upload instead (correct, just
+    // slower). Mirrors `sync_gemv_from_scratch` (audit A.3.4).
+    if scratch.block_k > 1 {
+        return begin_gemv(eng, m, xn);
+    }
     match scratch.weight_bind(eng, layer) {
         Ok(WeightBind::Svm { ptr }) => Ok(eng.ggml_gemv_async_from_svm(
             kernel,
