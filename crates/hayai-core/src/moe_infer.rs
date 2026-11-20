@@ -24,9 +24,10 @@ pub(crate) fn prefill_moe(
     prompt_ids: &[u32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
+    let n = prompt_ids.len();
     let mut last = Vec::new();
-    for &tok in prompt_ids {
-        last = forward_moe(gen, orch, tok, scratch)?;
+    for (i, &tok) in prompt_ids.iter().enumerate() {
+        last = forward_moe_inner(gen, orch, tok, scratch, i + 1 == n)?;
     }
     Ok(last)
 }
@@ -36,6 +37,16 @@ pub(crate) fn forward_moe(
     orch: &mut EngineOrchestrator,
     token: u32,
     scratch: &mut StreamingScratch,
+) -> Result<Vec<f32>, StreamInferError> {
+    forward_moe_inner(gen, orch, token, scratch, true)
+}
+
+fn forward_moe_inner(
+    gen: &mut StreamingGenerator,
+    orch: &mut EngineOrchestrator,
+    token: u32,
+    scratch: &mut StreamingScratch,
+    compute_logits: bool,
 ) -> Result<Vec<f32>, StreamInferError> {
     let h = gen.config.hidden_size;
     let eps = gen.config.rms_norm_eps;
@@ -520,26 +531,22 @@ pub(crate) fn forward_moe(
     }
 
     // ── Output head ─────────────────────────────────────────────────────────────
+    gen.position += 1;
+    if !compute_logits {
+        return Ok(Vec::new());
+    }
     let mut xn = x;
     rms_norm(&mut xn, &gen.output_norm, eps);
     let vocab = gen.config.vocab_size;
     let mut logits = vec![0.0f32; vocab];
+    gen.ensure_head_loaded()?;
     if gen.has_output_weight {
-        if let Some(ow) = &gen.resident_output {
-            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-        } else {
-            let ow = gen.catalog.load_quant_matrix("output.weight")?;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            gen.io_bytes += ow.nbytes() as u64;
-        }
-    } else if let Some(emb) = &gen.resident_embed {
-        orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+        let ow = gen.resident_output.as_ref().unwrap();
+        orch.execute_quant_gemv(ow, &xn, &mut logits)?;
     } else {
-        let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-        orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-        gen.io_bytes += emb.nbytes() as u64;
+        let emb = gen.resident_embed.as_ref().unwrap();
+        orch.execute_quant_gemv(emb, &xn, &mut logits)?;
     }
-    gen.position += 1;
     if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
         let at = std::env::var("HAYAI_DUMP_AT_POS")
             .ok()
@@ -1139,5 +1146,6 @@ mod tests {
         assert!(off.get(0, 1).is_none());
     }
 }
+
 
 

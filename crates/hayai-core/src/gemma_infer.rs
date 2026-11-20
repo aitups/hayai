@@ -183,9 +183,10 @@ pub(crate) fn prefill_gemma(
     tokens: &[u32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
+    let n = tokens.len();
     let mut logits = Vec::new();
-    for &tok in tokens {
-        logits = forward_gemma(gen, orch, tok, scratch)?;
+    for (i, &tok) in tokens.iter().enumerate() {
+        logits = forward_gemma_inner(gen, orch, Some(tok), None, scratch, i + 1 == n)?;
     }
     Ok(logits)
 }
@@ -196,7 +197,7 @@ pub(crate) fn forward_gemma(
     token: u32,
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
-    forward_gemma_inner(gen, orch, Some(token), None, scratch)
+    forward_gemma_inner(gen, orch, Some(token), None, scratch, true)
 }
 
 /// Gemma forward with a pre-computed input embedding (multimodal injection); the
@@ -207,7 +208,7 @@ pub(crate) fn forward_gemma_embd(
     embd: &[f32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
-    forward_gemma_inner(gen, orch, None, Some(embd), scratch)
+    forward_gemma_inner(gen, orch, None, Some(embd), scratch, true)
 }
 
 fn forward_gemma_inner(
@@ -216,6 +217,7 @@ fn forward_gemma_inner(
     token: Option<u32>,
     embd: Option<&[f32]>,
     scratch: &mut StreamingScratch,
+    compute_logits: bool,
 ) -> Result<Vec<f32>, StreamInferError> {
     let h = gen.config.hidden_size;
     let eps = gen.config.rms_norm_eps;
@@ -417,26 +419,21 @@ fn forward_gemma_inner(
         let _ = pack;
     }
 
+    gen.position += 1;
+    if !compute_logits {
+        return Ok(Vec::new());
+    }
     let mut xn = x;
     rms_norm(&mut xn, &gen.output_norm, eps);
     let vocab = gen.config.vocab_size;
     let mut logits = vec![0.0f32; vocab];
+    gen.ensure_head_loaded()?;
     if gen.has_output_weight {
-        if let Some(ow) = &gen.resident_output {
-            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-        } else {
-            let ow = gen.catalog.load_quant_matrix("output.weight")?;
-            orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            gen.io_bytes += ow.nbytes() as u64;
-        }
+        let ow = gen.resident_output.as_ref().unwrap();
+        orch.execute_quant_gemv(ow, &xn, &mut logits)?;
     } else {
-        if let Some(emb) = &gen.resident_embed {
-            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
-        } else {
-            let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-            orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-            gen.io_bytes += emb.nbytes() as u64;
-        }
+        let emb = gen.resident_embed.as_ref().unwrap();
+        orch.execute_quant_gemv(emb, &xn, &mut logits)?;
     }
     if meta.softcap > 0.0 {
         let inv = 1.0 / meta.softcap;
@@ -444,7 +441,6 @@ fn forward_gemma_inner(
             *l = meta.softcap * (*l * inv).tanh();
         }
     }
-    gen.position += 1;
     Ok(logits)
 }
 
