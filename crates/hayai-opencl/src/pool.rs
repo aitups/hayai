@@ -164,34 +164,21 @@ impl OpenClDevicePool {
     }
 }
 
-/// Assign the 3 FFN roles (gate/up/down) across the pool to balance estimated
-/// load by compute-unit count (greedy LPT). Deterministic and vendor-agnostic.
+/// Assign the 3 FFN roles (gate/up/down) across the pool.
+///
+/// Without measured throughputs and with the gate/up → down dependency, the safe default
+/// is to keep all three roles on the single fastest device *class* — never blind
+/// round-robin `up` onto a slow iGPU (the old formula normalised by the same weight it
+/// accumulated, always yielding `[0, 1, 0]`). The measured planner is the authority: it
+/// calls [`OpenClDevicePool::set_role_map`] with the per-op placement, and the hot FFN
+/// path reads `orchestrator.placement` directly.
 pub fn plan_roles(engines: &[OpenClEngine]) -> Vec<usize> {
     let n = engines.len();
     if n == 0 {
         return Vec::new();
     }
-    // Throughput proxy: faster device classes get proportionally more roles.
-    // `pool_rank` (0 = discrete) maps to weight 1/(rank+1). Cross-vendor CU counts
-    // are not comparable, so ordering is the safer default; the calibration
-    // profile can override the map via `set_role_map`.
-    let weight: Vec<f64> = engines
-        .iter()
-        .map(|e| 1.0 / (e.device_info.device_kind.pool_rank() as f64 + 1.0))
-        .collect();
-    let mut load = vec![0.0f64; n];
-    let mut map = Vec::with_capacity(3);
-    for _role in 0..3 {
-        let best = (0..n)
-            .min_by(|&a, &b| {
-                // Least normalized load; on a tie prefer the faster class.
-                let ka = (load[a] / weight[a], -weight[a]);
-                let kb = (load[b] / weight[b], -weight[b]);
-                ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap_or(0);
-        map.push(best);
-        load[best] += weight[best];
-    }
-    map
+    let best = (0..n)
+        .min_by_key(|&i| (engines[i].device_info.device_kind.pool_rank(), i))
+        .unwrap_or(0);
+    vec![best; 3]
 }

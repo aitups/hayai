@@ -573,6 +573,28 @@ impl StreamingGenerator {
     /// pack trae bloques sustituidos; los bloques densos usan el orchestrator.
     /// `ov` (override de evolución, Vía B) tiene prioridad sobre el CSR embebido
     /// — agnóstico a arquitectura: lo usan el path Dense y los bloques híbridos.
+    /// Cache the final projection (or tied embedding) once. The audit found this was
+    /// re-read from disk and a ~300–550 MiB buffer re-zeroed on **every** token, outside
+    /// the attn/ffn timers. Now it is loaded once per session and its time is counted.
+    pub(crate) fn ensure_head_loaded(&mut self) -> Result<(), StreamInferError> {
+        if self.has_output_weight {
+            if self.resident_output.is_none() {
+                let t0 = Instant::now();
+                let m = self.catalog.load_quant_matrix("output.weight")?;
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += m.nbytes() as u64;
+                self.resident_output = Some(m);
+            }
+        } else if self.resident_embed.is_none() {
+            let t0 = Instant::now();
+            let m = self.catalog.load_quant_matrix("token_embd.weight")?;
+            self.io_secs += t0.elapsed().as_secs_f64();
+            self.io_bytes += m.nbytes() as u64;
+            self.resident_embed = Some(m);
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_ffn_block(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -1778,26 +1800,35 @@ impl StreamingGenerator {
             self.scratch_q.resize(q_dim, 0.0);
             self.scratch_k.resize(kv_dim, 0.0);
             self.scratch_v.resize(kv_dim, 0.0);
-            orch.execute_op(
+            orch.execute_op_bound(
                 LayerOpKind::AttnQ,
                 op_binding(LayerOpKind::AttnQ),
                 &current.wq,
                 &self.scratch_xn,
                 &mut self.scratch_q,
+                scratch.as_deref(),
+                layer_idx,
+                layout.wq_off,
             )?;
-            orch.execute_op(
+            orch.execute_op_bound(
                 LayerOpKind::AttnK,
                 op_binding(LayerOpKind::AttnK),
                 &current.wk,
                 &self.scratch_xn,
                 &mut self.scratch_k,
+                scratch.as_deref(),
+                layer_idx,
+                layout.wk_off,
             )?;
-            orch.execute_op(
+            orch.execute_op_bound(
                 LayerOpKind::AttnV,
                 op_binding(LayerOpKind::AttnV),
                 &current.wv,
                 &self.scratch_xn,
                 &mut self.scratch_v,
+                scratch.as_deref(),
+                layer_idx,
+                layout.wv_off,
             )?;
             if let Some(b) = self.attn_bias.get(layer_idx) {
                 add_qkv_bias(b, &mut self.scratch_q, &mut self.scratch_k, &mut self.scratch_v);
@@ -1819,24 +1850,30 @@ impl StreamingGenerator {
             );
             if let Some(ref gate_w) = current.attn_gate {
                 self.scratch_gate.resize(q_dim, 0.0);
-                orch.execute_op(
+                orch.execute_op_bound(
                     LayerOpKind::AttnGate,
                     op_binding(LayerOpKind::AttnGate),
                     gate_w,
                     &self.scratch_xn,
                     &mut self.scratch_gate,
+                    scratch.as_deref(),
+                    layer_idx,
+                    layout.attn_gate_off,
                 )?;
                 for i in 0..q_dim {
                     self.scratch_attn[i] *= 1.0 / (1.0 + (-self.scratch_gate[i]).exp());
                 }
             }
             self.scratch_proj.resize(h, 0.0);
-            orch.execute_op(
+            orch.execute_op_bound(
                 LayerOpKind::AttnO,
                 op_binding(LayerOpKind::AttnO),
                 &current.wo,
                 &self.scratch_attn,
                 &mut self.scratch_proj,
+                scratch.as_deref(),
+                layer_idx,
+                layout.wo_off,
             )?;
             if let Some(b) = self.attn_bias.get(layer_idx) {
                 add_bias(&mut self.scratch_proj, &b.o);
@@ -2038,28 +2075,16 @@ impl StreamingGenerator {
         self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
+        let t_head = Instant::now();
+        self.ensure_head_loaded()?;
         if self.has_output_weight {
-            if let Some(ow) = &self.resident_output {
-                // Resident: cached final projection (zero disk I/O).
-                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let ow = self.catalog.load_quant_matrix("output.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += ow.nbytes() as u64;
-                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            }
+            let ow = self.resident_output.as_ref().unwrap();
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
         } else {
-            if let Some(emb) = &self.resident_embed {
-                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += emb.nbytes() as u64;
-                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-            }
+            let emb = self.resident_embed.as_ref().unwrap();
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
         }
+        self.ffn_secs += t_head.elapsed().as_secs_f64();
 
         self.position += 1;
         if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
@@ -2275,27 +2300,16 @@ impl StreamingGenerator {
         self.last_hidden_nextn.extend_from_slice(&xn);
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
+        let t_head = Instant::now();
+        self.ensure_head_loaded()?;
         if self.has_output_weight {
-            if let Some(ow) = &self.resident_output {
-                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let ow = self.catalog.load_quant_matrix("output.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += ow.nbytes() as u64;
-                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            }
+            let ow = self.resident_output.as_ref().unwrap();
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
         } else {
-            if let Some(emb) = &self.resident_embed {
-                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += emb.nbytes() as u64;
-                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-            }
+            let emb = self.resident_embed.as_ref().unwrap();
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
         }
+        self.ffn_secs += t_head.elapsed().as_secs_f64();
 
         self.position += 1;
         self.apply_logit_scale(&mut logits);
@@ -2418,6 +2432,24 @@ impl StreamingGenerator {
                             info!("placement: {kind:?} → {target}");
                         }
                         orch.set_placement(plan.placement.clone());
+                        // Keep the pool role map aligned with the planner for any
+                        // remaining `for_role()` users (deltanet aux ops, diagnostics).
+                        let mut role_map = vec![0usize; 3];
+                        for (role, kind) in [
+                            crate::LayerOpKind::FfnGate,
+                            crate::LayerOpKind::FfnUp,
+                            crate::LayerOpKind::FfnDown,
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            if let Some(crate::planner::ComputeTarget::Device(i)) =
+                                plan.placement.target_of(*kind)
+                            {
+                                role_map[role] = i;
+                            }
+                        }
+                        orch.pool.set_role_map(role_map);
                     }
                     self.exec_plan = Some(std::sync::Arc::new(plan));
                 }
@@ -3823,13 +3855,46 @@ pub(crate) fn sync_gemv_from_scratch(
 }
 
 pub(crate) enum GateUpInflight {
-    /// Both devices async — wait both after overlap work.
-    Dual {
-        gate: PendingGemv,
-        up: PendingGemv,
+    /// Pending device GEMVs; `None` means the result is already in the output buffer
+    /// (the op was placed on the CPU and computed inline there).
+    Pending {
+        gate: Option<PendingGemv>,
+        up: Option<PendingGemv>,
     },
-    /// Both already computed on CPU (empty OpenCL pool).
-    Done,
+}
+
+/// Device the planner assigned to `kind`; only falls back to the pool role map when the
+/// planner produced no placement (so the FFN never blindly round-robins onto a slow
+/// device — the whole layer's ops follow one measured cost model).
+fn ffn_device_for(
+    orch: &EngineOrchestrator,
+    kind: LayerOpKind,
+    role: usize,
+) -> Option<&hayai_opencl::OpenClEngine> {
+    match orch.placed_target(kind) {
+        Some(crate::planner::ComputeTarget::Device(i)) => orch.pool.engines.get(i),
+        Some(crate::planner::ComputeTarget::Cpu) => None,
+        None => orch.pool.for_role(role),
+    }
+}
+
+/// Run one FFN GEMV async on `eng`, reading the layer's device mirror when bound (no
+/// per-op re-upload), else falling back to a host upload for **that op only** — never
+/// re-running a different op that already succeeded.
+fn begin_ffn_gemv(
+    eng: &hayai_opencl::OpenClEngine,
+    m: &QuantMatrix,
+    xn: &[f32],
+    scratch: Option<&hayai_opencl::StreamingScratch>,
+    layer: usize,
+    tensor_off: usize,
+) -> Result<PendingGemv, StreamInferError> {
+    if let Some(sc) = scratch {
+        if let Ok(p) = begin_gemv_from_scratch(eng, m, xn, sc, layer, tensor_off) {
+            return Ok(p);
+        }
+    }
+    begin_gemv(eng, m, xn)
 }
 
 /// FFN gate∥up across the OpenCL device pool. CPU only if pool is empty.
@@ -3838,8 +3903,8 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     gate: &QuantMatrix,
     up: &QuantMatrix,
     xn: &[f32],
-    _gate_out: &mut [f32],
-    _up_out: &mut [f32],
+    gate_out: &mut [f32],
+    up_out: &mut [f32],
     used_dgpu: &mut bool,
     used_apu: &mut bool,
     scratch: Option<&hayai_opencl::StreamingScratch>,
@@ -3847,46 +3912,47 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<GateUpInflight, StreamInferError> {
     if orch.pool.is_empty() {
-        orch.execute_quant_gemv(gate, xn, _gate_out)?;
-        orch.execute_quant_gemv(up, xn, _up_out)?;
-        return Ok(GateUpInflight::Done);
+        orch.execute_quant_gemv(gate, xn, gate_out)?;
+        orch.execute_quant_gemv(up, xn, up_out)?;
+        return Ok(GateUpInflight::Pending { gate: None, up: None });
     }
+    let (gate_off, up_off) = layout.map(|l| (l.gate_off, l.up_off)).unwrap_or((0, 0));
+    let gate_eng = ffn_device_for(orch, LayerOpKind::FfnGate, 0);
+    let up_eng = ffn_device_for(orch, LayerOpKind::FfnUp, 1);
 
-    let gate_eng = orch
-        .pool
-        .for_role(0)
-        .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
-    let up_eng = orch
-        .pool
-        .for_role(1)
-        .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
-    *used_dgpu = true;
-    if orch.pool.len() >= 2 {
-        *used_apu = true;
-    }
-
-    // Persistent-buffer synchronous dispatch from the layer mirror. `begin_dev`
-    // (async) assigns fresh input/output buffers per op; for small ops that churn
-    // dominates the kernel time on a discrete GPU, so prefer the bound path.
-    if let (Some(sc), Some(lay)) = (scratch, layout) {
-        if sync_gemv_from_scratch(gate_eng, gate, xn, _gate_out, sc, layer, lay.gate_off)? {
-            if sync_gemv_from_scratch(up_eng, up, xn, _up_out, sc, layer, lay.up_off)? {
-                return Ok(GateUpInflight::Done);
-            }
+    // Gate: run on its placed device (async, from the mirror when bound), or inline on
+    // the CPU. Never deferred so that `up` can never force it to run twice.
+    let gate_pending = match gate_eng {
+        Some(eng) => {
+            *used_dgpu = true;
+            Some(begin_ffn_gemv(eng, gate, xn, scratch, layer, gate_off)?)
         }
-    }
-
-    let g = if let (Some(sc), Some(lay)) = (scratch, layout) {
-        begin_gemv_from_scratch(gate_eng, gate, xn, sc, layer, lay.gate_off)?
-    } else {
-        begin_gemv(gate_eng, gate, xn)?
+        None => {
+            gate.gemv(xn, gate_out)
+                .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            None
+        }
     };
-    let u = if let (Some(sc), Some(lay)) = (scratch, layout) {
-        begin_gemv_from_scratch(up_eng, up, xn, sc, layer, lay.up_off)?
-    } else {
-        begin_gemv(up_eng, up, xn)?
+    let up_pending = match up_eng {
+        Some(eng) => {
+            *used_dgpu = true;
+            if let Some(g) = gate_eng {
+                if g.device_info.device_id != eng.device_info.device_id {
+                    *used_apu = true;
+                }
+            }
+            Some(begin_ffn_gemv(eng, up, xn, scratch, layer, up_off)?)
+        }
+        None => {
+            up.gemv(xn, up_out)
+                .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+            None
+        }
     };
-    Ok(GateUpInflight::Dual { gate: g, up: u })
+    Ok(GateUpInflight::Pending {
+        gate: gate_pending,
+        up: up_pending,
+    })
 }
 
 /// Finish FFN using Base+Offset scratch for `down` when available.
@@ -3903,13 +3969,14 @@ pub(crate) fn ffn_finish_scratch(
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<(), StreamInferError> {
     match inflight {
-        GateUpInflight::Dual { gate, up } => {
-            let gate_v = gate.wait()?;
-            let up_v = up.wait()?;
-            gate_out.copy_from_slice(&gate_v);
-            up_out.copy_from_slice(&up_v);
+        GateUpInflight::Pending { gate, up } => {
+            if let Some(g) = gate {
+                gate_out.copy_from_slice(&g.wait()?);
+            }
+            if let Some(u) = up {
+                up_out.copy_from_slice(&u.wait()?);
+            }
         }
-        GateUpInflight::Done => {}
     }
     if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
         eprintln!("PROD_GATE_PRE L0: {:?}", &gate_out[0..8]);
@@ -3924,23 +3991,18 @@ pub(crate) fn ffn_finish_scratch(
     }
 
     if !orch.pool.is_empty() {
-        let eng = orch
-            .pool
-            .for_role(2)
-            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
-        *used_dgpu = true;
-        if let (Some(sc), Some(lay)) = (scratch, layout) {
-            if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, lay.down_off)? {
-                return Ok(());
+        let down_off = layout.map(|l| l.down_off).unwrap_or(0);
+        match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
+            Some(eng) => {
+                *used_dgpu = true;
+                let v = begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
+                down_out.copy_from_slice(&v);
+            }
+            None => {
+                down.gemv(gate_out, down_out)
+                    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
             }
         }
-        let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
-            begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
-        } else {
-            begin_gemv(eng, down, gate_out)?
-        };
-        let v = p.wait()?;
-        down_out.copy_from_slice(&v);
         return Ok(());
     }
     orch.execute_quant_gemv(down, gate_out, down_out)?;
@@ -3961,13 +4023,14 @@ pub(crate) fn ffn_finish_gelu_scratch(
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<(), StreamInferError> {
     match inflight {
-        GateUpInflight::Dual { gate, up } => {
-            let gate_v = gate.wait()?;
-            let up_v = up.wait()?;
-            gate_out.copy_from_slice(&gate_v);
-            up_out.copy_from_slice(&up_v);
+        GateUpInflight::Pending { gate, up } => {
+            if let Some(g) = gate {
+                gate_out.copy_from_slice(&g.wait()?);
+            }
+            if let Some(u) = up {
+                up_out.copy_from_slice(&u.wait()?);
+            }
         }
-        GateUpInflight::Done => {}
     }
 
     // tanh approximation of GELU (same family as ggml_gelu_quick).
@@ -3979,23 +4042,18 @@ pub(crate) fn ffn_finish_gelu_scratch(
     }
 
     if !orch.pool.is_empty() {
-        let eng = orch
-            .pool
-            .for_role(2)
-            .ok_or_else(|| StreamInferError::Msg("empty GPU pool".into()))?;
-        *used_dgpu = true;
-        if let (Some(sc), Some(lay)) = (scratch, layout) {
-            if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, lay.down_off)? {
-                return Ok(());
+        let down_off = layout.map(|l| l.down_off).unwrap_or(0);
+        match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
+            Some(eng) => {
+                *used_dgpu = true;
+                let v = begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
+                down_out.copy_from_slice(&v);
+            }
+            None => {
+                down.gemv(gate_out, down_out)
+                    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
             }
         }
-        let p = if let (Some(sc), Some(lay)) = (scratch, layout) {
-            begin_gemv_from_scratch(eng, down, gate_out, sc, layer, lay.down_off)?
-        } else {
-            begin_gemv(eng, down, gate_out)?
-        };
-        let v = p.wait()?;
-        down_out.copy_from_slice(&v);
         return Ok(());
     }
     orch.execute_quant_gemv(down, gate_out, down_out)?;

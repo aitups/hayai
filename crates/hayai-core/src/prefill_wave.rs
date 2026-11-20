@@ -251,7 +251,10 @@ impl StreamingGenerator {
                     } else {
                         orch.execute_quant_gemv(&current.up, &xn, &mut up_out)?;
                     }
-                    GateUpInflight::Done
+                    GateUpInflight::Pending {
+                        gate: None,
+                        up: None,
+                    }
                 } else {
                     ffn_begin_gate_up_scratch(
                         orch,
