@@ -238,6 +238,9 @@ mod iouring_weight {
         ring: IoUring,
         direct: bool,
         file_size: u64,
+        /// Reused page-aligned staging buffer for padded `O_DIRECT` reads (avoids a
+        /// fresh `AlignedBuffer::zeroed` — mmap + page zeroing — per tensor).
+        scratch: Option<AlignedBuffer>,
     }
 
     /// O_DIRECT alignment used for padded reads. 4096 is a multiple of both the
@@ -247,7 +250,13 @@ mod iouring_weight {
     impl IoUringWeightIo {
         pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
             let path = path.as_ref().to_path_buf();
-            let want_direct = std::env::var_os("HAYAI_O_DIRECT").is_some();
+            // Audit D.1.2: direct I/O is the streaming default on Linux (it bypasses the
+            // page cache — no double copy, no kswapd storms on models larger than RAM).
+            // Opt out with HAYAI_O_DIRECT=0; an unaligned/unsupported device still falls
+            // back to buffered per-read.
+            let want_direct = std::env::var_os("HAYAI_O_DIRECT")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             let (file, direct) = if want_direct {
                 match std::fs::OpenOptions::new()
                     .read(true)
@@ -266,7 +275,8 @@ mod iouring_weight {
             } else {
                 (File::open(&path)?, false)
             };
-            let ring = IoUring::new(16).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            // Ring depth 64: enough in-flight layer reads to keep a PCIe 4.0 NVMe busy.
+            let ring = IoUring::new(64).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             let file_size = file.metadata()?.len();
             // Streaming reads one layer at a time: ask the page cache for
             // sequential readahead (no-op/ignored under O_DIRECT).
@@ -282,6 +292,7 @@ mod iouring_weight {
                 ring,
                 direct,
                 file_size,
+                scratch: None,
             })
         }
 
@@ -348,10 +359,16 @@ mod iouring_weight {
                 ));
             }
             let n = (end - start) as usize;
-            let mut scratch = AlignedBuffer::zeroed(n);
-            self.read_exact_at(start, scratch.as_mut_slice())?;
+            // Reuse the staging buffer across tensors (grow when needed).
+            let mut scratch = self
+                .scratch
+                .take()
+                .filter(|s| s.len() >= n)
+                .unwrap_or_else(|| AlignedBuffer::zeroed(n));
+            self.read_exact_at(start, &mut scratch.as_mut_slice()[..n])?;
             let skip = (offset - start) as usize;
             buf.copy_from_slice(&scratch.as_slice()[skip..skip + buf.len()]);
+            self.scratch = Some(scratch);
             Ok(())
         }
     }
@@ -613,3 +630,4 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+

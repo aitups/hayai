@@ -9,6 +9,12 @@ pub struct AlignedBuffer {
     len: usize,
 }
 
+// SAFETY: an `AlignedBuffer` owns its single heap block exclusively; moving it between
+// threads is sound (no aliasing). Shared read-only access (`as_slice`) touches no
+// interior mutable state, so `&AlignedBuffer` is also safe to share.
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
 impl AlignedBuffer {
     /// Page size used for all Hayai streaming buffers.
     pub const ALIGN: usize = 4096;
