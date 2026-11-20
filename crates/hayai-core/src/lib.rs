@@ -21,7 +21,7 @@ pub mod spec_decode;
 pub mod stream_infer;
 
 pub use adaptive_window::{compute_window_plan, MemoryStrategy, WindowPlan};
-pub use calibration::{calibrate, DeviceProfile, HwProfile};
+pub use calibration::{calibrate, calibrate_fresh, DeviceProfile, HwProfile};
 pub use exec_plan::{build_exec_plan, ExecPlan, LayerOpKind, UnknownLayerOp};
 pub use planner::{plan_placement, ComputeTarget, Placement, TargetCaps};
 pub use infer::{spmm_adj, FfnOverride, GenerateStats, Generator, InferError, SparseAdj};
@@ -37,3 +37,4 @@ pub use hayai_model::{
 };
 pub use session::GenerationSession;
 pub use stream_infer::{load_config, MediaInput, StreamInferError, StreamingGenerator};
+

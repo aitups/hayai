@@ -268,8 +268,8 @@ enum Commands {
         /// DEV ONLY: load weights via full-file mmap (violates PRD streaming design)
         #[arg(long, default_value_t = false)]
         dev_mmap: bool,
-        /// Memory window strategy: auto | minimal | cap_mb (e.g. 2048 or 2048mb)
-        #[arg(long, default_value = "auto")]
+        /// Memory window strategy: auto (opt-in residency) | minimal (default) | cap_mb
+        #[arg(long, default_value = "minimal")]
         memory_strategy: String,
     },
 
@@ -290,8 +290,8 @@ enum Commands {
         /// Disable ChatML wrap (send prompt as-is; better for fair llama.cpp compare)
         #[arg(long, default_value_t = false)]
         raw: bool,
-        /// Memory window strategy: auto | minimal | cap_mb (e.g. 2048 or 2048mb)
-        #[arg(long, default_value = "auto")]
+        /// Memory window strategy: auto (opt-in residency) | minimal (default) | cap_mb
+        #[arg(long, default_value = "minimal")]
         memory_strategy: String,
     },
 
@@ -584,7 +584,7 @@ fn cmd_calibrate(model: Option<PathBuf>, out: Option<PathBuf>) -> anyhow::Result
         .as_ref()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len() as f64);
-    let profile = hayai_core::calibrate(&orch.pool, model.as_deref());
+    let profile = hayai_core::calibrate_fresh(&orch.pool, model.as_deref());
     print!("{}", profile.format_report(bytes_per_token));
     if let Some(path) = out {
         if let Some(parent) = path.parent() {
@@ -1472,3 +1472,4 @@ fn cmd_bench_generate(
     println!("  Compare: scripts/bench_compare.sh|.ps1 (tok/s + e2e + memory vs llama.cpp)");
     Ok(())
 }
+

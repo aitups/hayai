@@ -30,8 +30,10 @@ pub enum MemoryStrategy {
 }
 
 impl Default for MemoryStrategy {
+    /// Default to strict streaming (low-memory identity). Full residency is opt-in via
+    /// `--memory-strategy auto` (the measured planner then decides what stays resident).
     fn default() -> Self {
-        Self::AutoFit
+        Self::Minimal
     }
 }
 
@@ -40,8 +42,9 @@ impl MemoryStrategy {
     pub fn parse(s: &str) -> Self {
         let s = s.trim().to_ascii_lowercase();
         match s.as_str() {
-            "auto" | "autofit" | "" => Self::AutoFit,
+            "auto" | "autofit" => Self::AutoFit,
             "minimal" | "min" | "strict" => Self::Minimal,
+            "" => Self::default(),
             _ => {
                 // Accept numeric MiB or raw bytes: "2048", "2048mb", "2048mib"
                 let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();

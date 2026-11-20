@@ -282,8 +282,20 @@ impl OwnedSvmBuffer {
                 alloc::handle_alloc_error(layout);
             }
             (p, false, true)
+        } else if fine_grain_buffer {
+            let raw = unsafe {
+                svm_alloc(
+                    engine.context.get(),
+                    CL_MEM_SVM_FINE_GRAIN_BUFFER | CL3_MEM_READ_WRITE,
+                    size_bytes,
+                    64u32 as cl_uint,
+                )
+                .map_err(|e| OpenClError::ClError(format!("clSVMAlloc fine failed: {e}")))?
+            };
+            (raw as *mut u8, false, true)
         } else if has_coarse {
-            // Prefer coarse-grain (expert: APU first-class + map/unmap protocol).
+            // Coarse-grain is what most iGPU/APU and unified SoCs expose. It needs the
+            // map/unmap protocol but is still a first-class zero-copy target.
             let raw = unsafe {
                 svm_alloc(
                     engine.context.get(),
@@ -302,17 +314,6 @@ impl OwnedSvmBuffer {
                     .map_err(|e| OpenClError::ClError(format!("SVM map failed: {e}")))?;
             }
             (p, true, true)
-        } else if fine_grain_buffer {
-            let raw = unsafe {
-                svm_alloc(
-                    engine.context.get(),
-                    CL_MEM_SVM_FINE_GRAIN_BUFFER | CL3_MEM_READ_WRITE,
-                    size_bytes,
-                    64u32 as cl_uint,
-                )
-                .map_err(|e| OpenClError::ClError(format!("clSVMAlloc fine failed: {e}")))?
-            };
-            (raw as *mut u8, false, true)
         } else {
             return Err(OpenClError::ClError("No usable SVM mode".into()));
         };

@@ -114,7 +114,12 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
             // SVM capability bits (OpenCL 2.0+ / 3.0 SVM coarse/fine grain).
             let svm_capability = dev.svm_mem_capability() as u64;
             let supports_svm = svm_capability != 0;
-            let unified_memory = dev.host_unified_memory().unwrap_or(false);
+            // `CL_DEVICE_HOST_UNIFIED_MEMORY` is deprecated since OpenCL 2.0 and often
+            // false on OpenCL 3.0 SoCs; also treat fine-grain system SVM (host and
+            // device share one address space = unified) as unified so we never create a
+            // redundant "VRAM mirror" on the same physical DRAM.
+            let unified_memory = dev.host_unified_memory().unwrap_or(false)
+                || (svm_capability & SVM_FINE_GRAIN_SYSTEM != 0);
 
             // OpenCL platform version (Hayai hard-requires OpenCL 3.0 platforms).
             let opencl_version = dev.version().unwrap_or_else(|_| "OpenCL Unknown".into());
@@ -128,9 +133,17 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
             let gl_gpu = dev_type & CL_DEVICE_TYPE_GPU as u64 != 0;
             let device_kind = if gl_gpu {
                 let name_lower = device_name.to_lowercase();
-                if unified_memory {
-                    // Unified host/device memory (APU / superchip) — first-class
-                    // zero-copy target (SVM fine-system when available).
+                if unified_memory
+                    || name_lower.contains("gb10")
+                    || name_lower.contains("grace")
+                    || name_lower.contains("apple")
+                    || name_lower.contains("mali")
+                    || name_lower.contains("adreno")
+                    || name_lower.contains("tegra")
+                    || name_lower.contains("snapdragon")
+                {
+                    // Unified host/device memory (APU / superchip / mobile SoC) —
+                    // first-class zero-copy target; never mirror it onto the same DRAM.
                     DeviceKind::Apu
                 } else if name_lower.contains("intel")
                     || name_lower.contains("graphics")
@@ -182,3 +195,4 @@ pub fn discover_opencl_devices() -> Vec<OpenClDeviceInfo> {
 
     results
 }
+

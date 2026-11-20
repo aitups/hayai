@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 /// Bandwidth / memory profile of one accelerator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeviceProfile {
     pub name: String,
     pub kind: String,
@@ -37,7 +37,7 @@ pub struct DeviceProfile {
 }
 
 /// Full hardware profile for one host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HwProfile {
     pub host_bw_gbytes_s: f64,
     /// Measured CPU Q4_K GEMV bandwidth (the real host compute rate).
@@ -260,8 +260,75 @@ pub fn measure_device_gemv_gbytes_s(engine: &OpenClEngine) -> Result<f64, String
     Ok((m * n * 4 * iters) as f64 / dt / 1e9)
 }
 
+/// Cache schema version — bump when `HwProfile`/its measurement changes.
+const CACHE_VERSION: u32 = 1;
+
+fn cache_fingerprint(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> String {
+    let mut s = format!("v{CACHE_VERSION}");
+    for e in &pool.engines {
+        s.push_str(&format!(
+            "|{}|{}|{}|{}",
+            e.device_info.device_name,
+            e.device_info.global_mem_size,
+            e.device_info.opencl_version,
+            e.device_info.device_kind.pool_rank(),
+        ));
+    }
+    // Disk bandwidth depends on the volume, not the specific model file.
+    if let Some(parent) = disk_path.and_then(|p| p.parent()) {
+        s.push_str(&format!("|disk:{}", parent.display()));
+    }
+    s
+}
+
+fn cache_path(fingerprint: &str) -> std::path::PathBuf {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in fingerprint.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    std::env::temp_dir().join(format!("hayai-hwprofile-v{CACHE_VERSION}-{h:016x}.json"))
+}
+
+static MEM_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, HwProfile)>>> =
+    std::sync::OnceLock::new();
+
 /// Run the full calibration over the OpenCL pool and (optionally) a model file.
+///
+/// Cached in memory and on disk (audit D.2: recalibrating on every session/HTTP request
+/// cost 1–3 s). The cache is keyed by a device fingerprint (name + VRAM + OpenCL version
+/// + class) and the model's volume; any change invalidates it and re-measures.
 pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile {
+    let fp = cache_fingerprint(pool, disk_path);
+    let mem = MEM_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(g) = mem.lock() {
+        if let Some((k, p)) = g.as_ref() {
+            if *k == fp {
+                return p.clone();
+            }
+        }
+    }
+    let file = cache_path(&fp);
+    if let Ok(txt) = std::fs::read_to_string(&file) {
+        if let Ok(p) = serde_json::from_str::<HwProfile>(&txt) {
+            tracing::info!("Hardware profile loaded from cache {}", file.display());
+            if let Ok(mut g) = mem.lock() {
+                *g = Some((fp, p.clone()));
+            }
+            return p;
+        }
+    }
+    let profile = calibrate_fresh(pool, disk_path);
+    if let Ok(mut g) = mem.lock() {
+        *g = Some((fp, profile.clone()));
+    }
+    if let Ok(txt) = serde_json::to_string(&profile) {
+        let _ = std::fs::write(&file, txt);
+    }
+    profile
+}
+
+pub fn calibrate_fresh(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile {
     let host_bw_gbytes_s = measure_host_bandwidth_gbytes_s();
     let host_gemv_gbytes_s = measure_host_gemv_gbytes_s();
     let disk_bw_gbytes_s = disk_path
@@ -302,3 +369,5 @@ pub fn calibrate(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwProfile
         devices,
     }
 }
+
+
