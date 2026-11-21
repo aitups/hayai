@@ -67,6 +67,7 @@ pub fn generate_text(
     let mut session = GenerationSession::start(
         &handle.path,
         handle.tokenizer.clone(),
+        handle.head_cache.clone(),
         handle.sinks,
         handle.window,
         handle.memory_strategy,
@@ -181,3 +182,4 @@ pub fn chat_prompt(handle: &ModelHandle, messages: &[ChatMessage], tools: &serde
         .chat_template
         .render(&msgs, true, &handle.tokenizer, tools)
 }
+

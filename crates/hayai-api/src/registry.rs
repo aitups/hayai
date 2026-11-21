@@ -22,6 +22,8 @@ pub struct ModelHandle {
     pub memory_strategy: MemoryStrategy,
     /// Encoder-decoder (T5/BART): routes generation through `encoder_decoder_infer`.
     pub encoder_decoder: bool,
+    /// Final projection / tied embedding, loaded once per model and shared across requests.
+    pub head_cache: Arc<Mutex<hayai_core::HeadCache>>,
 }
 
 /// Server-wide registry (models discovered at startup; handles built lazily).
@@ -126,6 +128,7 @@ impl ModelRegistry {
             window: self.window,
             memory_strategy: self.memory_strategy,
             encoder_decoder,
+            head_cache: Arc::new(Mutex::new(hayai_core::HeadCache::default())),
         })
     }
 }

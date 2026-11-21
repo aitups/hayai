@@ -35,6 +35,6 @@ pub use pipeline::{
 pub use hayai_model::{
     load_sparse_dag, sparse_dag_to_csr, spmm_csr_cpu, spmm_dense_masked, SparseDagBlock,
 };
-pub use session::GenerationSession;
+pub use session::{GenerationSession, HeadCache};
 pub use stream_infer::{load_config, MediaInput, StreamInferError, StreamingGenerator};
 

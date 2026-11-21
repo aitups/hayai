@@ -12,6 +12,15 @@ use hayai_model::{Grammar, GrammarState, Penalties, SamplerConfig, Tokenizer};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Cross-request cache of a model's final projection / tied embedding, shared through the
+/// server's `ModelHandle` so it is read from disk once per **model** instead of once per
+/// request (audit D.2.3). Empty until first needed (lazy).
+#[derive(Default)]
+pub struct HeadCache {
+    pub output: Option<Arc<hayai_model::QuantMatrix>>,
+    pub embed: Option<Arc<hayai_model::QuantMatrix>>,
+}
+
 /// One generation request: prefill once, then drive decode token by token.
 pub struct GenerationSession {
     gen: StreamingGenerator,
@@ -34,6 +43,7 @@ impl GenerationSession {
     pub fn start(
         model: impl AsRef<Path>,
         tokenizer: Arc<Tokenizer>,
+        head_cache: Arc<Mutex<HeadCache>>,
         sinks: usize,
         window: usize,
         memory_strategy: MemoryStrategy,
@@ -46,6 +56,7 @@ impl GenerationSession {
         // and rebuilding it per request: `StreamingGenerator::open` opens the catalog once.
         let mut gen = StreamingGenerator::open(path, tokenizer, sinks, window, sampler, seed)?;
         gen.set_memory_strategy(memory_strategy);
+        gen.set_head_cache(head_cache);
         let mut guard = orch.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = gen.prepare_session(&mut guard)?;
         drop(guard);
@@ -202,3 +213,4 @@ impl GenerationSession {
         self.gen.tokenizer.decode(ids)
     }
 }
+

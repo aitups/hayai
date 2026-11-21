@@ -520,12 +520,13 @@ pub struct StreamingGenerator {
     pub window_plan: Option<WindowPlan>,
     /// Joint residency + cadence + placement decision from the measured hardware.
     pub session_plan: Option<crate::planner::SessionPlan>,
-    /// Resident mode: cached final projection matrix (`output.weight`) for zero-I/O
-    /// decode. `None` in streaming mode.
-    pub(crate) resident_output: Option<QuantMatrix>,
-    /// Resident mode: cached embedding matrix (`token_embd.weight`) for zero-I/O
-    /// decode. `None` in streaming mode.
-    pub(crate) resident_embed: Option<QuantMatrix>,
+    /// Final projection matrix (`output.weight`), shared via `Arc` so a server can reuse
+    /// one copy across requests (audit D.2.3). `None` until first needed.
+    pub(crate) resident_output: Option<Arc<QuantMatrix>>,
+    /// Embedding matrix (`token_embd.weight`), shared via `Arc` (see `resident_output`).
+    pub(crate) resident_embed: Option<Arc<QuantMatrix>>,
+    /// Cross-request cache for the final projection / tied embedding (server only).
+    pub(crate) head_cache: Option<Arc<std::sync::Mutex<crate::session::HeadCache>>>,
     /// MoE resident non-expert (attn + router + shared expert) bytes per layer,
     /// cached after the first read so subsequent tokens skip the disk. Bounded by
     /// `moe_non_expert_cap`. Experts are streamed sparsely (never cached here).
@@ -595,20 +596,56 @@ impl StreamingGenerator {
     pub(crate) fn ensure_head_loaded(&mut self) -> Result<(), StreamInferError> {
         if self.has_output_weight {
             if self.resident_output.is_none() {
-                let t0 = Instant::now();
-                let m = self.catalog.load_quant_matrix("output.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += m.nbytes() as u64;
-                self.resident_output = Some(m);
+                if let Some(arc) = self.head_cache_get(true) {
+                    self.resident_output = Some(arc);
+                } else {
+                    let t0 = Instant::now();
+                    let m = Arc::new(self.catalog.load_quant_matrix("output.weight")?);
+                    self.io_secs += t0.elapsed().as_secs_f64();
+                    self.io_bytes += m.nbytes() as u64;
+                    self.head_cache_put(true, m.clone());
+                    self.resident_output = Some(m);
+                }
             }
         } else if self.resident_embed.is_none() {
-            let t0 = Instant::now();
-            let m = self.catalog.load_quant_matrix("token_embd.weight")?;
-            self.io_secs += t0.elapsed().as_secs_f64();
-            self.io_bytes += m.nbytes() as u64;
-            self.resident_embed = Some(m);
+            if let Some(arc) = self.head_cache_get(false) {
+                self.resident_embed = Some(arc);
+            } else {
+                let t0 = Instant::now();
+                let m = Arc::new(self.catalog.load_quant_matrix("token_embd.weight")?);
+                self.io_secs += t0.elapsed().as_secs_f64();
+                self.io_bytes += m.nbytes() as u64;
+                self.head_cache_put(false, m.clone());
+                self.resident_embed = Some(m);
+            }
         }
         Ok(())
+    }
+
+    fn head_cache_get(&self, output: bool) -> Option<Arc<QuantMatrix>> {
+        let c = self.head_cache.as_ref()?;
+        let g = c.lock().unwrap_or_else(|e| e.into_inner());
+        if output {
+            g.output.clone()
+        } else {
+            g.embed.clone()
+        }
+    }
+
+    fn head_cache_put(&self, output: bool, m: Arc<QuantMatrix>) {
+        if let Some(c) = &self.head_cache {
+            let mut g = c.lock().unwrap_or_else(|e| e.into_inner());
+            if output {
+                g.output = Some(m);
+            } else {
+                g.embed = Some(m);
+            }
+        }
+    }
+
+    /// Share the final projection / tied embedding across sessions (server, audit D.2.3).
+    pub fn set_head_cache(&mut self, cache: Arc<std::sync::Mutex<crate::session::HeadCache>>) {
+        self.head_cache = Some(cache);
     }
 
     pub(crate) fn run_ffn_block(
@@ -1245,6 +1282,7 @@ impl StreamingGenerator {
             session_plan: None,
             resident_output: None,
             resident_embed: None,
+            head_cache: None,
         })
     }
 
@@ -2736,9 +2774,9 @@ impl StreamingGenerator {
             }
             info!("Resident preload complete: {} layers in device memory", self.config.num_layers);
             if self.has_output_weight {
-                self.resident_output = Some(self.catalog.load_quant_matrix("output.weight")?);
+                self.resident_output = Some(Arc::new(self.catalog.load_quant_matrix("output.weight")?));
             }
-            self.resident_embed = Some(self.catalog.load_quant_matrix("token_embd.weight")?);
+            self.resident_embed = Some(Arc::new(self.catalog.load_quant_matrix("token_embd.weight")?));
             self.io_bytes += self
                 .resident_output
                 .as_ref()
@@ -4883,6 +4921,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
 
 
 

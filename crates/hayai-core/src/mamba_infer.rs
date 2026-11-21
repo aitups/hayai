@@ -128,7 +128,7 @@ impl StreamingGenerator {
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
         let head = if let Some(ow) = &self.resident_output {
-            Some(ow)
+            Some(ow.as_ref())
         } else if self.has_output_weight {
             None
         } else {
