@@ -346,6 +346,13 @@ impl OwnedSvmBuffer {
         self.ptr
     }
 
+    /// Whether the device may read this region as a kernel SVM argument right now.
+    /// Fine-grain SVM is always usable; coarse-grain must be unmapped (host not
+    /// accessing it) first — see [`Self::prepare_for_device`].
+    pub fn device_usable(&self) -> bool {
+        !self.coarse || !self.mapped
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         assert!(
             self.mapped || !self.coarse,

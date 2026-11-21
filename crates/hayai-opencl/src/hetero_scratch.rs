@@ -173,6 +173,25 @@ impl StreamingScratch {
         // every op, so one DMA per layer is strictly better; true UMA zero-copy via
         // CL_MEM_USE_HOST_PTR is the remaining refinement).
         for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
+            // A coarse-SVM UMA owner reads the host base directly once it is unmapped
+            // (`weight_bind` → SVM, `unmap_host_for_device`); a mirror would only add a
+            // redundant copy, so skip it and keep true zero-copy.
+            if let HostBase::Svm { owner_id, .. } = &host {
+                if eng.device_info.device_id == *owner_id
+                    && matches!(
+                        eng.device_info.device_kind,
+                        DeviceKind::Apu | DeviceKind::IntegratedGpu
+                    )
+                    && eng.device_info.svm_coarse()
+                    && !(eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
+                {
+                    info!(
+                        "HeteroScratch: {} reads host base zero-copy (coarse SVM, no mirror)",
+                        eng.device_info.device_name
+                    );
+                    continue;
+                }
+            }
             if !mirror_fits(eng, slot_bytes) {
                 warn!(
                     "Skipping VRAM mirror on {} ({} KiB > max alloc {} KiB); \
@@ -281,6 +300,18 @@ impl StreamingScratch {
                         layer_bytes / 1024
                     );
                     let mut mirrors = Self::resident_mirrors(pool, total)?;
+                    // Coarse-SVM UMA owner reads the base zero-copy; a mirror only adds
+                    // a redundant copy (see `unmap_host_for_device` / `weight_bind`).
+                    if apu.device_info.svm_coarse()
+                        && !(apu.device_info.svm_fine_system()
+                            || apu.device_info.svm_fine_buffer())
+                        && matches!(
+                            apu.device_info.device_kind,
+                            DeviceKind::Apu | DeviceKind::IntegratedGpu
+                        )
+                    {
+                        mirrors.retain(|m| m.device_id != apu.device_info.device_id);
+                    }
                     // Pinned-host fallback not needed here (SVM covers primary FFN).
                     if mirrors.is_empty() {
                         let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
@@ -696,13 +727,26 @@ impl StreamingScratch {
     /// Unmap SVM so the device can consume the slot (call after Attn, before FFN enqueue).
     pub fn unmap_host_for_device(
         &mut self,
-        _pool: &OpenClDevicePool,
-        _idx: usize,
+        pool: &OpenClDevicePool,
+        idx: usize,
     ) -> Result<(), OpenClError> {
-        // The host slot stays mapped for the whole session: CPU attention reads it
-        // and the device never binds a coarse SVM pointer (`weight_bind` rejects
-        // coarse owners in favour of the mirror / host-upload). Fine-grain SVM
-        // needs no unmap either. So this is intentionally a no-op.
+        // Coarse-grain SVM must be unmapped before the device reads it. On a UMA APU
+        // this is a coherence hand-off, not a copy: the GEMV then reads the host bytes
+        // directly (`weight_bind` returns the SVM pointer) — true zero-copy. Fine-grain
+        // and pinned bases stay mapped (`prepare_for_device` is a no-op for them).
+        let slot = if self.resident { 0 } else { self.slot_for(idx) };
+        if let HostBase::Svm { slots, owner_id } = &mut self.host {
+            if !slots[slot].coarse {
+                return Ok(());
+            }
+            if let Some(apu) = pool
+                .engines
+                .iter()
+                .find(|e| e.device_info.device_id == *owner_id)
+            {
+                slots[slot].prepare_for_device(apu)?;
+            }
+        }
         Ok(())
     }
 
@@ -857,9 +901,7 @@ impl StreamingScratch {
             // host mapping stays live. A coarse owner falls through to the mirror
             // (dGPU) or to host-upload (the `begin_gemv_from_scratch` fallback).
             if let HostBase::Svm { slots, owner_id } = &self.host {
-                if eng.device_info.device_id == *owner_id
-                    && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
-                {
+                if eng.device_info.device_id == *owner_id && slots[0].device_usable() {
                     return Ok(WeightBind::Svm {
                         ptr: slots[0].as_ptr(),
                     });
@@ -884,9 +926,7 @@ impl StreamingScratch {
             // Only a fine-grain owner can be read by the device while the host
             // mapping stays live. A coarse owner falls through to the mirror
             // (dGPU) or host-upload, so the slot never needs to be unmapped.
-            if eng.device_info.device_id == *owner_id
-                && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
-            {
+            if eng.device_info.device_id == *owner_id && slots[slot].device_usable() {
                 return Ok(WeightBind::Svm {
                     ptr: slots[slot].as_ptr(),
                 });
@@ -1121,6 +1161,26 @@ mod tests {
             total: 0,
         };
         assert!(s.dma_ffn_keep_mapped(&pool, 0, &layout).is_ok());
+    }
+
+    #[test]
+    fn coarse_svm_map_unmap_toggles_device_usable() {
+        let devs = crate::device::discover_opencl_devices();
+        let Some(info) = devs.iter().find(|d| d.svm_coarse()) else {
+            eprintln!("coarse SVM map/unmap: SKIP (no coarse SVM device)");
+            return;
+        };
+        let eng = OpenClEngine::init_device(info).unwrap();
+        let mut buf = OwnedSvmBuffer::new(&eng, 4096).unwrap();
+        if !buf.coarse {
+            eprintln!("coarse SVM map/unmap: SKIP (device chose fine/system SVM)");
+            return;
+        }
+        assert!(!buf.device_usable(), "coarse SVM starts host-mapped");
+        buf.prepare_for_device(&eng).unwrap();
+        assert!(buf.device_usable(), "unmapped coarse SVM must be device-usable");
+        buf.prepare_for_host(&eng).unwrap();
+        assert!(!buf.device_usable(), "remapped coarse SVM is host-only");
     }
 }
 
