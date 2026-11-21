@@ -576,6 +576,22 @@ impl StreamingGenerator {
     /// Cache the final projection (or tied embedding) once. The audit found this was
     /// re-read from disk and a ~300–550 MiB buffer re-zeroed on **every** token, outside
     /// the attn/ffn timers. Now it is loaded once per session and its time is counted.
+    /// The model's dominant quant (the one with the most weight elements), used to
+    /// calibrate the planner with the real quant instead of f32/q4_k (audit A.4.2).
+    pub(crate) fn dominant_quant_label(&self) -> Option<&'static str> {
+        let mut acc: Vec<(&'static str, u64)> = Vec::new();
+        for t in &self.catalog.tensors {
+            let w: u64 = t.dims.iter().product::<u64>().max(1);
+            let label = t.ggml_type.label();
+            if let Some(e) = acc.iter_mut().find(|(k, _)| *k == label) {
+                e.1 += w;
+            } else {
+                acc.push((label, w));
+            }
+        }
+        acc.into_iter().max_by_key(|(_, w)| *w).map(|(l, _)| l)
+    }
+
     pub(crate) fn ensure_head_loaded(&mut self) -> Result<(), StreamInferError> {
         if self.has_output_weight {
             if self.resident_output.is_none() {
@@ -2392,24 +2408,38 @@ impl StreamingGenerator {
                                 c.resident_bytes = host_ram;
                             }
                         }
+                        // Per-quant calibration: price each device's resident GEMV with
+                        // the model's real dominant quant (audit A.4.2 — f32/q4_k alone
+                        // mis-prices q4_0/q5_k/q6_k models).
+                        if let Some(label) = self.dominant_quant_label() {
+                            for c in caps.iter_mut() {
+                                if let crate::planner::ComputeTarget::Device(i) = c.target {
+                                    if let Some(eng) = orch.pool.engines.get(i) {
+                                        if let Ok(bw) = eng
+                                            .bench_resident_gemv_quant_gbytes_s(label, 4096, 4096)
+                                        {
+                                            if bw > 0.0 {
+                                                // The mirror path prices at the resident
+                                                // rate (attention/FFN read the mirror).
+                                                c.resident_gemv_bw = bw * 1e9;
+                                                c.gemv_bw = bw * 1e9;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         for c in &caps {
                             debug!(
-                                "candidate {}: gemv {:.1} GB/s, launch {:.0} µs, link {:.1} GB/s, vram {} MiB",
+                                "candidate {}: gemv {:.1} GB/s, resident {:.1} GB/s, launch {:.0} µs, link {:.1} GB/s, vram {} MiB",
                                 c.name,
                                 c.gemv_bw / 1e9,
+                                c.resident_gemv_bw / 1e9,
                                 c.launch_s * 1e6,
                                 c.link_bw / 1e9,
                                 c.resident_bytes / (1024 * 1024),
                             );
                         }
-                        plan.plan_placement(&caps);
-                        info!(
-                            "Planner: {:.0} ms | host {:.1} GB/s disk {:.1} GB/s | makespan {:.2} ms/layer",
-                            t_cal.elapsed().as_secs_f64() * 1e3,
-                            profile.host_bw_gbytes_s,
-                            profile.disk_bw_gbytes_s,
-                            plan.placement.makespan_s * 1e3,
-                        );
                         // Joint decision: what stays resident, what streams and how
                         // fast, and where each op runs — all from measured caps.
                         let layer_bytes = plan.max_full_block_bytes.max(1) as u64;
@@ -2424,6 +2454,14 @@ impl StreamingGenerator {
                             self.config.num_layers,
                             profile.disk_bw_gbytes_s * 1e9,
                             0,
+                        );
+                        info!(
+                            "Planner: {:.0} ms | host {:.1} GB/s disk {:.1} GB/s | est {:.2} tok/s ({})",
+                            t_cal.elapsed().as_secs_f64() * 1e3,
+                            profile.host_bw_gbytes_s,
+                            profile.disk_bw_gbytes_s,
+                            session.est_tokens_per_s,
+                            session.bottleneck,
                         );
                         info!("Session plan: {}", session.summary());
                         plan.placement = session.placement.clone();

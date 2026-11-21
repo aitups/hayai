@@ -387,12 +387,13 @@ pub fn plan_session(
     let prefetch_depth = depth.clamp(2, 8);
     let bottleneck = if t_io >= t_compute { "disk" } else { "compute" };
 
-    // Price each target with the residency actually assigned to it, then place the ops.
-    let mut priced = caps.to_vec();
-    for c in &mut priced {
-        c.resident_bytes = if c.target == compute { resident_bytes } else { 0 };
-    }
-    let placement = plan_placement(tasks, &priced, true);
+    // The placement prices every device with its own (per-layer mirror) residency and
+    // assigns each op to its fastest device. It is NOT load-balanced across devices:
+    // the op kinds are aggregated across layers, so e.g. full-attention and DeltaNet
+    // kinds belong to *different* layers and must not be treated as concurrent spillover
+    // (that is exactly what wrongly pushed attention onto the CPU). Cross-device spread
+    // belongs to the per-layer split, not per-kind balancing.
+    let placement = plan_placement(tasks, caps, false);
 
     SessionPlan {
         compute,
@@ -463,10 +464,13 @@ pub fn caps_from_profile(
         if d.max_alloc_bytes > 0 {
             vram_budget = vram_budget.min(d.max_alloc_bytes);
         }
+        // The attention/FFN now read the layer mirror (`execute_op_bound`), i.e. the
+        // resident GEMV rate — not the per-op host-upload rate. Price it that way so a
+        // real dGPU is not under-valued against a slower fully-resident APU.
         caps.push(TargetCaps {
             target: ComputeTarget::Device(d.device_index),
             name: d.name.clone(),
-            gemv_bw: stream,
+            gemv_bw: resident,
             resident_gemv_bw: resident,
             launch_s: d.launch_us.max(0.0) * 1e-6,
             link_bw: link,

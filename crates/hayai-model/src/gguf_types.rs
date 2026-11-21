@@ -40,6 +40,41 @@ pub enum GgmlType {
 }
 
 impl GgmlType {
+    /// Short label matching the OpenCL GEMV kernel names / `gemv_split` (planner
+    /// calibration of the model's dominant quant).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::BF16 => "bf16",
+            Self::F64 => "f64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::Q4_0 => "q4_0",
+            Self::Q4_1 => "q4_1",
+            Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
+            Self::Q8_0 => "q8_0",
+            Self::Q8_1 => "q8_1",
+            Self::Q8_K => "q8_k",
+            Self::Q2_K => "q2_k",
+            Self::Q3_K => "q3_k",
+            Self::Q4_K => "q4_k",
+            Self::Q5_K => "q5_k",
+            Self::Q6_K => "q6_k",
+            Self::IQ4_NL => "iq4_nl",
+            Self::IQ4_XS => "iq4_xs",
+            Self::IQ3_XXS => "iq3_xxs",
+            Self::IQ3_S => "iq3_s",
+            Self::IQ2_XXS => "iq2_xxs",
+            Self::IQ2_XS => "iq2_xs",
+            Self::IQ2_S => "iq2_s",
+            Self::IQ1_S | Self::IQ1_M | Self::TQ1_0 | Self::TQ2_0 | Self::Other(_) => "other",
+        }
+    }
+
     pub fn from_u32(v: u32) -> Self {
         match v {
             0 => Self::F32,

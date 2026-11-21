@@ -346,6 +346,35 @@ impl OpenClEngine {
         self.bench_resident_gemv_label_gbytes_s(&self.gemv_q4_k, "q4_k", m, n)
     }
 
+    /// Resident GEMV bandwidth for the model's dominant quant (audit A.4.2: calibrating
+    /// only f32/q4_k misled the planner for q4_0/q5_k/q6_k models).
+    pub fn bench_resident_gemv_quant_gbytes_s(
+        &self,
+        label: &str,
+        m: usize,
+        n: usize,
+    ) -> Result<f64, OpenClError> {
+        let kernel = match label {
+            "q4_0" => &self.gemv_q4_0,
+            "q4_1" => &self.gemv_q4_1,
+            "q5_0" => &self.gemv_q5_0,
+            "q5_1" => &self.gemv_q5_1,
+            "q8_0" => &self.gemv_q8_0,
+            "q8_1" => &self.gemv_q8_1,
+            "q8_k" => &self.gemv_q8_k,
+            "q2_k" => &self.gemv_q2_k,
+            "q3_k" => &self.gemv_q3_k,
+            "q4_k" => &self.gemv_q4_k,
+            "q5_k" => &self.gemv_q5_k,
+            "q6_k" => &self.gemv_q6_k,
+            "f32" => &self.gemv_f32,
+            "f16" => &self.gemv_f16,
+            "bf16" => &self.gemv_bf16,
+            _ => return Ok(0.0),
+        };
+        self.bench_resident_gemv_label_gbytes_s(kernel, label, m, n)
+    }
+
     pub fn bench_resident_gemv_label_gbytes_s(
         &self,
         kernel: &Kernel,
@@ -353,10 +382,7 @@ impl OpenClEngine {
         m: usize,
         n: usize,
     ) -> Result<f64, OpenClError> {
-        let row_bytes = match label {
-            "q4_k" => (n / 256) * 144,
-            _ => n * 4,
-        };
+        let row_bytes = quant_row_bytes(label, n);
         let nbytes = m * row_bytes;
         let weights = vec![0u8; nbytes];
         let mut wbuf = unsafe {
@@ -436,6 +462,28 @@ fn preferred_local_async(m: usize, max_work_group: usize) -> usize {
         }
     }
     64.min(m.max(16)).min(cap)
+}
+
+/// Bytes per output row of a quant `label` with `n` input columns (GGML block layout).
+fn quant_row_bytes(label: &str, n: usize) -> usize {
+    let (block, bytes) = match label {
+        "q4_0" => (32, 18),
+        "q4_1" => (32, 20),
+        "q5_0" => (32, 22),
+        "q5_1" => (32, 24),
+        "q8_0" => (32, 34),
+        "q8_1" => (32, 40),
+        "q2_k" => (256, 84),
+        "q3_k" => (256, 110),
+        "q4_k" => (256, 144),
+        "q5_k" => (256, 176),
+        "q6_k" => (256, 210),
+        "q8_k" => (256, 292),
+        "f16" | "bf16" => (1, 2),
+        "f32" => (1, 4),
+        _ => (1, 4),
+    };
+    (n / block.max(1)) * bytes
 }
 
 
