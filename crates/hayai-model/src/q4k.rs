@@ -223,36 +223,75 @@ pub fn gemv_q4_k(
     assert_eq!(input.len(), ncols);
     assert_eq!(output.len(), nrows);
 
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let row_base = row * row_bytes;
-        let mut sum = 0.0f32;
-        for b in 0..blocks_per_row {
-            let block = &data[row_base + b * Q4_K_BLOCK_BYTES..];
-            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-            let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
-            let scales = &block[4..16];
-            let mut q = &block[16..144];
-            let mut is = 0usize;
-            let x_base = b * QK_K;
-            let mut xo = 0usize;
-            for _ in 0..(QK_K / 64) {
-                let (sc0, m0) = get_scale_min_k4(is, scales);
-                let (sc1, m1) = get_scale_min_k4(is + 1, scales);
-                let d1 = d * sc0 as f32;
-                let m1v = min * m0 as f32;
-                let d2 = d * sc1 as f32;
-                let m2v = min * m1 as f32;
-                sum += gemv_q4k_sub32(d1, m1v, &q[..32], &input[x_base + xo..], false);
-                xo += 32;
-                sum += gemv_q4k_sub32(d2, m2v, &q[..32], &input[x_base + xo..], true);
-                xo += 32;
-                q = &q[32..];
-                is += 2;
-            }
-        }
-        *out = sum;
+        *out = gemv_q4k_dispatch(use_avx2, data, input, row_base, blocks_per_row);
     });
     Ok(())
+}
+
+#[inline(always)]
+fn gemv_q4k_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    let mut sum = 0.0f32;
+    for b in 0..blocks_per_row {
+        let block = &data[row_base + b * Q4_K_BLOCK_BYTES..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let mut q = &block[16..144];
+        let mut is = 0usize;
+        let x_base = b * QK_K;
+        let mut xo = 0usize;
+        for _ in 0..(QK_K / 64) {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc0 as f32;
+            let m1v = min * m0 as f32;
+            let d2 = d * sc1 as f32;
+            let m2v = min * m1 as f32;
+            sum += gemv_q4k_sub32(d1, m1v, &q[..32], &input[x_base + xo..], false);
+            xo += 32;
+            sum += gemv_q4k_sub32(d2, m2v, &q[..32], &input[x_base + xo..], true);
+            xo += 32;
+            q = &q[32..];
+            is += 2;
+        }
+    }
+    sum
+}
+
+/// AVX2/FMA/F16C clone of [`gemv_q4k_row`]. The `#[inline(always)]` body is inlined
+/// here so its `f32x8` ops use 256-bit AVX registers (2× the SSE2 baseline) instead of
+/// being compiled at the base target. Bit-exact (same per-lane f32 ops; Rust does not
+/// contract to FMA by default).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn gemv_q4k_row_avx2(
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    gemv_q4k_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn gemv_q4k_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { gemv_q4k_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    gemv_q4k_row(data, input, row_base, blocks_per_row)
 }
 
 /// Extract one embedding row from a Q4_K matrix (nrows = vocab, ncols = hidden).

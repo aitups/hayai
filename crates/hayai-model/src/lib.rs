@@ -17,6 +17,7 @@ pub mod q5k;
 pub mod q6k;
 pub mod quant;
 pub mod sampling;
+pub mod simd_dispatch;
 pub mod sparse_dag;
 pub mod tokenizer;
 pub mod vision;

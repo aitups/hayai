@@ -74,27 +74,69 @@ pub fn gemv_q6_k(
     // Audit C.2.1: dequantise one 256-element block into a stack buffer and dot it,
     // instead of `vec![0.0f32; ncols]` per row (the lm_head fired ~152k malloc+free per
     // token and thrashed the global allocator across the Rayon threads).
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output
         .par_iter_mut()
         .with_min_len(64)
         .enumerate()
         .for_each(|(row, out)| {
             let row_base = row * row_bytes;
-            let mut sum = 0.0f32;
-            let mut block_vals = [0.0f32; QK_K];
-            for b in 0..blocks_per_row {
-                dequant_q6_k_block(
-                    &data[row_base + b * Q6_K_BLOCK_BYTES..],
-                    &mut block_vals,
-                );
-                let xs = &input[b * QK_K..(b + 1) * QK_K];
-                for c in 0..QK_K {
-                    sum += block_vals[c] * xs[c];
-                }
-            }
-            *out = sum;
+            *out = gemv_q6k_dispatch(use_avx2, data, input, row_base, blocks_per_row);
         });
     Ok(())
+}
+
+#[inline(always)]
+fn gemv_q6k_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut sum = 0.0f32;
+    let mut block_vals = [0.0f32; QK_K];
+    for b in 0..blocks_per_row {
+        dequant_q6_k_block(&data[row_base + b * Q6_K_BLOCK_BYTES..], &mut block_vals);
+        let xs = &input[b * QK_K..(b + 1) * QK_K];
+        let mut acc = f32x8::splat(0.0);
+        let mut c = 0;
+        while c + 8 <= QK_K {
+            acc += f32x8::from_slice(&block_vals[c..c + 8]) * f32x8::from_slice(&xs[c..c + 8]);
+            c += 8;
+        }
+        sum += acc.reduce_sum();
+        while c < QK_K {
+            sum += block_vals[c] * xs[c];
+            c += 1;
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn gemv_q6k_row_avx2(
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    gemv_q6k_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn gemv_q6k_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { gemv_q6k_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    gemv_q6k_row(data, input, row_base, blocks_per_row)
 }
 
 pub fn extract_q6_k_row(
