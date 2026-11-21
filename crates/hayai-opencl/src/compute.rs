@@ -30,6 +30,7 @@ pub enum GgmlWeightBind<'a> {
 /// launch `global = M * split` for the matching kernel (see `ggml_gemv_q4_k`).
 pub(crate) fn gemv_split(label: &str) -> usize {
     match label {
+        "q4_0" | "q8_0" => 32,
         "q4_k" => 32,
         "f32" => 32,
         _ => 1,

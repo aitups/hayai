@@ -9,6 +9,13 @@
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
+// Per-workgroup reduction scratch for the warp-striped GEMV kernels (one warp per row).
+// Sized to the maximum preferred local size (256) rather than 1024 (audit B.2.2).
+#ifndef HAYAI_WG_MAX
+#define HAYAI_WG_MAX 256
+#endif
+
+
 inline float hayai_half_bits_to_float(ushort h) {
     uint sign = ((uint)(h >> 15) & 1u) << 31;
     uint exp = (h >> 10) & 0x1Fu;
@@ -60,45 +67,35 @@ __kernel void ggml_gemv_q4_0(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 32;
-    int row_bytes = blocks * 18;
+    // Warp-striped: one warp per row, lane `l` handles one weight of each 32-block
+    // (16 qs bytes shared by 32 lanes → coalesced). Reduces the 32 partials in __local.
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    // Tile input into __local (all WIs must hit barriers).
-    for (int t0 = 0; t0 < N; t0 += HAYAI_X_TILE) {
-        int ntile = min(HAYAI_X_TILE, N - t0);
-        hayai_load_input_tile(t0, ntile, input, local_input);
-        if (row < M) {
-            int b0 = t0 / 32;
-            int b1 = (t0 + ntile) / 32;
-            long row_base = (long)row * row_bytes;
-            for (int b = b0; b < b1; b++) {
-                long base = row_base + b * 18;
-                ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
-                float d = hayai_half_bits_to_float(hd);
-                int x_base = b * 32 - t0;
-                // Vectorized loads (vload8 tolerates the 18-byte unaligned GGML block).
-                // `.s<N>` needs a constant index and dynamic `v[i]` needs C 2.0+ (NVIDIA's
-                // OpenCL 3.0 compiles C 1.2 only) — index via a union of vector + array.
-                union { uchar8 v; uchar a[8]; } q0u, q1u;
-                q0u.v = vload8(0, &wbase[base + 2]);
-                q1u.v = vload8(0, &wbase[base + 10]);
-                for (int j = 0; j < 8; j++) {
-                    float x0 = (float)((int)(q0u.a[j] & 0x0F) - 8);
-                    float x1 = (float)((int)(q0u.a[j] >> 4) - 8);
-                    float x2 = (float)((int)(q1u.a[j] & 0x0F) - 8);
-                    float x3 = (float)((int)(q1u.a[j] >> 4) - 8);
-                    sum += x0 * d * local_input[x_base + j];
-                    sum += x1 * d * local_input[x_base + j + 16];
-                    sum += x2 * d * local_input[x_base + j + 8];
-                    sum += x3 * d * local_input[x_base + j + 24];
-                }
-            }
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 18;
+        int qb = lane & 15;
+        for (int b = 0; b < blocks; b++) {
+            __global const uchar* block = wbase + b * 18;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            uchar q = block[2 + qb];
+            int v = (lane < 16) ? (q & 0x0F) : (q >> 4);
+            sum += d * (float)(v - 8) * input[b * 32 + lane];
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (row < M) output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q4_1(
@@ -159,33 +156,32 @@ __kernel void ggml_gemv_q8_0(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 32;
-    int row_bytes = blocks * 34;
-    long row_base = (long)row * row_bytes;
+    // Warp-striped: one warp per row, lane `l` reads qs[l] of each 34-byte block
+    // (32 contiguous int8 bytes = fully coalesced).
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int b = 0; b < blocks; b++) {
-        long base = row_base + b * 34;
-        ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
-        float d = hayai_half_bits_to_float(hd);
-        int x_base = b * 32;
-        // Vectorized loads (vload8 tolerates the 34-byte unaligned GGML block).
-        union { uchar8 v; uchar a[8]; } q0u, q1u, q2u, q3u;
-        q0u.v = vload8(0, &wbase[base + 2]);
-        q1u.v = vload8(0, &wbase[base + 10]);
-        q2u.v = vload8(0, &wbase[base + 18]);
-        q3u.v = vload8(0, &wbase[base + 26]);
-        for (int j = 0; j < 8; j++) {
-            sum += (float)((char)q0u.a[j]) * d * input[x_base + j];
-            sum += (float)((char)q1u.a[j]) * d * input[x_base + j + 8];
-            sum += (float)((char)q2u.a[j]) * d * input[x_base + j + 16];
-            sum += (float)((char)q3u.a[j]) * d * input[x_base + j + 24];
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 34;
+        for (int b = 0; b < blocks; b++) {
+            __global const uchar* block = wbase + b * 34;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            sum += d * (float)((char)block[2 + lane]) * input[b * 32 + lane];
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q5_0(
@@ -1699,4 +1695,5 @@ __kernel void ggml_gemv_q8_k(
     }
     output[row] = sum;
 }
+
 
