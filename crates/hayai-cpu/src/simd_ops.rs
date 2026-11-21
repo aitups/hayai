@@ -40,9 +40,33 @@ pub fn simd_scale_mul(x: &mut [f32], weight: &[f32], inv: f32) {
     }
 }
 
-/// Dot product.
+/// Runtime AVX2+FMA detection for multiversioned SIMD (x86-64 only).
+#[inline]
+fn avx2_fma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Dot product (AVX2-accelerated when available, portable `std::simd` otherwise).
 #[inline]
 pub fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_fma() {
+            return unsafe { simd_dot_avx2(a, b) };
+        }
+    }
+    simd_dot_impl(a, b)
+}
+
+#[inline(always)]
+fn simd_dot_impl(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let mut sum = f32x8::splat(0.0);
     let mut i = 0;
@@ -60,11 +84,28 @@ pub fn simd_dot(a: &[f32], b: &[f32]) -> f32 {
     acc
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn simd_dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    simd_dot_impl(a, b)
+}
+
 /// Dot `query` with INT8 keys dequantised by **per-block** scales (`block` elements
 /// share one scale). This is the KV-cache layout (audit C.3): ~1.06 bytes/element
 /// instead of one `f32` scale per element (5 bytes/element).
 #[inline]
 pub fn simd_dot_i8_block(query: &[f32], keys: &[i8], scales: &[f32], block: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2_fma() {
+            return unsafe { simd_dot_i8_block_avx2(query, keys, scales, block) };
+        }
+    }
+    simd_dot_i8_block_impl(query, keys, scales, block)
+}
+
+#[inline(always)]
+fn simd_dot_i8_block_impl(query: &[f32], keys: &[i8], scales: &[f32], block: usize) -> f32 {
     assert_eq!(query.len(), keys.len());
     assert!(block > 0);
     let mut acc = 0.0f32;
@@ -75,6 +116,17 @@ pub fn simd_dot_i8_block(query: &[f32], keys: &[i8], scales: &[f32], block: usiz
         b = end;
     }
     acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn simd_dot_i8_block_avx2(
+    query: &[f32],
+    keys: &[i8],
+    scales: &[f32],
+    block: usize,
+) -> f32 {
+    simd_dot_i8_block_impl(query, keys, scales, block)
 }
 
 #[inline]

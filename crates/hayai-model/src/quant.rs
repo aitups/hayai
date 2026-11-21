@@ -356,43 +356,156 @@ impl QuantMatrix {
 }
 
 fn gemv_f32(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
         let base = row * ncols * 4;
-        let mut sum = 0.0f32;
-        for col in 0..ncols {
-            let o = base + col * 4;
-            let w = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
-            sum += w * input[col];
-        }
-        *out = sum;
+        // GGUF F32 tensors are 4-byte aligned; reinterpret the (LE) bytes as f32.
+        let w: &[f32] =
+            unsafe { std::slice::from_raw_parts(data[base..].as_ptr() as *const f32, ncols) };
+        *out = f32_dot_dispatch(use_avx2, w, input);
     });
 }
 
 fn gemv_f16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let base = row * ncols * 2;
-        let mut sum = 0.0f32;
-        for col in 0..ncols {
-            let o = base + col * 2;
-            let w = f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]]));
-            sum += w * input[col];
-        }
-        *out = sum;
+        *out = f16_dot_dispatch(use_avx2, data, row * ncols * 2, ncols, input);
     });
 }
 
 fn gemv_bf16(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let base = row * ncols * 2;
-        let mut sum = 0.0f32;
-        for col in 0..ncols {
-            let o = base + col * 2;
-            let bits = (u16::from_le_bytes([data[o], data[o + 1]]) as u32) << 16;
-            let w = f32::from_bits(bits);
-            sum += w * input[col];
-        }
-        *out = sum;
+        *out = bf16_dot_dispatch(use_avx2, data, row * ncols * 2, ncols, input);
     });
+}
+
+/// 4-accumulator f32 dot (audit C.2 ILP), multiversioned for AVX2.
+#[inline(always)]
+fn f32_dot_impl(w: &[f32], x: &[f32]) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let n = w.len().min(x.len());
+    let mut acc = [f32x8::splat(0.0); 4];
+    let mut i = 0;
+    let mut k = 0;
+    while i + 8 <= n {
+        acc[k] += f32x8::from_slice(&w[i..i + 8]) * f32x8::from_slice(&x[i..i + 8]);
+        k = (k + 1) & 3;
+        i += 8;
+    }
+    let mut s = (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum();
+    while i < n {
+        s += w[i] * x[i];
+        i += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn f32_dot_avx2(w: &[f32], x: &[f32]) -> f32 {
+    f32_dot_impl(w, x)
+}
+
+#[inline]
+fn f32_dot_dispatch(use_avx2: bool, w: &[f32], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { f32_dot_avx2(w, x) };
+        }
+    }
+    let _ = use_avx2;
+    f32_dot_impl(w, x)
+}
+
+#[inline(always)]
+fn f16_dot_impl(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut acc = [f32x8::splat(0.0); 4];
+    let mut buf = [0.0f32; 8];
+    let mut c = 0;
+    let mut k = 0;
+    while c + 8 <= ncols {
+        for (j, b) in buf.iter_mut().enumerate() {
+            let o = base + (c + j) * 2;
+            *b = f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]]));
+        }
+        acc[k] += f32x8::from_slice(&buf) * f32x8::from_slice(&x[c..c + 8]);
+        k = (k + 1) & 3;
+        c += 8;
+    }
+    let mut s = (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum();
+    while c < ncols {
+        let o = base + c * 2;
+        s += f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]])) * x[c];
+        c += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn f16_dot_avx2(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    f16_dot_impl(data, base, ncols, x)
+}
+
+#[inline]
+fn f16_dot_dispatch(use_avx2: bool, data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { f16_dot_avx2(data, base, ncols, x) };
+        }
+    }
+    let _ = use_avx2;
+    f16_dot_impl(data, base, ncols, x)
+}
+
+#[inline(always)]
+fn bf16_dot_impl(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut acc = [f32x8::splat(0.0); 4];
+    let mut buf = [0.0f32; 8];
+    let mut c = 0;
+    let mut k = 0;
+    while c + 8 <= ncols {
+        for (j, b) in buf.iter_mut().enumerate() {
+            let o = base + (c + j) * 2;
+            *b = f32::from_bits((u16::from_le_bytes([data[o], data[o + 1]]) as u32) << 16);
+        }
+        acc[k] += f32x8::from_slice(&buf) * f32x8::from_slice(&x[c..c + 8]);
+        k = (k + 1) & 3;
+        c += 8;
+    }
+    let mut s = (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum();
+    while c < ncols {
+        let o = base + c * 2;
+        s += f32::from_bits((u16::from_le_bytes([data[o], data[o + 1]]) as u32) << 16) * x[c];
+        c += 1;
+    }
+    s
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bf16_dot_avx2(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    bf16_dot_impl(data, base, ncols, x)
+}
+
+#[inline]
+fn bf16_dot_dispatch(use_avx2: bool, data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { bf16_dot_avx2(data, base, ncols, x) };
+        }
+    }
+    let _ = use_avx2;
+    bf16_dot_impl(data, base, ncols, x)
 }
 
 fn gemv_f64(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
@@ -785,6 +898,31 @@ mod tests {
         let d = dequantize(&info, &b).unwrap();
         assert_eq!(d.len(), 256);
         assert!((d[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_dot_matches_scalar() {
+        // all weights = f16(1.0) → the vectorized dot equals Σ input.
+        let n = 64usize;
+        let mut data = vec![0u8; n * 2];
+        for i in 0..n {
+            data[i * 2] = 0x00;
+            data[i * 2 + 1] = 0x3C; // f16 1.0 (LE)
+        }
+        let x: Vec<f32> = (0..n).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+        let expect: f32 = x.iter().sum();
+        let got = f16_dot_impl(&data, 0, n, &x);
+        assert!((got - expect).abs() < 1e-3, "got={got} expect={expect}");
+    }
+
+    #[test]
+    fn f32_dot_matches_scalar() {
+        let n = 37usize;
+        let w: Vec<f32> = (0..n).map(|i| ((i * 7) % 13) as f32 - 6.0).collect();
+        let x: Vec<f32> = (0..n).map(|i| ((i * 5) % 9) as f32 - 4.0).collect();
+        let expect: f32 = w.iter().zip(&x).map(|(a, b)| a * b).sum();
+        let got = f32_dot_impl(&w, &x);
+        assert!((got - expect).abs() < 1e-3, "got={got} expect={expect}");
     }
 }
 
