@@ -31,6 +31,9 @@ pub struct BoundedKvCache {
     recent_v: Vec<f32>,
     /// Physical slot id for each recent ring entry (`usize::MAX` if empty).
     recent_slot: Vec<usize>,
+    /// Reverse map: physical slot → recent ring index (`None` when not in the ring).
+    /// O(1) lookup replacing the linear scan in `recent_fp_for_slot` (audit C.3.2).
+    slot_recent: Vec<Option<usize>>,
     recent_len: usize,
     recent_write: usize,
     pub current_len: usize,
@@ -67,6 +70,7 @@ impl BoundedKvCache {
             recent_k: vec![0.0; recent_fp_tokens * dim],
             recent_v: vec![0.0; recent_fp_tokens * dim],
             recent_slot: vec![usize::MAX; recent_fp_tokens],
+            slot_recent: vec![None; max_seq_len],
             recent_len: 0,
             recent_write: 0,
             current_len: 0,
@@ -135,9 +139,15 @@ impl BoundedKvCache {
             self.recent_len += 1;
         }
         let w = self.recent_write;
+        // Clear the reverse mapping of the slot this ring position is about to evict.
+        let old = self.recent_slot[w];
+        if old != usize::MAX && old < self.slot_recent.len() {
+            self.slot_recent[old] = None;
+        }
         self.recent_k[w * self.dim..(w + 1) * self.dim].copy_from_slice(key);
         self.recent_v[w * self.dim..(w + 1) * self.dim].copy_from_slice(value);
         self.recent_slot[w] = target_idx;
+        self.slot_recent[target_idx] = Some(w);
         self.recent_write = (w + 1) % self.recent_fp_tokens;
 
         self.current_len += 1;
@@ -181,17 +191,8 @@ impl BoundedKvCache {
     }
 
     fn recent_fp_for_slot(&self, slot: usize) -> Option<usize> {
-        for i in 0..self.recent_len {
-            let idx = if self.recent_len < self.recent_fp_tokens {
-                i
-            } else {
-                (self.recent_write + i) % self.recent_fp_tokens
-            };
-            if self.recent_slot[idx] == slot {
-                return Some(idx);
-            }
-        }
-        None
+        // O(1) via the reverse map (audit C.3.2 — was a linear scan per head per layer).
+        self.slot_recent.get(slot).copied().flatten()
     }
 
     pub fn dequantize_key(&self, slot: usize, out: &mut [f32]) {
