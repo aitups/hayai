@@ -744,7 +744,15 @@ impl StreamingScratch {
                 .iter()
                 .find(|e| e.device_info.device_id == *owner_id)
             {
-                slots[slot].prepare_for_device(apu)?;
+                // Only UMA owners consume the coarse SVM directly (`weight_bind` gates
+                // coarse bind to Apu/IntegratedGpu); a discrete owner always uses its
+                // mirror, so keep its host base mapped (no unnecessary unmap/remap).
+                if matches!(
+                    apu.device_info.device_kind,
+                    DeviceKind::Apu | DeviceKind::IntegratedGpu
+                ) {
+                    slots[slot].prepare_for_device(apu)?;
+                }
             }
         }
         Ok(())
@@ -895,13 +903,20 @@ impl StreamingScratch {
     /// Resolve Base+Offset bind for a pool device. Errors if the device has no
     /// SVM ownership and no VRAM mirror (HostUpload removed from product path).
     pub fn weight_bind(&self, eng: &OpenClEngine, slot: usize) -> Result<WeightBind<'_>, OpenClError> {
+        let uma = matches!(
+            eng.device_info.device_kind,
+            DeviceKind::Apu | DeviceKind::IntegratedGpu
+        );
         if self.resident {
             // Resident: single base allocation; `slot` is the layer index.
             // Only a **fine-grain** SVM owner can be read by the device while the
             // host mapping stays live. A coarse owner falls through to the mirror
             // (dGPU) or to host-upload (the `begin_gemv_from_scratch` fallback).
             if let HostBase::Svm { slots, owner_id } = &self.host {
-                if eng.device_info.device_id == *owner_id && slots[0].device_usable() {
+                if eng.device_info.device_id == *owner_id
+                    && slots[0].device_usable()
+                    && (uma || !slots[0].coarse)
+                {
                     return Ok(WeightBind::Svm {
                         ptr: slots[0].as_ptr(),
                     });
@@ -926,7 +941,10 @@ impl StreamingScratch {
             // Only a fine-grain owner can be read by the device while the host
             // mapping stays live. A coarse owner falls through to the mirror
             // (dGPU) or host-upload, so the slot never needs to be unmapped.
-            if eng.device_info.device_id == *owner_id && slots[slot].device_usable() {
+            if eng.device_info.device_id == *owner_id
+                && slots[slot].device_usable()
+                && (uma || !slots[slot].coarse)
+            {
                 return Ok(WeightBind::Svm {
                     ptr: slots[slot].as_ptr(),
                 });
