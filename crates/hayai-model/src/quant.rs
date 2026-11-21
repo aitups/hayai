@@ -649,82 +649,194 @@ fn extract_q8_k_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> R
 
 /// Q4_0 GEMV with `f32x8` MAC on each half-block (Attn hot path, PRD §2 SIMD).
 pub fn gemv_q4_0(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
-    use std::simd::f32x8;
-    use std::simd::num::SimdFloat;
-
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 18;
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let row_base = row * row_bytes;
-        let mut sum = 0.0f32;
-        for b in 0..blocks_per_row {
-            let base = row_base + b * 18;
-            let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-            let qs = &data[base + 2..base + 18];
-            let x_base = b * 32;
-            let d_v = f32x8::splat(d);
-            // Low nibbles × input[0..16]
-            let mut q_lo = [0.0f32; 16];
-            let mut q_hi = [0.0f32; 16];
-            for j in 0..16 {
-                q_lo[j] = ((qs[j] & 0x0F) as i8 - 8) as f32;
-                q_hi[j] = ((qs[j] >> 4) as i8 - 8) as f32;
-            }
-            let mut acc = f32x8::splat(0.0);
-            for chunk in 0..2 {
-                let o = chunk * 8;
-                let ql = f32x8::from_slice(&q_lo[o..o + 8]);
-                let qh = f32x8::from_slice(&q_hi[o..o + 8]);
-                let xl = f32x8::from_slice(&input[x_base + o..x_base + o + 8]);
-                let xh = f32x8::from_slice(&input[x_base + 16 + o..x_base + 24 + o]);
-                acc += ql * d_v * xl + qh * d_v * xh;
-            }
-            sum += acc.reduce_sum();
-        }
-        *out = sum;
+        *out = q4_0_row_dispatch(use_avx2, data, input, row * row_bytes, blocks_per_row);
     });
+}
+
+#[inline(always)]
+fn q4_0_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut sum = 0.0f32;
+    for b in 0..blocks_per_row {
+        let base = row_base + b * 18;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let qs = &data[base + 2..base + 18];
+        let x_base = b * 32;
+        let d_v = f32x8::splat(d);
+        let mut q_lo = [0.0f32; 16];
+        let mut q_hi = [0.0f32; 16];
+        for j in 0..16 {
+            q_lo[j] = ((qs[j] & 0x0F) as i8 - 8) as f32;
+            q_hi[j] = ((qs[j] >> 4) as i8 - 8) as f32;
+        }
+        let mut acc = f32x8::splat(0.0);
+        for chunk in 0..2 {
+            let o = chunk * 8;
+            let ql = f32x8::from_slice(&q_lo[o..o + 8]);
+            let qh = f32x8::from_slice(&q_hi[o..o + 8]);
+            let xl = f32x8::from_slice(&input[x_base + o..x_base + o + 8]);
+            let xh = f32x8::from_slice(&input[x_base + 16 + o..x_base + 24 + o]);
+            acc += ql * d_v * xl + qh * d_v * xh;
+        }
+        sum += acc.reduce_sum();
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4_0_row_avx2(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    q4_0_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn q4_0_row_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { q4_0_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    q4_0_row(data, input, row_base, blocks_per_row)
 }
 
 pub fn gemv_q4_1(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 20;
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let row_base = row * row_bytes;
-        let mut sum = 0.0f32;
-        for b in 0..blocks_per_row {
-            let base = row_base + b * 20;
-            let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-            let m = f16_to_f32(u16::from_le_bytes([data[base + 2], data[base + 3]]));
-            let qs = &data[base + 4..base + 20];
-            let x_base = b * 32;
-            for j in 0..16 {
-                sum += ((qs[j] & 0x0F) as f32 * d + m) * input[x_base + j];
-                sum += ((qs[j] >> 4) as f32 * d + m) * input[x_base + j + 16];
-            }
-        }
-        *out = sum;
+        *out = q4_1_row_dispatch(use_avx2, data, input, row * row_bytes, blocks_per_row);
     });
+}
+
+#[inline(always)]
+fn q4_1_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut sum = 0.0f32;
+    for b in 0..blocks_per_row {
+        let base = row_base + b * 20;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let m = f16_to_f32(u16::from_le_bytes([data[base + 2], data[base + 3]]));
+        let qs = &data[base + 4..base + 20];
+        let x_base = b * 32;
+        let d_v = f32x8::splat(d);
+        let m_v = f32x8::splat(m);
+        let mut q_lo = [0.0f32; 16];
+        let mut q_hi = [0.0f32; 16];
+        for j in 0..16 {
+            q_lo[j] = (qs[j] & 0x0F) as f32;
+            q_hi[j] = (qs[j] >> 4) as f32;
+        }
+        let mut acc = [f32x8::splat(0.0); 2];
+        for (chunk, a) in acc.iter_mut().enumerate() {
+            let o = chunk * 8;
+            let ql = f32x8::from_slice(&q_lo[o..o + 8]) * d_v + m_v;
+            let qh = f32x8::from_slice(&q_hi[o..o + 8]) * d_v + m_v;
+            let xl = f32x8::from_slice(&input[x_base + o..x_base + o + 8]);
+            let xh = f32x8::from_slice(&input[x_base + 16 + o..x_base + 24 + o]);
+            *a = ql * xl + qh * xh;
+        }
+        sum += (acc[0] + acc[1]).reduce_sum();
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4_1_row_avx2(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    q4_1_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn q4_1_row_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { q4_1_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    q4_1_row(data, input, row_base, blocks_per_row)
 }
 
 pub fn gemv_q8_0(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     assert_eq!(ncols % 32, 0);
     let blocks_per_row = ncols / 32;
     let row_bytes = blocks_per_row * 34;
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let row_base = row * row_bytes;
-        let mut sum = 0.0f32;
-        for b in 0..blocks_per_row {
-            let base = row_base + b * 34;
-            let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-            let x_base = b * 32;
-            for j in 0..32 {
-                sum += (data[base + 2 + j] as i8) as f32 * d * input[x_base + j];
-            }
-        }
-        *out = sum;
+        *out = q8_0_row_dispatch(use_avx2, data, input, row * row_bytes, blocks_per_row);
     });
+}
+
+#[inline(always)]
+fn q8_0_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut sum = 0.0f32;
+    for b in 0..blocks_per_row {
+        let base = row_base + b * 34;
+        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
+        let d_v = f32x8::splat(d);
+        let x_base = b * 32;
+        let qs = &data[base + 2..base + 34];
+        let mut acc = [f32x8::splat(0.0); 4];
+        for (chunk, a) in acc.iter_mut().enumerate() {
+            let o = chunk * 8;
+            let mut w = [0.0f32; 8];
+            for (j, wj) in w.iter_mut().enumerate() {
+                *wj = qs[o + j] as i8 as f32;
+            }
+            *a = f32x8::from_slice(&w) * d_v * f32x8::from_slice(&input[x_base + o..x_base + o + 8]);
+        }
+        sum += (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum();
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q8_0_row_avx2(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    q8_0_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn q8_0_row_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { q8_0_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    q8_0_row(data, input, row_base, blocks_per_row)
 }
 
 /// Q4_0 × Q8_0 GEMV (audit C.2): quantise the activation to Q8_0 (32-element blocks)
