@@ -91,11 +91,15 @@ fn build_or_load_program(
     let path = std::env::temp_dir().join(format!("hayai-cl-program-{h:016x}.bin"));
     if let Ok(bytes) = std::fs::read(&path) {
         if !bytes.is_empty() {
-            if let Ok(p) = unsafe {
+            if let Ok(mut p) = unsafe {
                 Program::create_from_binary(context, &[info.device_id], &[bytes.as_slice()])
             } {
-                info!("Loaded cached OpenCL program binary {}", path.display());
-                return Ok(p);
+                // A program created from a binary still needs clBuildProgram to become
+                // executable (otherwise clCreateKernel -> CL_INVALID_PROGRAM_EXECUTABLE).
+                if p.build(&[info.device_id], "").is_ok() {
+                    info!("Loaded cached OpenCL program binary {}", path.display());
+                    return Ok(p);
+                }
             }
         }
     }
