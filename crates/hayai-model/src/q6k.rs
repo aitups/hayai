@@ -95,13 +95,15 @@ fn gemv_q6k_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usi
     for b in 0..blocks_per_row {
         dequant_q6_k_block(&data[row_base + b * Q6_K_BLOCK_BYTES..], &mut block_vals);
         let xs = &input[b * QK_K..(b + 1) * QK_K];
-        let mut acc = f32x8::splat(0.0);
+        let mut acc = [f32x8::splat(0.0); 4];
         let mut c = 0;
+        let mut k = 0;
         while c + 8 <= QK_K {
-            acc += f32x8::from_slice(&block_vals[c..c + 8]) * f32x8::from_slice(&xs[c..c + 8]);
+            acc[k] += f32x8::from_slice(&block_vals[c..c + 8]) * f32x8::from_slice(&xs[c..c + 8]);
+            k = (k + 1) & 3;
             c += 8;
         }
-        sum += acc.reduce_sum();
+        sum += (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum();
         while c < QK_K {
             sum += block_vals[c] * xs[c];
             c += 1;
@@ -137,6 +139,36 @@ fn gemv_q6k_dispatch(
     }
     let _ = use_avx2;
     gemv_q6k_row(data, input, row_base, blocks_per_row)
+}
+
+/// Q6_K × Q8_K GEMV (audit C.2): quantise the activation once to Q8_K, then the existing
+/// f32 dot on the pre-scaled int8 activations (exact; 4 accumulators for ILP).
+pub fn gemv_q6_k_q8k(
+    nrows: usize,
+    ncols: usize,
+    data: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 {
+        return Err(GgufError::Msg(format!("Q6_K ncols={ncols}")));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * Q6_K_BLOCK_BYTES;
+    if data.len() < nrows * row_bytes {
+        return Err(GgufError::Truncated("q6_k gemv"));
+    }
+    let q8 = crate::q8k::Q8K::quantize(input);
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
+    output
+        .par_iter_mut()
+        .with_min_len(64)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let row_base = row * row_bytes;
+            *out = gemv_q6k_dispatch(use_avx2, data, &q8.scaled, row_base, blocks_per_row);
+        });
+    Ok(())
 }
 
 pub fn extract_q6_k_row(

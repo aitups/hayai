@@ -12,6 +12,7 @@ pub mod iq4;
 pub mod q2k;
 pub mod q3k;
 pub mod q4k;
+pub mod q8k;
 pub mod q5;
 pub mod q5k;
 pub mod q6k;

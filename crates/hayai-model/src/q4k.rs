@@ -11,24 +11,24 @@ pub const Q4_K_BLOCK_BYTES: usize = 144; // d(2)+dmin(2)+scales(12)+qs(128)
 fn gemv_q4k_sub32(d: f32, minv: f32, q: &[u8], x: &[f32], high_nibble: bool) -> f32 {
     use std::simd::num::{SimdFloat, SimdUint};
     use std::simd::{f32x8, u32x8, u8x8};
-    let mut acc = f32x8::splat(0.0);
     let d_v = f32x8::splat(d);
     let m_v = f32x8::splat(minv);
     let shift = u8x8::splat(4);
     let mask = u8x8::splat(0x0F);
     let magic = u32x8::splat(0x4B00_0000);
     let magic_f = f32x8::splat(8_388_608.0);
-    for chunk in 0..4 {
+    // Four independent per-chunk products (no serial accumulator chain) to hide the f32
+    // multiply/add latency (audit C.2).
+    let mut acc = [f32x8::splat(0.0); 4];
+    for (chunk, a) in acc.iter_mut().enumerate() {
         let o = chunk * 8;
         let bytes = u8x8::from_slice(&q[o..o + 8]);
         let nib = if high_nibble { bytes >> shift } else { bytes & mask };
         // u8 nibble -> f32 via the "magic number" int-to-float bit trick, all SIMD.
         let f = f32x8::from_bits(nib.cast::<u32>() | magic) - magic_f;
-        let wv = f * d_v - m_v;
-        let xv = f32x8::from_slice(&x[o..o + 8]);
-        acc += wv * xv;
+        *a = (f * d_v - m_v) * f32x8::from_slice(&x[o..o + 8]);
     }
-    acc.reduce_sum()
+    (acc[0] + acc[1] + acc[2] + acc[3]).reduce_sum()
 }
 
 #[inline]
@@ -294,6 +294,42 @@ fn gemv_q4k_dispatch(
     gemv_q4k_row(data, input, row_base, blocks_per_row)
 }
 
+/// Q4_K × Q8_K GEMV (audit C.2): quantise the activation to Q8_K once (256-element blocks,
+/// one f32 scale each, matching llama.cpp), then run the existing f32 dot on the
+/// pre-scaled int8 activations. The values are small exact ints, so the f32 dot is
+/// bit-identical to an integer dot; the dot keeps four independent accumulators for ILP
+/// (the audit allows `i32x8 / f32x8` accs).
+pub fn gemv_q4_k_q8k(
+    nrows: usize,
+    ncols: usize,
+    data: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), GgufError> {
+    if ncols % QK_K != 0 {
+        return Err(GgufError::Msg(format!(
+            "Q4_K ncols={ncols} not multiple of {QK_K}"
+        )));
+    }
+    let blocks_per_row = ncols / QK_K;
+    let row_bytes = blocks_per_row * Q4_K_BLOCK_BYTES;
+    if data.len() < nrows * row_bytes {
+        return Err(GgufError::Truncated("q4_k gemv"));
+    }
+    assert_eq!(input.len(), ncols);
+    assert_eq!(output.len(), nrows);
+    let q8 = crate::q8k::Q8K::quantize(input);
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
+    output
+        .par_iter_mut()
+        .with_min_len(64)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let row_base = row * row_bytes;
+            *out = gemv_q4k_dispatch(use_avx2, data, &q8.scaled, row_base, blocks_per_row);
+        });
+    Ok(())
+}
 /// Extract one embedding row from a Q4_K matrix (nrows = vocab, ncols = hidden).
 pub fn extract_q4_k_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
     if ncols % QK_K != 0 || out.len() != ncols {
@@ -387,5 +423,33 @@ mod tests {
         let range_rel = max_abs / (xmax - xmin).max(1e-6);
         assert!(range_rel < 0.2, "range_rel_err={range_rel} max_abs={max_abs}");
     }
+
+    #[test]
+    fn q8k_gemv_matches_f32_within_quant_error() {
+        // The Q8_K path quantises the activation (int8) — compare it to the exact f32 dot
+        // on one Q4_K row (4 blocks) with a non-trivial activation pattern.
+        let ncols = 1024usize;
+        let mut w = vec![0.0f32; ncols];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = (((i * 37) % 211) as f32 - 105.0) * 0.05;
+        }
+        let packed = quantize_q4_k(&w, w.len()).unwrap();
+        let mut input = vec![0.0f32; ncols];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = (((i * 53) % 97) as f32 - 48.0) * 0.1;
+        }
+        let mut out_f32 = vec![0.0f32; 1];
+        let mut out_q8 = vec![0.0f32; 1];
+        gemv_q4_k(1, ncols, &packed, &input, &mut out_f32).unwrap();
+        gemv_q4_k_q8k(1, ncols, &packed, &input, &mut out_q8).unwrap();
+        let err = (out_f32[0] - out_q8[0]).abs() / out_f32[0].abs().max(1e-3);
+        assert!(
+            err < 0.05,
+            "f32={} q8={} rel_err={err}",
+            out_f32[0],
+            out_q8[0]
+        );
+    }
 }
+
 
