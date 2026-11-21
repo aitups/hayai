@@ -20,7 +20,7 @@ use crate::q2k::{extract_q2_k_row, gemv_q2_k};
 use crate::q3k::{extract_q3_k_row, gemv_q3_k};
 use crate::q4k::{extract_q4_k_row, gemv_q4_k_q8k};
 use crate::q5::{extract_q5_0_row, gemv_q5_0, gemv_q5_1};
-use crate::q5k::{extract_q5_k_row, gemv_q5_k};
+use crate::q5k::{extract_q5_k_row, gemv_q5_k_q8k};
 use crate::q6k::{extract_q6_k_row, gemv_q6_k_q8k};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -318,7 +318,7 @@ impl QuantMatrix {
             }
             GgmlType::Q8_K => gemv_q8_k(self.nrows, self.ncols, data, input, output),
             GgmlType::Q4_0 => {
-                gemv_q4_0(self.ncols, data, input, output);
+                gemv_q4_0_q8k(self.ncols, data, input, output);
                 Ok(())
             }
             GgmlType::Q4_1 => {
@@ -326,7 +326,7 @@ impl QuantMatrix {
                 Ok(())
             }
             GgmlType::Q8_0 => {
-                gemv_q8_0(self.ncols, data, input, output);
+                gemv_q8_0_q8k(self.ncols, data, input, output);
                 Ok(())
             }
             GgmlType::Q2_K => gemv_q2_k(self.nrows, self.ncols, data, input, output),
@@ -334,7 +334,7 @@ impl QuantMatrix {
             GgmlType::Q4_K => gemv_q4_k_q8k(self.nrows, self.ncols, data, input, output),
             GgmlType::Q5_0 => gemv_q5_0(self.nrows, self.ncols, data, input, output),
             GgmlType::Q5_1 => gemv_q5_1(self.nrows, self.ncols, data, input, output),
-            GgmlType::Q5_K => gemv_q5_k(self.nrows, self.ncols, data, input, output),
+            GgmlType::Q5_K => gemv_q5_k_q8k(self.nrows, self.ncols, data, input, output),
             GgmlType::Q6_K => gemv_q6_k_q8k(self.nrows, self.ncols, data, input, output),
             GgmlType::IQ4_NL => gemv_iq4_nl(self.nrows, self.ncols, data, input, output),
             GgmlType::IQ4_XS => gemv_iq4_xs(self.nrows, self.ncols, data, input, output),
@@ -614,6 +614,19 @@ pub fn gemv_q8_0(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
     });
 }
 
+/// Q4_0 × Q8_0 GEMV (audit C.2): quantise the activation to Q8_0 (32-element blocks)
+/// once, then dot the pre-scaled int8 activations (exact for these small ints).
+pub fn gemv_q4_0_q8k(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    let q8 = crate::q8k::Q8K::quantize_blocked(input, 32);
+    gemv_q4_0(ncols, data, &q8.scaled, output);
+}
+
+/// Q8_0 × Q8_0 GEMV (audit C.2), same Q8_0 input quantisation.
+pub fn gemv_q8_0_q8k(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    let q8 = crate::q8k::Q8K::quantize_blocked(input, 32);
+    gemv_q8_0(ncols, data, &q8.scaled, output);
+}
+
 fn extract_q4_0_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
     let blocks = ncols / 32;
     let row_bytes_n = blocks * 18;
@@ -774,6 +787,7 @@ mod tests {
         assert!((d[0] - 1.0).abs() < 1e-6);
     }
 }
+
 
 
 

@@ -129,6 +129,19 @@ pub fn gemv_q5_k(
     Ok(())
 }
 
+/// Q5_K × Q8_K GEMV (audit C.2): quantise the activation to Q8_K (256-element blocks),
+/// then the f32 dot on the pre-scaled int8 activations (exact for these small ints).
+pub fn gemv_q5_k_q8k(
+    nrows: usize,
+    ncols: usize,
+    data: &[u8],
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), GgufError> {
+    let q8 = crate::q8k::Q8K::quantize(input);
+    gemv_q5_k(nrows, ncols, data, &q8.scaled, output)
+}
+
 pub fn extract_q5_k_row(
     data: &[u8],
     ncols: usize,
