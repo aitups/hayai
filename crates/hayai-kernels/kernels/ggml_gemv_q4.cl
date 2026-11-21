@@ -663,59 +663,54 @@ __kernel void ggml_gemv_q5_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 176;
+    // Warp-striped: one warp per row, lane `l` handles the low/high weight `l` of each
+    // 64-weight sub-block; ql/qh reads are contiguous across the warp.
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int t0 = 0; t0 < N; t0 += HAYAI_X_TILE) {
-        int ntile = min(HAYAI_X_TILE, N - t0);
-        hayai_load_input_tile(t0, ntile, input, local_input);
-        if (row < M) {
-            int bi0 = t0 / 256;
-            int bi1 = (t0 + ntile) / 256;
-            long row_base = (long)row * row_bytes;
-            for (int bi = bi0; bi < bi1; bi++) {
-                __global const uchar* block = wbase + row_base + bi * 176;
-                float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-                float minv = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
-                __global const uchar* scales = block + 4;
-                __global const uchar* qh = block + 16;
-                __global const uchar* ql = block + 48;
-                int x_base = bi * 256 - t0;
-                int xo = 0;
-                int is = 0;
-                int qlo = 0;
-                uchar u1 = 1;
-                uchar u2 = 2;
-                for (int sub = 0; sub < 4; sub++) {
-                    uchar sc0, m0, sc1, m1;
-                    hayai_get_scale_min_k4(is, scales, &sc0, &m0);
-                    hayai_get_scale_min_k4(is + 1, scales, &sc1, &m1);
-                    float d1 = d * (float)sc0;
-                    float m1v = minv * (float)m0;
-                    float d2 = d * (float)sc1;
-                    float m2v = minv * (float)m1;
-                    for (int l = 0; l < 32; l++) {
-                        int v = (ql[qlo + l] & 0x0F) + ((qh[l] & u1) ? 16 : 0);
-                        sum += (d1 * (float)v - m1v) * local_input[x_base + xo + l];
-                    }
-                    xo += 32;
-                    for (int l = 0; l < 32; l++) {
-                        int v = (ql[qlo + l] >> 4) + ((qh[l] & u2) ? 16 : 0);
-                        sum += (d2 * (float)v - m2v) * local_input[x_base + xo + l];
-                    }
-                    xo += 32;
-                    qlo += 32;
-                    is += 2;
-                    u1 <<= 2;
-                    u2 <<= 2;
-                }
+    if (row < M) {
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 176;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 176;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            float minv = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
+            __global const uchar* scales = block + 4;
+            __global const uchar* qh = block + 16;
+            __global const uchar* ql = block + 48;
+            int x_base = bi * 256;
+            uchar qhb = qh[lane];
+            for (int sub = 0; sub < 4; sub++) {
+                uchar sc0, m0, sc1, m1;
+                hayai_get_scale_min_k4(2 * sub, scales, &sc0, &m0);
+                hayai_get_scale_min_k4(2 * sub + 1, scales, &sc1, &m1);
+                float d1 = d * (float)sc0;
+                float m1v = minv * (float)m0;
+                float d2 = d * (float)sc1;
+                float m2v = minv * (float)m1;
+                uchar qbyte = ql[sub * 32 + lane];
+                int u1 = 1 << (2 * sub);
+                int u2 = 1 << (2 * sub + 1);
+                int vlow = (qbyte & 0x0F) + ((qhb & u1) ? 16 : 0);
+                int vhigh = (qbyte >> 4) + ((qhb & u2) ? 16 : 0);
+                int x0 = x_base + sub * 64 + lane;
+                sum += (d1 * (float)vlow - m1v) * input[x0];
+                sum += (d2 * (float)vhigh - m2v) * input[x0 + 32];
             }
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (row < M) output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __constant char hayai_kvalues_iq4nl[16] = {

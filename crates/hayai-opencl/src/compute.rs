@@ -32,6 +32,7 @@ pub(crate) fn gemv_split(label: &str) -> usize {
     match label {
         "q4_0" | "q8_0" | "q6_k" => 32,
         "q4_k" => 32,
+        "q5_k" => 32,
         "f32" => 32,
         _ => 1,
     }
