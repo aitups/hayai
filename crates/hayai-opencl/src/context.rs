@@ -68,6 +68,49 @@ pub struct OpenClEngine {
     pub sync_ws: std::sync::Mutex<crate::compute::GemvSyncWorkspace>,
 }
 
+/// Build the OpenCL program from source, caching the compiled device binary on disk
+/// (audit B.1.1) so ~1.7k lines of OpenCL C are not recompiled on every start. The key
+/// covers source + device + platform/driver fingerprint; a stale/failed load rebuilds.
+fn build_or_load_program(
+    context: &Context,
+    info: &OpenClDeviceInfo,
+    source: &str,
+) -> Result<Program, OpenClError> {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut feed = |s: &[u8]| {
+        for &b in s {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(info.device_name.as_bytes());
+    feed(info.opencl_version.as_bytes());
+    feed(info.opencl_c_version.as_bytes());
+    feed(&info.max_compute_units.to_le_bytes());
+    feed(source.as_bytes());
+    let path = std::env::temp_dir().join(format!("hayai-cl-program-{h:016x}.bin"));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if !bytes.is_empty() {
+            if let Ok(p) = unsafe {
+                Program::create_from_binary(context, &[info.device_id], &[bytes.as_slice()])
+            } {
+                info!("Loaded cached OpenCL program binary {}", path.display());
+                return Ok(p);
+            }
+        }
+    }
+    let p = Program::create_and_build_from_source(context, source, "")
+        .map_err(|e| OpenClError::ClError(format!("Kernel compilation failed: {e}")))?;
+    if let Ok(bins) = p.get_binaries() {
+        if let Some(first) = bins.first() {
+            if !first.is_empty() {
+                let _ = std::fs::write(&path, first);
+            }
+        }
+    }
+    Ok(p)
+}
+
 impl OpenClEngine {
     pub fn try_init_any() -> Result<Self, OpenClError> {
         let devices = discover_opencl_devices();
@@ -129,8 +172,7 @@ impl OpenClEngine {
         }
 
         let source = opencl_program_source();
-        let program = Program::create_and_build_from_source(&context, &source, "")
-            .map_err(|e| OpenClError::ClError(format!("Kernel compilation failed: {}", e)))?;
+        let program = build_or_load_program(&context, info, &source)?;
 
         let lut_kernel = Kernel::create(&program, "lut_matmul_q4_v1")
             .map_err(|e| OpenClError::ClError(format!("lut kernel: {}", e)))?;
