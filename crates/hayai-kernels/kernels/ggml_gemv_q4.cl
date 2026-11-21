@@ -953,42 +953,49 @@ __kernel void ggml_gemv_iq3_xxs(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 98;
-    long row_base = (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int l = lane >> 3;
+    int e = lane & 7;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row_base + bi * 98;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 2;
-        __global const uchar* scales_and_signs = block + 66;
-        int x_base = bi * 256;
-        int xo = 0;
-        int qoff = 0;
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            uint aux32 = (uint)scales_and_signs[4*ib32]
-                | ((uint)scales_and_signs[4*ib32+1] << 8)
-                | ((uint)scales_and_signs[4*ib32+2] << 16)
-                | ((uint)scales_and_signs[4*ib32+3] << 24);
-            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
-            for (int l = 0; l < 4; l++) {
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off;
+        int blocks = N / 256;
+        int row_bytes = blocks * 98;
+        __global const uchar* rowp = wbase + (long)row * row_bytes;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = rowp + bi * 98;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            __global const uchar* qs = block + 2;
+            __global const uchar* ss = block + 66;
+            int x_base = bi * 256;
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                uint aux32 = (uint)ss[4*ib32]
+                    | ((uint)ss[4*ib32+1] << 8)
+                    | ((uint)ss[4*ib32+2] << 16)
+                    | ((uint)ss[4*ib32+3] << 24);
+                float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
                 uchar signs = hayai_ksigns_iq2xs[(aux32 >> (7*l)) & 127];
+                int qoff = 8 * ib32;
                 uint g1u = hayai_iq3xxs_grid[qs[qoff + 2*l]];
                 uint g2u = hayai_iq3xxs_grid[qs[qoff + 2*l + 1]];
-                for (int j = 0; j < 4; j++) {
-                    sum += hayai_iq3_signed(db, hayai_grid_byte(g1u, j), signs, j) * input[x_base + xo + j];
-                    sum += hayai_iq3_signed(db, hayai_grid_byte(g2u, j), signs, j + 4) * input[x_base + xo + 4 + j];
-                }
-                xo += 8;
+                uchar gb = (e < 4) ? hayai_grid_byte(g1u, e) : hayai_grid_byte(g2u, e - 4);
+                sum += hayai_iq3_signed(db, gb, signs, e) * input[x_base + ib32 * 32 + lane];
             }
-            qoff += 8;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_iq3_s(
@@ -1000,63 +1007,61 @@ __kernel void ggml_gemv_iq3_s(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 110;
-    long row_base = (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int l = lane >> 3;
+    int e = lane & 7;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row_base + bi * 110;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 2;
-        __global const uchar* qh = block + 66;
-        __global const uchar* signs_all = block + 74;
-        __global const uchar* scales = block + 106;
-        int x_base = bi * 256;
-        int xo = 0;
-        int qoff = 0;
-        int soff = 0;
-        int qh_off = 0;
-        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
-            float db1 = d * (1.0f + 2.0f * (float)(scales[ib32/2] & 0x0f));
-            float db2 = d * (1.0f + 2.0f * (float)(scales[ib32/2] >> 4));
-            uchar qh0 = qh[qh_off];
-            for (int l = 0; l < 4; l++) {
-                int idx1 = (int)qs[qoff + 2*l] | ((((int)qh0) << (8 - 2*l)) & 256);
-                int idx2 = (int)qs[qoff + 2*l + 1] | ((((int)qh0) << (7 - 2*l)) & 256);
-                uint g1u = hayai_iq3s_grid[idx1];
-                uint g2u = hayai_iq3s_grid[idx2];
-                uchar signs = signs_all[soff + l];
-                for (int j = 0; j < 4; j++) {
-                    sum += hayai_iq3_signed(db1, hayai_grid_byte(g1u, j), signs, j) * input[x_base + xo + j];
-                    sum += hayai_iq3_signed(db1, hayai_grid_byte(g2u, j), signs, j + 4) * input[x_base + xo + 4 + j];
-                }
-                xo += 8;
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off;
+        int blocks = N / 256;
+        int row_bytes = blocks * 110;
+        __global const uchar* rowp = wbase + (long)row * row_bytes;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = rowp + bi * 110;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            __global const uchar* qs = block + 2;
+            __global const uchar* qh = block + 66;
+            __global const uchar* signs_all = block + 74;
+            __global const uchar* scales = block + 106;
+            int x_base = bi * 256;
+            for (int m = 0; m < 4; m++) {
+                float db1 = d * (1.0f + 2.0f * (float)(scales[m] & 0x0f));
+                float db2 = d * (1.0f + 2.0f * (float)(scales[m] >> 4));
+                uchar qh0 = qh[2 * m];
+                uchar qh1 = qh[2 * m + 1];
+                int qo0 = 16 * m;
+                int so0 = 8 * m;
+                int idx1a = (int)qs[qo0 + 2*l] | ((((int)qh0) << (8 - 2*l)) & 256);
+                int idx2a = (int)qs[qo0 + 2*l + 1] | ((((int)qh0) << (7 - 2*l)) & 256);
+                uint g1a = hayai_iq3s_grid[idx1a];
+                uint g2a = hayai_iq3s_grid[idx2a];
+                uchar sgna = signs_all[so0 + l];
+                uchar gba = (e < 4) ? hayai_grid_byte(g1a, e) : hayai_grid_byte(g2a, e - 4);
+                sum += hayai_iq3_signed(db1, gba, sgna, e) * input[x_base + (2*m) * 32 + lane];
+
+                int idx1b = (int)qs[qo0 + 8 + 2*l] | ((((int)qh1) << (8 - 2*l)) & 256);
+                int idx2b = (int)qs[qo0 + 8 + 2*l + 1] | ((((int)qh1) << (7 - 2*l)) & 256);
+                uint g1b = hayai_iq3s_grid[idx1b];
+                uint g2b = hayai_iq3s_grid[idx2b];
+                uchar sgnb = signs_all[so0 + 4 + l];
+                uchar gbb = (e < 4) ? hayai_grid_byte(g1b, e) : hayai_grid_byte(g2b, e - 4);
+                sum += hayai_iq3_signed(db2, gbb, sgnb, e) * input[x_base + (2*m + 1) * 32 + lane];
             }
-            qoff += 8;
-            soff += 4;
-            uchar qh1 = qh[qh_off + 1];
-            for (int l = 0; l < 4; l++) {
-                int idx1 = (int)qs[qoff + 2*l] | ((((int)qh1) << (8 - 2*l)) & 256);
-                int idx2 = (int)qs[qoff + 2*l + 1] | ((((int)qh1) << (7 - 2*l)) & 256);
-                uint g1u = hayai_iq3s_grid[idx1];
-                uint g2u = hayai_iq3s_grid[idx2];
-                uchar signs = signs_all[soff + l];
-                for (int j = 0; j < 4; j++) {
-                    sum += hayai_iq3_signed(db2, hayai_grid_byte(g1u, j), signs, j) * input[x_base + xo + j];
-                    sum += hayai_iq3_signed(db2, hayai_grid_byte(g2u, j), signs, j + 4) * input[x_base + xo + 4 + j];
-                }
-                xo += 8;
-            }
-            qh_off += 2;
-            qoff += 8;
-            soff += 4;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 /* ---- IQ2 grids / kernels ---- */
@@ -1534,36 +1539,45 @@ __kernel void ggml_gemv_iq2_xxs(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 66;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int l = lane >> 3;
+    int j = lane & 7;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + (long)row * row_bytes + bi * 66;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 2;
-        int x_base = bi * 256;
-        int xo = 0;
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            int base = 8 * ib32;
-            uint aux0 = (uint)qs[base] | ((uint)qs[base+1] << 8) | ((uint)qs[base+2] << 16) | ((uint)qs[base+3] << 24);
-            uint aux1 = (uint)qs[base+4] | ((uint)qs[base+5] << 8) | ((uint)qs[base+6] << 16) | ((uint)qs[base+7] << 24);
-            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
-            for (int l = 0; l < 4; l++) {
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off;
+        int blocks = N / 256;
+        int row_bytes = blocks * 66;
+        __global const uchar* rowp = wbase + (long)row * row_bytes;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = rowp + bi * 66;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            __global const uchar* qs = block + 2;
+            int x_base = bi * 256;
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                int base = 8 * ib32;
+                uint aux0 = (uint)qs[base] | ((uint)qs[base+1] << 8) | ((uint)qs[base+2] << 16) | ((uint)qs[base+3] << 24);
+                uint aux1 = (uint)qs[base+4] | ((uint)qs[base+5] << 8) | ((uint)qs[base+6] << 16) | ((uint)qs[base+7] << 24);
+                float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
                 uchar idx = (uchar)((aux0 >> (8*l)) & 0xff);
                 ulong gu = hayai_iq2xxs_grid[idx];
                 uchar signs = hayai_ksigns_iq2xs[(aux1 >> (7*l)) & 127];
-                for (int j = 0; j < 8; j++) {
-                    sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + xo + j];
-                }
-                xo += 8;
+                sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + ib32 * 32 + lane];
             }
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_iq2_xs(
@@ -1573,36 +1587,45 @@ __kernel void ggml_gemv_iq2_xs(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 74;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int l = lane >> 3;
+    int j = lane & 7;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + (long)row * row_bytes + bi * 74;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 2;
-        __global const uchar* scales = block + 66;
-        int x_base = bi * 256;
-        int xo = 0;
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            float db0 = d * (0.5f + (float)(scales[ib32] & 0x0f)) * 0.25f;
-            float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
-            for (int l = 0; l < 4; l++) {
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off;
+        int blocks = N / 256;
+        int row_bytes = blocks * 74;
+        __global const uchar* rowp = wbase + (long)row * row_bytes;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = rowp + bi * 74;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            __global const uchar* qs = block + 2;
+            __global const uchar* scales = block + 66;
+            int x_base = bi * 256;
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                float db0 = d * (0.5f + (float)(scales[ib32] & 0x0f)) * 0.25f;
+                float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+                float db = (l < 2) ? db0 : db1;
                 ushort q = (ushort)qs[8*ib32 + 2*l] | ((ushort)qs[8*ib32 + 2*l + 1] << 8);
                 ulong gu = hayai_iq2xs_grid[q & 511];
                 uchar signs = hayai_ksigns_iq2xs[q >> 9];
-                float db = (l < 2) ? db0 : db1;
-                for (int j = 0; j < 8; j++) {
-                    sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + xo + j];
-                }
-                xo += 8;
+                sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + ib32 * 32 + lane];
             }
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_iq2_s(
@@ -1612,42 +1635,47 @@ __kernel void ggml_gemv_iq2_s(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 82;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int l = lane >> 3;
+    int j = lane & 7;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + (long)row * row_bytes + bi * 82;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 2;
-        __global const uchar* signs_all = block + 34;
-        __global const uchar* qh = block + 66;
-        __global const uchar* scales = block + 74;
-        int x_base = bi * 256;
-        int xo = 0;
-        int qoff = 0;
-        int soff = 0;
-        for (int ib32 = 0; ib32 < 8; ib32++) {
-            float db0 = d * (0.5f + (float)(scales[ib32] & 0x0f)) * 0.25f;
-            float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
-            for (int l = 0; l < 4; l++) {
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off;
+        int blocks = N / 256;
+        int row_bytes = blocks * 82;
+        __global const uchar* rowp = wbase + (long)row * row_bytes;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = rowp + bi * 82;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            __global const uchar* qs = block + 2;
+            __global const uchar* signs_all = block + 34;
+            __global const uchar* qh = block + 66;
+            __global const uchar* scales = block + 74;
+            int x_base = bi * 256;
+            for (int ib32 = 0; ib32 < 8; ib32++) {
+                float db0 = d * (0.5f + (float)(scales[ib32] & 0x0f)) * 0.25f;
+                float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
                 float db = (l < 2) ? db0 : db1;
-                int idx = (int)qs[qoff + l] | ((((int)qh[ib32]) << (8 - 2*l)) & 0x300);
+                int idx = (int)qs[4*ib32 + l] | ((((int)qh[ib32]) << (8 - 2*l)) & 0x300);
                 ulong gu = hayai_iq2s_grid[idx];
-                uchar signs = signs_all[soff + l];
-                for (int j = 0; j < 8; j++) {
-                    sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + xo + j];
-                }
-                xo += 8;
+                uchar signs = signs_all[4*ib32 + l];
+                sum += hayai_iq2_signed(db, hayai_grid8_byte(gu, j), signs, j) * input[x_base + ib32 * 32 + lane];
             }
-            qoff += 4;
-            soff += 4;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 // BF16: high 16 bits of an IEEE-754 float32.

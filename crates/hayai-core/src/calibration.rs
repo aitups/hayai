@@ -348,7 +348,10 @@ pub fn calibrate_fresh(pool: &OpenClDevicePool, disk_path: Option<&Path>) -> HwP
         // Diagnostic (HAYAI_CALIB_QUANTS=1): per-quant resident GEMV rates, to decide
         // which kernels are actually far from memory-bound before rewriting them.
         if std::env::var_os("HAYAI_CALIB_QUANTS").is_some() {
-            for q in ["q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q5_k", "q6_k", "f32"] {
+            for q in [
+                "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q5_k", "q6_k", "q2_k", "q3_k", "f32",
+                "iq4_nl", "iq4_xs", "iq3_xxs", "iq3_s", "iq2_xxs", "iq2_xs", "iq2_s",
+            ] {
                 if let Ok(bw) = e.bench_resident_gemv_quant_gbytes_s(q, 8192, 4096) {
                     if bw > 0.0 {
                         tracing::info!(

@@ -35,6 +35,8 @@ pub(crate) fn gemv_split(label: &str) -> usize {
         "q4_k" => 32,
         "q5_k" => 32,
         "iq4_nl" | "iq4_xs" => 32,
+        "iq3_xxs" | "iq3_s" => 32,
+        "iq2_xxs" | "iq2_xs" | "iq2_s" => 32,
         "q8_1" => 32,
         "q2_k" => 32,
         "q3_k" => 32,
