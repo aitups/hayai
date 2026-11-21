@@ -157,36 +157,27 @@ impl GgufCatalog {
 
     /// Read increasing prefixes from offset 0 until the GGUF header parses.
     fn parse_header_from_start(io: &mut dyn WeightIo) -> Result<crate::gguf::GgufHeader, GgufError> {
-        let mut size = 256usize;
+        // Audit D.2.4: read the header **progressively** (only the new tail each step)
+        // instead of re-reading from offset 0 on every doubling (~15 times for an 11 MiB
+        // header).
+        const CAP: usize = 64 << 20;
+        let file_len = io.file_size() as usize;
+        let mut size = 4096usize;
+        let mut buf: Vec<u8> = Vec::new();
         loop {
-            let mut buf = vec![0u8; size];
-            match io.read_at(0, &mut buf) {
-                Ok(()) => match parse_header_bytes(&buf) {
-                    Ok(h) => return Ok(h),
-                    Err(GgufError::Truncated(_)) if size < 64 << 20 => {
-                        size = (size.saturating_mul(2)).min(64 << 20);
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Exact read of `size` failed — file is shorter. The doubling
-                    // loop can oscillate forever between `Truncated` (parse of
-                    // size/2) and EOF (read of size) when the file length lands
-                    // between two powers of two. Resolve deterministically by
-                    // reading the file's exact length (capped at the header cap).
-                    if size <= 64 {
-                        return Err(GgufError::Truncated("EOF before GGUF header complete"));
-                    }
-                    let file_len = std::fs::metadata(io.path())
-                        .map(|m| m.len() as usize)
-                        .unwrap_or(size / 2);
-                    let exact = file_len.clamp(64, 64 << 20).min(size - 1);
-                    let mut exact_buf = vec![0u8; exact];
-                    io.read_at(0, &mut exact_buf).map_err(GgufError::from)?;
-                    return parse_header_bytes(&exact_buf);
+            let target = size.min(file_len.max(64));
+            if buf.len() < target {
+                let old = buf.len();
+                buf.resize(target, 0);
+                io.read_at(old as u64, &mut buf[old..])?;
+            }
+            match parse_header_bytes(&buf) {
+                Ok(h) => return Ok(h),
+                Err(GgufError::Truncated(_)) if target < file_len.min(CAP) => {
+                    size = size.saturating_mul(2).min(CAP);
+                    continue;
                 }
-                Err(e) => return Err(GgufError::from(e)),
+                Err(e) => return Err(e),
             }
         }
     }
