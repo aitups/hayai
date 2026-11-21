@@ -1730,24 +1730,37 @@ __kernel void ggml_gemv_q8_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    int blocks = N / 256;
-    int row_bytes = blocks * 292;
-    __global const uchar* wbase = weights + weight_off + (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + bi * 292;
-        uint db = (uint)block[0] | ((uint)block[1] << 8) | ((uint)block[2] << 16) | ((uint)block[3] << 24);
-        float d = as_float(db);
-        __global const uchar* qs = block + 4;
-        int x_base = bi * 256;
-        for (int j = 0; j < 256; j++) {
-            sum += (float)((char)qs[j]) * d * input[x_base + j];
+    if (row < M) {
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 292;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 292;
+            uint db = (uint)block[0] | ((uint)block[1] << 8) | ((uint)block[2] << 16)
+                | ((uint)block[3] << 24);
+            float d = as_float(db);
+            __global const uchar* qs = block + 4;
+            int x_base = bi * 256;
+            for (int k = 0; k < 8; k++) {
+                int j = lane + k * 32;
+                sum += (float)((char)qs[j]) * d * input[x_base + j];
+            }
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 
