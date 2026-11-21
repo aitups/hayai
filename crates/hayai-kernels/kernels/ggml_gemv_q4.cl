@@ -107,44 +107,34 @@ __kernel void ggml_gemv_q4_1(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 32;
-    int row_bytes = blocks * 20;
+    // Warp-striped: one warp per row, lane `l` reads qs[l&15] of each 20-byte block.
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int t0 = 0; t0 < N; t0 += HAYAI_X_TILE) {
-        int ntile = min(HAYAI_X_TILE, N - t0);
-        hayai_load_input_tile(t0, ntile, input, local_input);
-        if (row < M) {
-            int b0 = t0 / 32;
-            int b1 = (t0 + ntile) / 32;
-            long row_base = (long)row * row_bytes;
-            for (int b = b0; b < b1; b++) {
-                long base = row_base + b * 20;
-                ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
-                ushort hm = (ushort)wbase[base + 2] | ((ushort)wbase[base + 3] << 8);
-                float d = hayai_half_bits_to_float(hd);
-                float m = hayai_half_bits_to_float(hm);
-                int x_base = b * 32 - t0;
-                // Vectorized loads (vload8 tolerates the 20-byte unaligned GGML block).
-                union { uchar8 v; uchar a[8]; } q0u, q1u;
-                q0u.v = vload8(0, &wbase[base + 4]);
-                q1u.v = vload8(0, &wbase[base + 12]);
-                for (int j = 0; j < 8; j++) {
-                    float a0 = (float)(q0u.a[j] & 0x0F) * d + m;
-                    float a1 = (float)(q0u.a[j] >> 4) * d + m;
-                    float a2 = (float)(q1u.a[j] & 0x0F) * d + m;
-                    float a3 = (float)(q1u.a[j] >> 4) * d + m;
-                    sum += a0 * local_input[x_base + j];
-                    sum += a1 * local_input[x_base + j + 16];
-                    sum += a2 * local_input[x_base + j + 8];
-                    sum += a3 * local_input[x_base + j + 24];
-                }
-            }
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 20;
+        for (int b = 0; b < blocks; b++) {
+            __global const uchar* block = wbase + b * 20;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            float m = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
+            uchar qs = block[4 + (lane & 15)];
+            int v = (lane < 16) ? (qs & 0x0F) : (qs >> 4);
+            sum += ((float)v * d + m) * input[b * 32 + lane];
         }
-        barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (row < M) output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q8_0(
@@ -193,32 +183,35 @@ __kernel void ggml_gemv_q5_0(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 32;
-    int row_bytes = blocks * 22;
-    long row_base = (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int b = 0; b < blocks; b++) {
-        long base = row_base + b * 22;
-        ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
-        float d = hayai_half_bits_to_float(hd);
-        uint qh = (uint)wbase[base + 2] | ((uint)wbase[base + 3] << 8)
-                | ((uint)wbase[base + 4] << 16) | ((uint)wbase[base + 5] << 24);
-        int x_base = b * 32;
-        for (int j = 0; j < 16; j++) {
-            uint xh_0 = ((qh >> j) << 4) & 0x10u;
-            uint xh_1 = (qh >> (j + 12)) & 0x10u;
-            uchar qs = wbase[base + 6 + j];
-            int x0 = (int)((qs & 0x0Fu) | xh_0) - 16;
-            int x1 = (int)((qs >> 4) | xh_1) - 16;
-            sum += (float)x0 * d * input[x_base + j];
-            sum += (float)x1 * d * input[x_base + j + 16];
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 22;
+        for (int b = 0; b < blocks; b++) {
+            __global const uchar* block = wbase + b * 22;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            uint qh = (uint)block[2] | ((uint)block[3] << 8) | ((uint)block[4] << 16)
+                | ((uint)block[5] << 24);
+            uchar qs = block[6 + (lane & 15)];
+            int v = (lane < 16) ? (qs & 0x0F) : (qs >> 4);
+            int val = (v | ((int)((qh >> lane) & 1u) << 4)) - 16;
+            sum += d * (float)val * input[b * 32 + lane];
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q5_1(
@@ -230,34 +223,36 @@ __kernel void ggml_gemv_q5_1(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 32;
-    int row_bytes = blocks * 24;
-    long row_base = (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int b = 0; b < blocks; b++) {
-        long base = row_base + b * 24;
-        ushort hd = (ushort)wbase[base] | ((ushort)wbase[base + 1] << 8);
-        ushort hm = (ushort)wbase[base + 2] | ((ushort)wbase[base + 3] << 8);
-        float d = hayai_half_bits_to_float(hd);
-        float m = hayai_half_bits_to_float(hm);
-        uint qh = (uint)wbase[base + 4] | ((uint)wbase[base + 5] << 8)
-                | ((uint)wbase[base + 6] << 16) | ((uint)wbase[base + 7] << 24);
-        int x_base = b * 32;
-        for (int j = 0; j < 16; j++) {
-            uint xh_0 = ((qh >> j) << 4) & 0x10u;
-            uint xh_1 = (qh >> (j + 12)) & 0x10u;
-            uchar qs = wbase[base + 8 + j];
-            int x0 = (int)((qs & 0x0Fu) | xh_0);
-            int x1 = (int)((qs >> 4) | xh_1);
-            sum += ((float)x0 * d + m) * input[x_base + j];
-            sum += ((float)x1 * d + m) * input[x_base + j + 16];
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 24;
+        for (int b = 0; b < blocks; b++) {
+            __global const uchar* block = wbase + b * 24;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            float m = hayai_half_bits_to_float((ushort)block[2] | ((ushort)block[3] << 8));
+            uint qh = (uint)block[4] | ((uint)block[5] << 8) | ((uint)block[6] << 16)
+                | ((uint)block[7] << 24);
+            uchar qs = block[8 + (lane & 15)];
+            int v = (lane < 16) ? (qs & 0x0F) : (qs >> 4);
+            int val = v | ((int)((qh >> lane) & 1u) << 4);
+            sum += ((float)val * d + m) * input[b * 32 + lane];
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 inline void hayai_get_scale_min_k4(int j, __global const uchar* scales, uchar* sc, uchar* m) {
@@ -521,16 +516,29 @@ __kernel void ggml_gemv_f16(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
+    // Warp-striped: lane reads f16 element `c = lane, lane+32, ...` (contiguous per step).
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int c = 0; c < N; c++) {
-        ushort hd = (ushort)wbase[c * 2] | ((ushort)wbase[c * 2 + 1] << 8);
-        sum += hayai_half_bits_to_float(hd) * input[c];
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
+        for (int c = lane; c < N; c += 32) {
+            ushort hd = (ushort)wbase[c * 2] | ((ushort)wbase[c * 2 + 1] << 8);
+            sum += hayai_half_bits_to_float(hd) * input[c];
+        }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q2_k(
@@ -1627,16 +1635,28 @@ __kernel void ggml_gemv_bf16(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int c = 0; c < N; c++) {
-        uint bits = (uint)wbase[c * 2] | ((uint)wbase[c * 2 + 1] << 8);
-        sum += as_float(bits << 16) * input[c];
+    if (row < M) {
+        __global const uchar* wbase = weights + weight_off + (long)row * N * 2;
+        for (int c = lane; c < N; c += 32) {
+            uint bits = (uint)wbase[c * 2] | ((uint)wbase[c * 2 + 1] << 8);
+            sum += as_float(bits << 16) * input[c];
+        }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 // Q8_1: block = { half d; half s; int8 qs[32] } = 36 bytes / 32 elems.
