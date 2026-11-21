@@ -550,47 +550,47 @@ __kernel void ggml_gemv_q2_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 84;
-    long row_base = (long)row * row_bytes;
+    // Warp-striped: one warp per row, lane `l` = weight `l` of each 32-weight shift
+    // (16 low + 16 high sub-halves); q/scales reads are contiguous across the warp.
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row_base + bi * 84;
-        __global const uchar* scales = block;
-        __global const uchar* q = block + 16;
-        float d = hayai_half_bits_to_float((ushort)block[80] | ((ushort)block[81] << 8));
-        float minv = hayai_half_bits_to_float((ushort)block[82] | ((ushort)block[83] << 8));
-        int x_base = bi * 256;
-        int xo = 0;
-        int is = 0;
-        int qo = 0;
-        for (int part = 0; part < 2; part++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                uchar sc = scales[is++];
-                float dl = d * (float)(sc & 0xF);
-                float ml = minv * (float)(sc >> 4);
-                for (int l = 0; l < 16; l++) {
-                    sum += (dl * (float)((q[qo + l] >> shift) & 3) - ml) * input[x_base + xo + l];
+    if (row < M) {
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 84;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 84;
+            __global const uchar* scales = block;
+            __global const uchar* q = block + 16;
+            float d = hayai_half_bits_to_float((ushort)block[80] | ((ushort)block[81] << 8));
+            float minv = hayai_half_bits_to_float((ushort)block[82] | ((ushort)block[83] << 8));
+            int x_base = bi * 256;
+            for (int part = 0; part < 2; part++) {
+                int qo = part * 32;
+                for (int j = 0; j < 4; j++) {
+                    int is_low = part * 8 + 2 * j;
+                    uchar sc = (lane < 16) ? scales[is_low] : scales[is_low + 1];
+                    float dl = d * (float)(sc & 0x0F);
+                    float ml = minv * (float)(sc >> 4);
+                    int v = (q[qo + lane] >> (2 * j)) & 3;
+                    int w = x_base + part * 128 + j * 32 + lane;
+                    sum += (dl * (float)v - ml) * input[w];
                 }
-                xo += 16;
-                sc = scales[is++];
-                dl = d * (float)(sc & 0xF);
-                ml = minv * (float)(sc >> 4);
-                for (int l = 0; l < 16; l++) {
-                    sum += (dl * (float)((q[qo + 16 + l] >> shift) & 3) - ml) * input[x_base + xo + l];
-                }
-                xo += 16;
-                shift += 2;
             }
-            qo += 32;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q3_k(
@@ -602,64 +602,74 @@ __kernel void ggml_gemv_q3_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 110;
-    long row_base = (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    const uint kmask1 = 0x03030303u;
-    const uint kmask2 = 0x0f0f0f0fu;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row_base + bi * 110;
-        __global const uchar* hmask = block;
-        __global const uchar* q = block + 32;
-        uint aux0 = (uint)block[96] | ((uint)block[97] << 8) | ((uint)block[98] << 16) | ((uint)block[99] << 24);
-        uint aux1 = (uint)block[100] | ((uint)block[101] << 8) | ((uint)block[102] << 16) | ((uint)block[103] << 24);
-        uint tmp = (uint)block[104] | ((uint)block[105] << 8) | ((uint)block[106] << 16) | ((uint)block[107] << 24);
-        uint aux2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-        uint aux3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-        aux0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
-        aux1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        char scales[16];
-        scales[0] = (char)(aux0 & 0xFF); scales[1] = (char)((aux0 >> 8) & 0xFF);
-        scales[2] = (char)((aux0 >> 16) & 0xFF); scales[3] = (char)((aux0 >> 24) & 0xFF);
-        scales[4] = (char)(aux1 & 0xFF); scales[5] = (char)((aux1 >> 8) & 0xFF);
-        scales[6] = (char)((aux1 >> 16) & 0xFF); scales[7] = (char)((aux1 >> 24) & 0xFF);
-        scales[8] = (char)(aux2 & 0xFF); scales[9] = (char)((aux2 >> 8) & 0xFF);
-        scales[10] = (char)((aux2 >> 16) & 0xFF); scales[11] = (char)((aux2 >> 24) & 0xFF);
-        scales[12] = (char)(aux3 & 0xFF); scales[13] = (char)((aux3 >> 8) & 0xFF);
-        scales[14] = (char)((aux3 >> 16) & 0xFF); scales[15] = (char)((aux3 >> 24) & 0xFF);
-        float d_all = hayai_half_bits_to_float((ushort)block[108] | ((ushort)block[109] << 8));
-        int x_base = bi * 256;
-        int xo = 0;
-        int is = 0;
-        int qo = 0;
-        uchar m = 1;
-        for (int part = 0; part < 2; part++) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                float dl = d_all * (float)((int)scales[is++] - 32);
-                for (int l = 0; l < 16; l++) {
-                    int qv = (int)((q[qo + l] >> shift) & 3) - ((hmask[l] & m) ? 0 : 4);
-                    sum += dl * (float)qv * input[x_base + xo + l];
+    if (row < M) {
+        const uint kmask1 = 0x03030303u;
+        const uint kmask2 = 0x0f0f0f0fu;
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 110;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 110;
+            __global const uchar* hmask = block;
+            __global const uchar* q = block + 32;
+            uint aux0 = (uint)block[96] | ((uint)block[97] << 8) | ((uint)block[98] << 16)
+                | ((uint)block[99] << 24);
+            uint aux1 = (uint)block[100] | ((uint)block[101] << 8) | ((uint)block[102] << 16)
+                | ((uint)block[103] << 24);
+            uint tmp = (uint)block[104] | ((uint)block[105] << 8) | ((uint)block[106] << 16)
+                | ((uint)block[107] << 24);
+            uint aux2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            uint aux3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            char scales[16];
+            scales[0] = (char)(aux0 & 0xFF);
+            scales[1] = (char)((aux0 >> 8) & 0xFF);
+            scales[2] = (char)((aux0 >> 16) & 0xFF);
+            scales[3] = (char)((aux0 >> 24) & 0xFF);
+            scales[4] = (char)(aux1 & 0xFF);
+            scales[5] = (char)((aux1 >> 8) & 0xFF);
+            scales[6] = (char)((aux1 >> 16) & 0xFF);
+            scales[7] = (char)((aux1 >> 24) & 0xFF);
+            scales[8] = (char)(aux2 & 0xFF);
+            scales[9] = (char)((aux2 >> 8) & 0xFF);
+            scales[10] = (char)((aux2 >> 16) & 0xFF);
+            scales[11] = (char)((aux2 >> 24) & 0xFF);
+            scales[12] = (char)(aux3 & 0xFF);
+            scales[13] = (char)((aux3 >> 8) & 0xFF);
+            scales[14] = (char)((aux3 >> 16) & 0xFF);
+            scales[15] = (char)((aux3 >> 24) & 0xFF);
+            float d_all = hayai_half_bits_to_float((ushort)block[108] | ((ushort)block[109] << 8));
+            int x_base = bi * 256;
+            for (int part = 0; part < 2; part++) {
+                int qo = part * 32;
+                for (int j = 0; j < 4; j++) {
+                    int is_low = part * 8 + 2 * j;
+                    int scv = (lane < 16) ? (int)scales[is_low] : (int)scales[is_low + 1];
+                    float dl = d_all * (float)(scv - 32);
+                    uchar mb = (uchar)(1u << (part * 4 + j));
+                    int qv = (int)((q[qo + lane] >> (2 * j)) & 3)
+                        - ((hmask[lane] & mb) ? 0 : 4);
+                    int w = x_base + part * 128 + j * 32 + lane;
+                    sum += dl * (float)qv * input[w];
                 }
-                xo += 16;
-                dl = d_all * (float)((int)scales[is++] - 32);
-                for (int l = 0; l < 16; l++) {
-                    int qv = (int)((q[qo + 16 + l] >> shift) & 3) - ((hmask[l + 16] & m) ? 0 : 4);
-                    sum += dl * (float)qv * input[x_base + xo + l];
-                }
-                xo += 16;
-                shift += 2;
-                m <<= 1;
             }
-            qo += 32;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 __kernel void ggml_gemv_q5_k(
@@ -1684,23 +1694,30 @@ __kernel void ggml_gemv_q8_1(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    int blocks = N / 32;
-    int row_bytes = blocks * 36;
-    __global const uchar* wbase = weights + weight_off + (long)row * row_bytes;
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + bi * 36;
-        float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
-        __global const uchar* qs = block + 4;
-        int x_base = bi * 32;
-        for (int j = 0; j < 32; j++) {
-            sum += (float)((char)qs[j]) * d * input[x_base + j];
+    if (row < M) {
+        int blocks = N / 32;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 36;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 36;
+            float d = hayai_half_bits_to_float((ushort)block[0] | ((ushort)block[1] << 8));
+            sum += d * (float)((char)block[4 + lane]) * input[bi * 32 + lane];
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 // Q8_K: block = { float d; int8 qs[256]; int16 bsums[16] } = 292 bytes / 256 elems.
