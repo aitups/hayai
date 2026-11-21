@@ -66,6 +66,7 @@ pub fn generate_text(
     let sampler = params.sampler();
     let mut session = GenerationSession::start(
         &handle.path,
+        handle.tokenizer.clone(),
         handle.sinks,
         handle.window,
         handle.memory_strategy,

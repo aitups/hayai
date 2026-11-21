@@ -476,7 +476,7 @@ fn cmd_mtp_probe(
     let cat = hayai_model::GgufCatalog::open(&model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     drop(cat);
-    let mut gen = StreamingGenerator::open(&model, tokenizer, 4, 128, SamplerConfig::Greedy, 42)?;
+    let mut gen = StreamingGenerator::open(&model, std::sync::Arc::new(tokenizer), 4, 128, SamplerConfig::Greedy, 42)?;
     let mtp = gen
         .mtp_layer()
         .ok_or_else(|| anyhow::anyhow!("{} has no NextN/MTP block", model.display()))?;
@@ -1155,7 +1155,7 @@ fn cmd_generate(
     let cat = hayai_model::GgufCatalog::open(&model)?;
     let tokenizer = Tokenizer::from_catalog(&cat)?;
     drop(cat);
-    let mut gen = StreamingGenerator::open(&model, tokenizer, sinks, window, sampler, seed)?;
+    let mut gen = StreamingGenerator::open(&model, std::sync::Arc::new(tokenizer), sinks, window, sampler, seed)?;
     gen.penalties = penalties;
     if let Some(gpath) = &grammar {
         let src = std::fs::read_to_string(gpath)
@@ -1323,7 +1323,7 @@ fn cmd_bench_generate(
     drop(cat);
     let mut gen = StreamingGenerator::open(
         &model,
-        tokenizer,
+        std::sync::Arc::new(tokenizer),
         sinks,
         window,
         SamplerConfig::Greedy,
@@ -1472,4 +1472,5 @@ fn cmd_bench_generate(
     println!("  Compare: scripts/bench_compare.sh|.ps1 (tok/s + e2e + memory vs llama.cpp)");
     Ok(())
 }
+
 

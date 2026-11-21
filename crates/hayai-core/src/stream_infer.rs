@@ -409,7 +409,7 @@ pub struct StreamingGenerator {
     pub catalog: GgufCatalog,
     pub path: PathBuf,
     pub config: ModelConfig,
-    pub tokenizer: Tokenizer,
+    pub tokenizer: Arc<Tokenizer>,
     pub attn_cfg: AttentionConfig,
     pub kv: Vec<LayerKvCache>,
     pub(crate) layer_norms: Vec<LayerNorms>,
@@ -766,7 +766,7 @@ impl StreamingGenerator {
 
     pub fn open(
         path: impl AsRef<std::path::Path>,
-        tokenizer: Tokenizer,
+        tokenizer: Arc<Tokenizer>,
         sink: usize,
         window: usize,
         sampler: SamplerConfig,
@@ -4652,7 +4652,7 @@ mod tests {
         let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
         let gen = StreamingGenerator::open(
             &path,
-            tok,
+            Arc::new(tok),
             4,
             128,
             hayai_model::SamplerConfig::Greedy,
@@ -4720,7 +4720,7 @@ mod tests {
         let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
         let mut gen = StreamingGenerator::open(
             &path,
-            tok,
+            Arc::new(tok),
             4,
             128,
             hayai_model::SamplerConfig::Greedy,
@@ -4838,7 +4838,7 @@ mod tests {
         let meta = cat.metadata.clone();
         let tok = hayai_model::Tokenizer::from_metadata(&meta).unwrap();
         let gen =
-            StreamingGenerator::open(&path, tok, 4, 128, hayai_model::SamplerConfig::Greedy, 42)
+            StreamingGenerator::open(&path, Arc::new(tok), 4, 128, hayai_model::SamplerConfig::Greedy, 42)
                 .unwrap();
         assert_eq!(gen.model_kind(), ModelKind::Dense);
         let _ = std::fs::remove_file(&path);
@@ -4883,6 +4883,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+
 
 
 

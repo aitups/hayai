@@ -67,7 +67,7 @@ fn decode_meets_hardware_slo_and_plan_is_present() {
         let cat = GgufCatalog::open(path).expect("open gguf");
         let tokenizer = Tokenizer::from_catalog(&cat).expect("tokenizer");
         drop(cat);
-        let mut gen = StreamingGenerator::open(path, tokenizer, 4, 128, SamplerConfig::Greedy, 42)
+        let mut gen = StreamingGenerator::open(path, std::sync::Arc::new(tokenizer), 4, 128, SamplerConfig::Greedy, 42)
             .expect("open generator");
         gen.set_memory_strategy(MemoryStrategy::parse("auto"));
         let mut orch =
@@ -115,3 +115,4 @@ fn decode_meets_hardware_slo_and_plan_is_present() {
     }
     assert!(failures.is_empty(), "SLO gate failed:\n{}", failures.join("\n"));
 }
+

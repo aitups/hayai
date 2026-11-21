@@ -8,7 +8,7 @@
 use crate::adaptive_window::MemoryStrategy;
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{StreamInferError, StreamingGenerator};
-use hayai_model::{Grammar, GrammarState, GgufCatalog, Penalties, SamplerConfig, Tokenizer};
+use hayai_model::{Grammar, GrammarState, Penalties, SamplerConfig, Tokenizer};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,7 @@ impl GenerationSession {
     /// `orch` must already be initialized with this model's [`crate::orchestrator::ExecutionMode`].
     pub fn start(
         model: impl AsRef<Path>,
+        tokenizer: Arc<Tokenizer>,
         sinks: usize,
         window: usize,
         memory_strategy: MemoryStrategy,
@@ -41,9 +42,8 @@ impl GenerationSession {
         orch: Arc<Mutex<EngineOrchestrator>>,
     ) -> Result<Self, StreamInferError> {
         let path = model.as_ref();
-        let cat = GgufCatalog::open(path)?;
-        let tokenizer = Tokenizer::from_catalog(&cat)?;
-        drop(cat);
+        // Reuse the model's shared tokenizer (audit D.2.3) instead of re-opening the GGUF
+        // and rebuilding it per request: `StreamingGenerator::open` opens the catalog once.
         let mut gen = StreamingGenerator::open(path, tokenizer, sinks, window, sampler, seed)?;
         gen.set_memory_strategy(memory_strategy);
         let mut guard = orch.lock().unwrap_or_else(|e| e.into_inner());
