@@ -119,9 +119,86 @@ pub fn apply_rope_partial_factors_scaled(
     }
 }
 
+/// Precompute the NeoX RoPE `(cos, sin)` table for one position. The table is
+/// **head-independent**, so the attention step builds it once and applies it to every Q
+/// and KV head (audit C.3.3 — was recomputing `powf`/`sin`/`cos` per head per layer).
+pub fn rope_cos_sin_table(
+    position: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    base_freq: f32,
+    freq_factors: Option<&[f32]>,
+    rope: RopeScaling,
+) -> Vec<(f32, f32)> {
+    let rd = rope_dim.min(head_dim);
+    if rd < 2 {
+        return Vec::new();
+    }
+    let half_dim = rd / 2;
+    let mut table = Vec::with_capacity(half_dim);
+    let freq_at = |i: usize| -> f32 {
+        let mut freq = 1.0 / base_freq.powf((2 * i) as f32 / rd as f32);
+        if let Some(ff) = freq_factors.and_then(|f| f.get(i)).copied() {
+            if ff != 0.0 {
+                freq /= ff;
+            }
+        }
+        freq
+    };
+    if rope.is_none() {
+        for i in 0..half_dim {
+            let val = position as f32 * freq_at(i);
+            table.push((val.cos(), val.sin()));
+        }
+        return table;
+    }
+    let n_ctx_orig = rope.n_ctx_orig.max(1) as f32;
+    let corr = |beta: f32| -> f32 {
+        rd as f32 * (n_ctx_orig / (beta * 2.0 * std::f32::consts::PI)).ln()
+            / (2.0 * base_freq.ln())
+    };
+    let (corr_low, corr_high) = if rope.ext_factor != 0.0 {
+        (corr(rope.beta_fast).floor(), corr(rope.beta_slow).ceil())
+    } else {
+        (0.0, 0.0)
+    };
+    for i in 0..half_dim {
+        let freq = freq_at(i);
+        let theta_extrap = position as f32 * freq;
+        let theta_interp = rope.freq_scale * theta_extrap;
+        let mut theta = theta_interp;
+        let mut mscale = rope.attn_factor;
+        if rope.ext_factor != 0.0 {
+            let i0 = (2 * i) as f32;
+            let y = (i0 / 2.0 - corr_low) / (corr_high - corr_low).max(0.001);
+            let ramp = 1.0 - y.clamp(0.0, 1.0);
+            let ramp_mix = ramp * rope.ext_factor;
+            theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0 + 0.1 * (1.0 / rope.freq_scale).ln();
+        }
+        table.push((theta.cos() * mscale, theta.sin() * mscale));
+    }
+    table
+}
+
+/// Apply a precomputed `(cos, sin)` table to one head vector (see [`rope_cos_sin_table`]).
+pub fn apply_rope_table(vec: &mut [f32], head_dim: usize, rope_dim: usize, table: &[(f32, f32)]) {
+    let rd = rope_dim.min(head_dim);
+    if rd < 2 {
+        return;
+    }
+    let half_dim = rd / 2;
+    for i in 0..half_dim.min(table.len()) {
+        let (cos_val, sin_val) = table[i];
+        let v0 = vec[i];
+        let v1 = vec[i + half_dim];
+        vec[i] = v0 * cos_val - v1 * sin_val;
+        vec[i + half_dim] = v0 * sin_val + v1 * cos_val;
+    }
+}
+
 /// Numerically stable Softmax in-place.
-pub fn softmax(slice: &mut [f32]) {
-    if slice.is_empty() {
+pub fn softmax(slice: &mut [f32]) {    if slice.is_empty() {
         return;
     }
     let max_val = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -310,35 +387,32 @@ pub fn attention_decode_step_ex(
     // Skipped for learned-position (GPT-2) / ALiBi (BLOOM/Falcon/MPT) models and, per
     // layer, for Cohere2 NoPE (global) layers.
     let rd = cfg.rope_dim.max(1).min(cfg.head_dim);
-    if cfg.use_rope && apply_rope {
+    // One (cos, sin) table per position, applied to every Q and KV head.
+    let rope_table = if cfg.use_rope && apply_rope {
+        Some(rope_cos_sin_table(
+            position,
+            cfg.head_dim,
+            rd,
+            cfg.rope_theta,
+            freq_factors,
+            cfg.rope,
+        ))
+    } else {
+        None
+    };
+    if let Some(table) = &rope_table {
         for h in 0..cfg.num_heads {
             let s = h * cfg.head_dim;
-            apply_rope_partial_factors_scaled(
-                &mut q[s..s + cfg.head_dim],
-                position,
-                cfg.head_dim,
-                rd,
-                cfg.rope_theta,
-                freq_factors,
-                cfg.rope,
-            );
+            apply_rope_table(&mut q[s..s + cfg.head_dim], cfg.head_dim, rd, table);
         }
     }
     if write_kv {
         assert_eq!(k.len(), cfg.kv_dim());
         assert_eq!(v.len(), cfg.kv_dim());
-        if cfg.use_rope && apply_rope {
+        if let Some(table) = &rope_table {
             for h in 0..cfg.num_kv_heads {
                 let s = h * cfg.head_dim;
-                apply_rope_partial_factors_scaled(
-                    &mut k[s..s + cfg.head_dim],
-                    position,
-                    cfg.head_dim,
-                    rd,
-                    cfg.rope_theta,
-                    freq_factors,
-                    cfg.rope,
-                );
+                apply_rope_table(&mut k[s..s + cfg.head_dim], cfg.head_dim, rd, table);
             }
         }
         // Append K/V into INT8 cache (post-RoPE keys).
@@ -508,4 +582,5 @@ mod tests {
         assert!(err < 0.15, "INT8 attn too far from FP32: {err}");
     }
 }
+
 
