@@ -424,47 +424,54 @@ __kernel void ggml_gemv_q6_k(
     __global float* restrict output,
     __local float* restrict local_input
 ) {
-    int row = get_global_id(0);
-    hayai_wg_barrier(local_input);
-    if (row >= M) return;
-    __global const uchar* wbase = weights + weight_off;
-    int blocks = N / 256;
-    int row_bytes = blocks * 210;
-    long row_base = (long)row * row_bytes;
+    // Warp-striped: one warp per row, lane `l` handles the 4 weights (l, l+32, l+64,
+    // l+96) of each 128-weight half. ql/qh/scales reads are contiguous across the warp.
+    int lid = (int)get_local_id(0);
+    int gid = (int)get_global_id(0);
+    int lane = gid % 32;
+    int row = gid / 32;
+    int is = lane / 16;
     float sum = 0.0f;
-    for (int bi = 0; bi < blocks; bi++) {
-        __global const uchar* block = wbase + row_base + bi * 210;
-        __global const uchar* ql = block;
-        __global const uchar* qh = block + 128;
-        __global const char* scales = (__global const char*)(block + 192);
-        float d = hayai_half_bits_to_float((ushort)block[208] | ((ushort)block[209] << 8));
-        int x_base = bi * 256;
-        int qlo = 0;
-        int qho = 0;
-        int sco = 0;
-        for (int part = 0; part < 2; part++) {
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                int q1 = ((ql[qlo + l] & 0x0F) | (((qh[qho + l] >> 0) & 3) << 4)) - 32;
-                int q2 = ((ql[qlo + l + 32] & 0x0F) | (((qh[qho + l] >> 2) & 3) << 4)) - 32;
-                int q3 = ((ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4)) - 32;
-                int q4 = ((ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4)) - 32;
+    if (row < M) {
+        int blocks = N / 256;
+        __global const uchar* wbase = weights + weight_off + (long)row * blocks * 210;
+        for (int bi = 0; bi < blocks; bi++) {
+            __global const uchar* block = wbase + bi * 210;
+            __global const uchar* ql = block;
+            __global const uchar* qh = block + 128;
+            __global const char* scales = (__global const char*)(block + 192);
+            float d = hayai_half_bits_to_float((ushort)block[208] | ((ushort)block[209] << 8));
+            int x_base = bi * 256;
+            for (int part = 0; part < 2; part++) {
+                int qlo = part * 64;
+                int qho = part * 32;
+                int sco = part * 8;
+                int q1 = ((ql[qlo + lane] & 0x0F) | (((qh[qho + lane] >> 0) & 3) << 4)) - 32;
+                int q2 = ((ql[qlo + lane + 32] & 0x0F) | (((qh[qho + lane] >> 2) & 3) << 4)) - 32;
+                int q3 = ((ql[qlo + lane] >> 4) | (((qh[qho + lane] >> 4) & 3) << 4)) - 32;
+                int q4 = ((ql[qlo + lane + 32] >> 4) | (((qh[qho + lane] >> 6) & 3) << 4)) - 32;
                 float s0 = (float)scales[sco + is];
                 float s2 = (float)scales[sco + is + 2];
                 float s4 = (float)scales[sco + is + 4];
                 float s6 = (float)scales[sco + is + 6];
-                int xb = x_base + part * 128 + l;
+                int xb = x_base + part * 128 + lane;
                 sum += d * s0 * (float)q1 * input[xb];
                 sum += d * s2 * (float)q2 * input[xb + 32];
                 sum += d * s4 * (float)q3 * input[xb + 64];
                 sum += d * s6 * (float)q4 * input[xb + 96];
             }
-            qlo += 64;
-            qho += 32;
-            sco += 8;
         }
     }
-    output[row] = sum;
+    __local float red[HAYAI_WG_MAX];
+    red[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lane == 0 && row < M) {
+        float s = 0.0f;
+        for (int p = 0; p < 32; p++) {
+            s += red[lid + p];
+        }
+        output[row] = s;
+    }
 }
 
 // F32 GEMV, warp-striped for coalesced weight reads. The old one-WI-per-row version
