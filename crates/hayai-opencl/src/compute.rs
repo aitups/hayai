@@ -1,5 +1,5 @@
 use crate::context::{OpenClEngine, OpenClError};
-use opencl3::kernel::ExecuteKernel;
+use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl3::types::{cl_float, cl_int, cl_uchar, CL_BLOCKING, CL_NON_BLOCKING};
 use std::ptr;
@@ -46,6 +46,180 @@ pub(crate) fn gemv_split(label: &str) -> usize {
     }
 }
 
+/// Persistent activation buffers for the device-resident FFN fast path
+/// (`HAYAI_FFN_DEV=1`): the gate/up GEMVs write device buffers, `silu_mul` merges them
+/// on-device, and the down GEMV reads the result without a host round-trip.
+#[derive(Default)]
+pub struct FfnDevWorkspace {
+    xn: Option<Buffer<cl_float>>,
+    gate: Option<Buffer<cl_float>>,
+    up: Option<Buffer<cl_float>>,
+    out: Option<Buffer<cl_float>>,
+    cap_xn: usize,
+    cap_gate: usize,
+    cap_up: usize,
+    cap_out: usize,
+}
+
+fn ensure_dev_buf(
+    slot: &mut Option<Buffer<cl_float>>,
+    cap: &mut usize,
+    len: usize,
+    ctx: &opencl3::context::Context,
+) -> Result<(), OpenClError> {
+    let need = len.max(1);
+    if *cap < need {
+        *slot = Some(unsafe {
+            Buffer::<cl_float>::create(ctx, CL_MEM_READ_WRITE, need, ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("ffn dev buf: {e}")))?
+        });
+        *cap = need;
+    }
+    Ok(())
+}
+
+impl OpenClEngine {
+    /// GEMV with the activation already on a device buffer: reads `input_dev`, writes
+    /// `output_dev`, no host upload or readback. Weights come from a mirror/SVM bind.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ggml_gemv_dev_io(
+        &self,
+        kernel: &Kernel,
+        label: &str,
+        m: usize,
+        n: usize,
+        weights: GgmlWeightBind<'_>,
+        weight_off: usize,
+        input_dev: &Buffer<cl_float>,
+        output_dev: &Buffer<cl_float>,
+    ) -> Result<(), OpenClError> {
+        validate_gemv_shape(label, m, n)?;
+        let m_i = m as cl_int;
+        let n_i = n as cl_int;
+        let off_i = weight_off as i64;
+        let local = preferred_local_size(m, self.device_info.max_work_group_size);
+        let split = gemv_split(label);
+        let local = if split > 1 { (local / split * split).max(split) } else { local };
+        let global = ((m.saturating_mul(split) + local - 1) / local) * local;
+        unsafe {
+            let mut exec = ExecuteKernel::new(kernel);
+            exec.set_arg(&m_i).set_arg(&n_i).set_arg(&off_i);
+            let exec_ref = match weights {
+                GgmlWeightBind::Device(b) => exec.set_arg(b),
+                GgmlWeightBind::Svm(p) => exec.set_arg_svm(p),
+            };
+            exec_ref
+                .set_arg(input_dev)
+                .set_arg(output_dev)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue devio {label}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Upload the (already normed) FFN input once for the gate/up/down pipeline.
+    pub fn ffn_dev_upload_x(&self, xn: &[f32]) -> Result<(), OpenClError> {
+        let mut guard = self
+            .ffn_dev_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("ffn dev workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        ensure_dev_buf(&mut ws.xn, &mut ws.cap_xn, xn.len(), &self.context)?;
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(ws.xn.as_mut().unwrap(), CL_BLOCKING, 0, xn, &[])
+                .map_err(|e| OpenClError::ClError(format!("ffn dev upload: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `gate = Wg*x`, `up = Wu*x` (both from the resident `xn`), then `gate = silu(gate)*up`
+    /// on-device. Outputs stay on the device for the following down GEMV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_dev_gate_up(
+        &self,
+        gate_kernel: &Kernel,
+        gate_label: &str,
+        gate_m: usize,
+        gate_n: usize,
+        gate_bind: GgmlWeightBind<'_>,
+        gate_off: usize,
+        up_kernel: &Kernel,
+        up_label: &str,
+        up_m: usize,
+        up_n: usize,
+        up_bind: GgmlWeightBind<'_>,
+        up_off: usize,
+    ) -> Result<(), OpenClError> {
+        if gate_n != up_n || gate_m != up_m {
+            return Err(OpenClError::ClError("ffn dev gate/up shape mismatch".into()));
+        }
+        let mut guard = self
+            .ffn_dev_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("ffn dev workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        ensure_dev_buf(&mut ws.gate, &mut ws.cap_gate, gate_m, &self.context)?;
+        ensure_dev_buf(&mut ws.up, &mut ws.cap_up, up_m, &self.context)?;
+        if ws.xn.is_none() || ws.cap_xn < gate_n {
+            return Err(OpenClError::ClError("ffn dev: input not uploaded".into()));
+        }
+        self.ggml_gemv_dev_io(
+            gate_kernel, gate_label, gate_m, gate_n, gate_bind, gate_off,
+            ws.xn.as_ref().unwrap(), ws.gate.as_ref().unwrap(),
+        )?;
+        self.ggml_gemv_dev_io(
+            up_kernel, up_label, up_m, up_n, up_bind, up_off,
+            ws.xn.as_ref().unwrap(), ws.up.as_ref().unwrap(),
+        )?;
+        self.silu_mul_dev(
+            ws.gate.as_ref().unwrap(),
+            ws.up.as_ref().unwrap(),
+            ws.gate.as_ref().unwrap(),
+            gate_m,
+        )?;
+        Ok(())
+    }
+
+    /// `out = Wd * silu_mul(gate, up)` reading the device-resident merge buffer, then a
+    /// single host readback of `out`.
+    pub fn ffn_dev_down(
+        &self,
+        down_kernel: &Kernel,
+        down_label: &str,
+        down_m: usize,
+        down_n: usize,
+        down_bind: GgmlWeightBind<'_>,
+        down_off: usize,
+        out: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        if out.len() != down_m {
+            return Err(OpenClError::ClError("ffn dev down output shape mismatch".into()));
+        }
+        let mut guard = self
+            .ffn_dev_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("ffn dev workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        ensure_dev_buf(&mut ws.out, &mut ws.cap_out, down_m, &self.context)?;
+        let gate = ws
+            .gate
+            .as_ref()
+            .ok_or_else(|| OpenClError::ClError("ffn dev: gate buffer missing".into()))?;
+        self.ggml_gemv_dev_io(
+            down_kernel, down_label, down_m, down_n, down_bind, down_off,
+            gate, ws.out.as_ref().unwrap(),
+        )?;
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(ws.out.as_ref().unwrap(), CL_BLOCKING, 0, out, &[])
+                .map_err(|e| OpenClError::ClError(format!("ffn dev read out: {e}")))?;
+        }
+        Ok(())
+    }
+}
 impl OpenClEngine {
     /// Run Q4 LUT MatMul on the active OpenCL device and write results into `output`.
     ///
@@ -1759,6 +1933,83 @@ mod tests {
         assert!(
             max_abs_diff(&exp, &out_gpu) < 1e-3,
             "spmm_adj_batched_q4gpu mismatch"
+        );
+    }
+
+    #[test]
+    fn ffn_dev_pipeline_matches_host() {
+        use opencl3::memory::{Buffer, CL_MEM_READ_ONLY};
+        use opencl3::types::{cl_uchar, CL_BLOCKING};
+        use std::ptr;
+
+        let Some(eng) = init_engine_or_skip("ffn dev pipeline test") else {
+            return;
+        };
+        let (hidden, ffn) = (64usize, 96usize);
+        let x: Vec<f32> = (0..hidden).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.05).collect();
+        let wg: Vec<f32> = (0..ffn * hidden)
+            .map(|i| ((i * 3 % 11) as f32 - 5.0) * 0.01)
+            .collect();
+        let wu: Vec<f32> = (0..ffn * hidden)
+            .map(|i| ((i * 5 % 7) as f32 - 3.0) * 0.01)
+            .collect();
+        let wd: Vec<f32> = (0..hidden * ffn)
+            .map(|i| ((i * 7 % 5) as f32 - 2.0) * 0.01)
+            .collect();
+        let wbuf = |data: &[f32]| -> Buffer<cl_uchar> {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            let mut b = unsafe {
+                Buffer::<cl_uchar>::create(
+                    &eng.context,
+                    CL_MEM_READ_ONLY,
+                    bytes.len().max(1),
+                    ptr::null_mut(),
+                )
+                .unwrap()
+            };
+            unsafe {
+                eng.queue
+                    .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, bytes, &[])
+                    .unwrap();
+            }
+            b
+        };
+        let bg = wbuf(&wg);
+        let bu = wbuf(&wu);
+        let bd = wbuf(&wd);
+        let mut out = vec![0.0f32; hidden];
+        eng.ffn_dev_upload_x(&x).unwrap();
+        eng.ffn_dev_gate_up(
+            &eng.gemv_f32, "f32", ffn, hidden, super::GgmlWeightBind::Device(&bg), 0,
+            &eng.gemv_f32, "f32", ffn, hidden, super::GgmlWeightBind::Device(&bu), 0,
+        )
+        .unwrap();
+        eng.ffn_dev_down(
+            &eng.gemv_f32, "f32", hidden, ffn, super::GgmlWeightBind::Device(&bd), 0, &mut out,
+        )
+        .unwrap();
+
+        let mv = |w: &[f32], m: usize, n: usize, v: &[f32]| -> Vec<f32> {
+            (0..m)
+                .map(|r| (0..n).map(|c| w[r * n + c] * v[c]).sum::<f32>())
+                .collect()
+        };
+        let g = mv(&wg, ffn, hidden, &x);
+        let u = mv(&wu, ffn, hidden, &x);
+        let merged: Vec<f32> = (0..ffn)
+            .map(|i| (g[i] / (1.0 + (-g[i]).exp())) * u[i])
+            .collect();
+        let want = mv(&wd, hidden, ffn, &merged);
+        let err = out
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            err < 1e-3,
+            "ffn dev pipeline diff {err} on {}",
+            eng.device_info.device_name
         );
     }
 }

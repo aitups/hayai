@@ -384,6 +384,7 @@ fn forward_gemma_inner(
             Some(scratch),
             layer,
             Some(&layout),
+            false,
         )?;
         ffn_finish_gelu_scratch(
             orch,

@@ -2009,6 +2009,7 @@ impl StreamingGenerator {
                     scratch.as_deref(),
                     layer_idx,
                     Some(&layout),
+                    true,
                 )?)
             };
             self.ffn_secs += t_ffn_enq.elapsed().as_secs_f64();
@@ -2308,6 +2309,7 @@ impl StreamingGenerator {
                         Some(scratch),
                         layer,
                         Some(&layout),
+                        true,
                     )?;
                     ffn_finish_scratch(
                         orch,
@@ -3879,17 +3881,14 @@ pub(crate) fn begin_gemv_from_scratch(
 /// Synchronous GEMV from the layer's device mirror / owned SVM using persistent device
 /// buffers (no per-op `clCreateBuffer`, no host weight upload). Returns `Ok(false)`
 /// when there is no device binding for this layer, so the caller can host-upload.
-pub(crate) fn sync_gemv_from_scratch(
-    eng: &hayai_opencl::OpenClEngine,
-    m: &QuantMatrix,
-    xn: &[f32],
-    out: &mut [f32],
-    scratch: &hayai_opencl::StreamingScratch,
-    layer: usize,
-    tensor_off: usize,
-) -> Result<bool, StreamInferError> {
-    use hayai_opencl::{GgmlWeightBind, WeightBind};
-    let (kernel, label) = match m.ggml_type {
+/// OpenCL GEMV kernel + label for a GGML type, or `None` when no GPU kernel exists
+/// (CPU-only formats F64/I*/IQ1/TQ). Shared by the mirror bind and the device-resident
+/// FFN fast path.
+fn gemv_kernel_for<'a>(
+    eng: &'a hayai_opencl::OpenClEngine,
+    t: GgmlType,
+) -> Option<(&'a hayai_opencl::Kernel, &'static str)> {
+    Some(match t {
         GgmlType::Q4_0 => (&eng.gemv_q4_0, "q4_0"),
         GgmlType::Q4_1 => (&eng.gemv_q4_1, "q4_1"),
         GgmlType::Q8_0 => (&eng.gemv_q8_0, "q8_0"),
@@ -3912,12 +3911,26 @@ pub(crate) fn sync_gemv_from_scratch(
         GgmlType::BF16 => (&eng.gemv_bf16, "bf16"),
         GgmlType::Q8_1 => (&eng.gemv_q8_1, "q8_1"),
         GgmlType::Q8_K => (&eng.gemv_q8_k, "q8_k"),
-        other => {
-            return Err(StreamInferError::Msg(format!(
-                "OpenCL GEMV missing for {other:?} (no CPU fallback with GPU pool)"
-            )));
-        }
-    };
+        _ => return None,
+    })
+}
+
+pub(crate) fn sync_gemv_from_scratch(
+    eng: &hayai_opencl::OpenClEngine,
+    m: &QuantMatrix,
+    xn: &[f32],
+    out: &mut [f32],
+    scratch: &hayai_opencl::StreamingScratch,
+    layer: usize,
+    tensor_off: usize,
+) -> Result<bool, StreamInferError> {
+    use hayai_opencl::{GgmlWeightBind, WeightBind};
+    let (kernel, label) = gemv_kernel_for(eng, m.ggml_type).ok_or_else(|| {
+        StreamInferError::Msg(format!(
+            "OpenCL GEMV missing for {:?} (no CPU fallback with GPU pool)",
+            m.ggml_type
+        ))
+    })?;
     let woff = scratch.weight_offset(layer, tensor_off);
     // Only the ping-pong layout maps a device mirror to the same offsets the read uses.
     // In macro-chunk a layer sits at `(layer % block_k) * stride` and the per-role DMA
@@ -3943,11 +3956,113 @@ pub(crate) enum GateUpInflight {
         gate: Option<PendingGemv>,
         up: Option<PendingGemv>,
     },
+    /// `HAYAI_FFN_DEV=1`: gate/up were merged on-device; `ffn_finish_scratch` runs
+    /// `down` from the device buffer and reads back only the FFN output.
+    DeviceResident,
 }
 
 /// Device the planner assigned to `kind`; only falls back to the pool role map when the
 /// planner produced no placement (so the FFN never blindly round-robins onto a slow
 /// device — the whole layer's ops follow one measured cost model).
+/// Begin the device-resident FFN fast path (`HAYAI_FFN_DEV=1`) for one token/layer:
+/// upload the (normed) input once, run gate+up on the shared device mirror, and merge
+/// `silu(gate)*up` on-device. Returns `true` when the layer qualifies; the paired
+/// [`try_ffn_dev_finish`] then runs `down` from the device buffer.
+fn try_ffn_dev_begin(
+    orch: &EngineOrchestrator,
+    gate: &QuantMatrix,
+    up: &QuantMatrix,
+    xn: &[f32],
+    scratch: &hayai_opencl::StreamingScratch,
+    layer: usize,
+    layout: &hayai_model::LayerPackLayout,
+) -> Result<bool, StreamInferError> {
+    use crate::planner::ComputeTarget;
+    use hayai_opencl::WeightBind;
+    if scratch.block_k > 1 {
+        return Ok(false);
+    }
+    let dev = match (
+        orch.placed_target(LayerOpKind::FfnGate),
+        orch.placed_target(LayerOpKind::FfnUp),
+        orch.placed_target(LayerOpKind::FfnDown),
+    ) {
+        (
+            Some(ComputeTarget::Device(a)),
+            Some(ComputeTarget::Device(b)),
+            Some(ComputeTarget::Device(c)),
+        ) if a == b && b == c => a,
+        _ => return Ok(false),
+    };
+    let Some(eng) = orch.pool.engines.get(dev) else {
+        return Ok(false);
+    };
+    let (Some((gk, gl)), Some((uk, ul))) = (
+        gemv_kernel_for(eng, gate.ggml_type),
+        gemv_kernel_for(eng, up.ggml_type),
+    ) else {
+        return Ok(false);
+    };
+    if gate.ncols != xn.len() || up.ncols != xn.len() || gate.nrows != up.nrows {
+        return Ok(false);
+    }
+    let wg = scratch.weight_offset(layer, layout.gate_off);
+    let wu = scratch.weight_offset(layer, layout.up_off);
+    let bg = match scratch.weight_bind(eng, layer) {
+        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
+        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
+        Err(_) => return Ok(false),
+    };
+    let bu = match scratch.weight_bind(eng, layer) {
+        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
+        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
+        Err(_) => return Ok(false),
+    };
+    eng.ffn_dev_upload_x(xn)?;
+    eng.ffn_dev_gate_up(
+        gk, gl, gate.nrows, gate.ncols, bg, wg, uk, ul, up.nrows, up.ncols, bu, wu,
+    )?;
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::info!("FFN device-resident path active (gate→silu→down stay on-device)")
+    });
+    Ok(true)
+}
+
+/// Finish the device-resident FFN: `down` reads the merged device buffer and only the
+/// FFN output is read back.
+fn try_ffn_dev_finish(
+    orch: &EngineOrchestrator,
+    down: &QuantMatrix,
+    scratch: &hayai_opencl::StreamingScratch,
+    layer: usize,
+    layout: &hayai_model::LayerPackLayout,
+    down_out: &mut [f32],
+) -> Result<bool, StreamInferError> {
+    use crate::planner::ComputeTarget;
+    use hayai_opencl::WeightBind;
+    let dev = match orch.placed_target(LayerOpKind::FfnDown) {
+        Some(ComputeTarget::Device(i)) => i,
+        _ => return Ok(false),
+    };
+    let Some(eng) = orch.pool.engines.get(dev) else {
+        return Ok(false);
+    };
+    let Some((dk, dl)) = gemv_kernel_for(eng, down.ggml_type) else {
+        return Ok(false);
+    };
+    if down.nrows != down_out.len() {
+        return Ok(false);
+    }
+    let wd = scratch.weight_offset(layer, layout.down_off);
+    let bd = match scratch.weight_bind(eng, layer) {
+        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
+        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
+        Err(_) => return Ok(false),
+    };
+    eng.ffn_dev_down(dk, dl, down.nrows, down.ncols, bd, wd, down_out)?;
+    Ok(true)
+}
 fn ffn_device_for(
     orch: &EngineOrchestrator,
     kind: LayerOpKind,
@@ -3992,11 +4107,20 @@ pub(crate) fn ffn_begin_gate_up_scratch(
     scratch: Option<&hayai_opencl::StreamingScratch>,
     layer: usize,
     layout: Option<&hayai_model::LayerPackLayout>,
+    dev_resident_ok: bool,
 ) -> Result<GateUpInflight, StreamInferError> {
     if orch.pool.is_empty() {
         orch.execute_quant_gemv(gate, xn, gate_out)?;
         orch.execute_quant_gemv(up, xn, up_out)?;
         return Ok(GateUpInflight::Pending { gate: None, up: None });
+    }
+    if dev_resident_ok && std::env::var("HAYAI_FFN_DEV").ok().as_deref() == Some("1") {
+        if let (Some(sc), Some(lay)) = (scratch, layout) {
+            if try_ffn_dev_begin(orch, gate, up, xn, sc, layer, lay)? {
+                *used_dgpu = true;
+                return Ok(GateUpInflight::DeviceResident);
+            }
+        }
     }
     let (gate_off, up_off) = layout.map(|l| (l.gate_off, l.up_off)).unwrap_or((0, 0));
     let gate_eng = ffn_device_for(orch, LayerOpKind::FfnGate, 0);
@@ -4083,7 +4207,7 @@ pub(crate) fn ffn_finish_scratch(
     layer: usize,
     layout: Option<&hayai_model::LayerPackLayout>,
 ) -> Result<(), StreamInferError> {
-    match inflight {
+    let dev_resident = match inflight {
         GateUpInflight::Pending { gate, up } => {
             if let Some(g) = gate {
                 gate_out.copy_from_slice(&g.wait()?);
@@ -4091,18 +4215,37 @@ pub(crate) fn ffn_finish_scratch(
             if let Some(u) = up {
                 up_out.copy_from_slice(&u.wait()?);
             }
+            false
         }
-    }
-    if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+        GateUpInflight::DeviceResident => true,
+    };
+    if !dev_resident
+        && std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1")
+        && layer == 0
+    {
         eprintln!("PROD_GATE_PRE L0: {:?}", &gate_out[0..8]);
         eprintln!("PROD_UP_PRE L0: {:?}", &up_out[0..8]);
     }
 
 
     // Default: SiLU(gate) * up (LLaMA / Qwen). Gemma4 overrides via `ffn_finish_gelu`.
-    for i in 0..gate_out.len() {
-        let g = gate_out[i];
-        gate_out[i] = (g / (1.0 + (-g).exp())) * up_out[i];
+    if !dev_resident {
+        for i in 0..gate_out.len() {
+            let g = gate_out[i];
+            gate_out[i] = (g / (1.0 + (-g).exp())) * up_out[i];
+        }
+    } else {
+        let ok = match (scratch, layout) {
+            (Some(sc), Some(lay)) => try_ffn_dev_finish(orch, down, sc, layer, lay, down_out)?,
+            _ => false,
+        };
+        if !ok {
+            return Err(StreamInferError::Msg(
+                "ffn device-resident finish lost its device/layout".into(),
+            ));
+        }
+        *used_dgpu = true;
+        return Ok(());
     }
 
     if !orch.pool.is_empty() {
@@ -4145,6 +4288,11 @@ pub(crate) fn ffn_finish_gelu_scratch(
             if let Some(u) = up {
                 up_out.copy_from_slice(&u.wait()?);
             }
+        }
+        GateUpInflight::DeviceResident => {
+            return Err(StreamInferError::Msg(
+                "GELU FFN does not support the device-resident path".into(),
+            ));
         }
     }
 

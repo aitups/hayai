@@ -203,6 +203,7 @@ impl StreamingGenerator {
                 Some(scratch),
                 blk,
                 Some(&layout),
+                true,
             )?;
             ffn_finish_scratch(
                 orch,

@@ -268,6 +268,7 @@ impl StreamingGenerator {
                         Some(scratch),
                         layer_idx,
                         Some(&layout),
+                        false,
                     )?
                 };
                 self.ffn_secs += t_enq.elapsed().as_secs_f64();

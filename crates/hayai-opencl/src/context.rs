@@ -78,6 +78,8 @@ pub struct OpenClEngine {
     pub deltanet_ws: std::sync::Mutex<crate::attn::DeltanetWorkspace>,
     /// Reusable partial buffer for the split-K attention path.
     pub attn_split_ws: std::sync::Mutex<crate::attn::AttnSplitWorkspace>,
+    /// Reusable activation buffers for the device-resident FFN fast path.
+    pub ffn_dev_ws: std::sync::Mutex<crate::compute::FfnDevWorkspace>,
 }
 
 /// Build the OpenCL program from source, caching the compiled device binary on disk
@@ -306,6 +308,7 @@ impl OpenClEngine {
             sync_ws: std::sync::Mutex::new(Default::default()),
             deltanet_ws: std::sync::Mutex::new(Default::default()),
             attn_split_ws: std::sync::Mutex::new(Default::default()),
+            ffn_dev_ws: std::sync::Mutex::new(Default::default()),
         })
     }
 

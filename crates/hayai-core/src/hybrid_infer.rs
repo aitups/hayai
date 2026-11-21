@@ -443,6 +443,7 @@ fn run_ffn_only_block(
             None,
             0,
             None,
+            false,
         )?;
         ffn_finish_scratch(
             orch,
@@ -601,6 +602,7 @@ fn run_deltanet_block(
             None,
             0,
             None,
+            false,
         )?;
         ffn_finish_scratch(
             orch,
@@ -935,6 +937,7 @@ pub(crate) fn ffn_apply(
             scratch.as_deref(),
             layer,
             layout,
+            false,
         )?;
         ffn_finish_scratch(
             orch,
