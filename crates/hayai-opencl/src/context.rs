@@ -61,11 +61,23 @@ pub struct OpenClEngine {
     pub attn_decode: Kernel,
     /// DeltaNet recurrent state update (one decode step).
     pub deltanet_step: Kernel,
+    /// FlashDecoding split-K attention (per-head/chunk partials).
+    pub attn_decode_split: Kernel,
+    /// Merge the per-split partial states of `attn_decode_split`.
+    pub attn_decode_combine: Kernel,
+    /// `silu(gate) * up` on device buffers (on-device FFN merge).
+    pub silu_mul: Kernel,
+    /// Row-wise RMSNorm on device buffers.
+    pub rms_norm: Kernel,
     /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
     pub ffn_calls: std::sync::atomic::AtomicU64,
     /// Reusable device buffers for the synchronous GEMV path (no per-call
     /// `clCreateBuffer`/destroy). Alias-safe because that path waits before returning.
     pub sync_ws: std::sync::Mutex<crate::compute::GemvSyncWorkspace>,
+    /// Reusable transient buffers for `deltanet_step` (no per-layer create/destroy).
+    pub deltanet_ws: std::sync::Mutex<crate::attn::DeltanetWorkspace>,
+    /// Reusable partial buffer for the split-K attention path.
+    pub attn_split_ws: std::sync::Mutex<crate::attn::AttnSplitWorkspace>,
 }
 
 /// Build the OpenCL program from source, caching the compiled device binary on disk
@@ -238,6 +250,14 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("attn_decode kernel: {}", e)))?;
         let deltanet_step = Kernel::create(&program, "hayai_deltanet_step")
             .map_err(|e| OpenClError::ClError(format!("deltanet_step kernel: {}", e)))?;
+        let attn_decode_split = Kernel::create(&program, "hayai_attn_decode_split")
+            .map_err(|e| OpenClError::ClError(format!("attn_decode_split kernel: {}", e)))?;
+        let attn_decode_combine = Kernel::create(&program, "hayai_attn_decode_combine")
+            .map_err(|e| OpenClError::ClError(format!("attn_decode_combine kernel: {}", e)))?;
+        let silu_mul = Kernel::create(&program, "hayai_silu_mul")
+            .map_err(|e| OpenClError::ClError(format!("silu_mul kernel: {}", e)))?;
+        let rms_norm = Kernel::create(&program, "hayai_rms_norm")
+            .map_err(|e| OpenClError::ClError(format!("rms_norm kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -278,8 +298,14 @@ impl OpenClEngine {
             dequant_q4_k_to_f32,
             attn_decode,
             deltanet_step,
+            attn_decode_split,
+            attn_decode_combine,
+            silu_mul,
+            rms_norm,
             ffn_calls: std::sync::atomic::AtomicU64::new(0),
             sync_ws: std::sync::Mutex::new(Default::default()),
+            deltanet_ws: std::sync::Mutex::new(Default::default()),
+            attn_split_ws: std::sync::Mutex::new(Default::default()),
         })
     }
 

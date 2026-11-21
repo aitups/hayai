@@ -137,6 +137,80 @@ impl OpenClEngine {
         let hd_i = hd as cl_int;
         let seq_i = seq as cl_int;
         let scale_f = scale;
+        // Long contexts: split the sequence across (head, chunk) work-items so the GPU
+        // gets `n_heads * n_splits` threads instead of `n_heads` (audit B.2 #4). Short
+        // contexts keep the single-work-item kernel (no combine launch).
+        let target_chunk = 128usize;
+        let max_splits = 16usize;
+        let n_splits = if seq > target_chunk {
+            ((seq + target_chunk - 1) / target_chunk)
+                .min(max_splits)
+                .max(1)
+        } else {
+            1
+        };
+        if n_splits > 1 {
+            let chunk = (seq + n_splits - 1) / n_splits;
+            let stride = hd + 2;
+            let need_p = n_heads * n_splits * stride;
+            let mut pws = self
+                .attn_split_ws
+                .lock()
+                .map_err(|_| OpenClError::ClError("attn split workspace poisoned".into()))?;
+            if pws.cap < need_p.max(1) {
+                let cap = need_p.max(1);
+                pws.partial = Some(unsafe {
+                    Buffer::<cl_float>::create(&self.context, CL_MEM_READ_WRITE, cap, ptr::null_mut())
+                        .map_err(|e| OpenClError::ClError(format!("attn partial buffer: {e}")))?
+                });
+                pws.cap = cap;
+            }
+            let local = 64usize.min(self.device_info.max_work_group_size.max(1));
+            let n_splits_i = n_splits as cl_int;
+            let chunk_i = chunk as cl_int;
+            let total = n_heads * n_splits;
+            let gsplit = ((total + local - 1) / local) * local;
+            let ev_split = unsafe {
+                let mut exec = ExecuteKernel::new(&self.attn_decode_split);
+                exec.set_arg(ws.input.as_ref().unwrap())
+                    .set_arg(&cache.k)
+                    .set_arg(&cache.v)
+                    .set_arg(pws.partial.as_ref().unwrap())
+                    .set_arg(&n_heads_i)
+                    .set_arg(&n_kv_i)
+                    .set_arg(&groups_i)
+                    .set_arg(&hd_i)
+                    .set_arg(&seq_i)
+                    .set_arg(&scale_f)
+                    .set_arg(&n_splits_i)
+                    .set_arg(&chunk_i)
+                    .set_global_work_size(gsplit)
+                    .set_local_work_size(local)
+                    .enqueue_nd_range(&self.queue)
+                    .map_err(|e| OpenClError::ClError(format!("enqueue attn_split: {e}")))?
+            };
+            let gcomb = ((n_heads + local - 1) / local) * local;
+            let ev_comb = unsafe {
+                let mut exec = ExecuteKernel::new(&self.attn_decode_combine);
+                exec.set_arg(pws.partial.as_ref().unwrap())
+                    .set_arg(ws.output.as_ref().unwrap())
+                    .set_arg(&n_heads_i)
+                    .set_arg(&n_splits_i)
+                    .set_arg(&hd_i)
+                    .set_global_work_size(gcomb)
+                    .set_local_work_size(local)
+                    .enqueue_nd_range(&self.queue)
+                    .map_err(|e| OpenClError::ClError(format!("enqueue attn_combine: {e}")))?
+            };
+            let _ = ev_split.get();
+            let wait = [ev_comb.get()];
+            unsafe {
+                self.queue
+                    .enqueue_read_buffer(ws.output.as_ref().unwrap(), CL_BLOCKING, 0, out, &wait)
+                    .map_err(|e| OpenClError::ClError(format!("attn read out: {e}")))?;
+            }
+            return Ok(());
+        }
         // Global size = n_heads work-items, rounded to the device work-group size.
         let local = 64usize.min(self.device_info.max_work_group_size.max(1));
         let global = ((n_heads + local - 1) / local) * local;
@@ -211,6 +285,51 @@ impl DeviceDeltanetState {
     }
 }
 
+/// Reusable transient buffers for [`OpenClEngine::deltanet_step`] so the ~6 per-layer
+/// inputs/outputs are not `clCreateBuffer`'d and destroyed on every DeltaNet layer
+/// (audit B.2 #4). Buffers grow on demand and are reused across calls.
+#[derive(Default)]
+pub struct DeltanetWorkspace {
+    q: Option<Buffer<cl_float>>,
+    kk: Option<Buffer<cl_float>>,
+    v: Option<Buffer<cl_float>>,
+    decay: Option<Buffer<cl_float>>,
+    beta: Option<Buffer<cl_float>>,
+    out: Option<Buffer<cl_float>>,
+    cap_q: usize,
+    cap_kk: usize,
+    cap_v: usize,
+    cap_decay: usize,
+    cap_beta: usize,
+    cap_out: usize,
+}
+
+fn ensure_buf(
+    slot: &mut Option<Buffer<cl_float>>,
+    cap: &mut usize,
+    len: usize,
+    flags: opencl3::types::cl_mem_flags,
+    ctx: &opencl3::context::Context,
+) -> Result<(), OpenClError> {
+    let need = len.max(1);
+    if *cap < need {
+        *slot = Some(unsafe {
+            Buffer::<cl_float>::create(ctx, flags, need, ptr::null_mut())
+                .map_err(|e| OpenClError::ClError(format!("deltanet buf: {e}")))?
+        });
+        *cap = need;
+    }
+    Ok(())
+}
+
+/// Reusable partial-state buffer for the FlashDecoding split-K attention path
+/// (`hayai_attn_decode_split` → `hayai_attn_decode_combine`).
+#[derive(Default)]
+pub struct AttnSplitWorkspace {
+    partial: Option<Buffer<cl_float>>,
+    cap: usize,
+}
+
 impl OpenClEngine {
     /// One DeltaNet decode step: `decay`/`beta` are the per-value-head scalars the host
     /// derived; the device `state` is updated in place and `out` (`n_v_heads * h_v`) is
@@ -240,39 +359,44 @@ impl OpenClEngine {
         {
             return Err(OpenClError::ClError("deltanet_step shape mismatch".into()));
         }
-        let mk = |len: usize, data: &[f32]| -> Result<Buffer<cl_float>, OpenClError> {
-            let mut b = unsafe {
-                Buffer::<cl_float>::create(&self.context, CL_MEM_READ_ONLY, len.max(1), ptr::null_mut())
-                    .map_err(|e| OpenClError::ClError(format!("deltanet buf: {e}")))?
+        let mut guard = self
+            .deltanet_ws
+            .lock()
+            .map_err(|_| OpenClError::ClError("deltanet workspace poisoned".into()))?;
+        let ws = &mut *guard;
+        ensure_buf(&mut ws.q, &mut ws.cap_q, q.len(), CL_MEM_READ_ONLY, &self.context)?;
+        ensure_buf(&mut ws.kk, &mut ws.cap_kk, kk.len(), CL_MEM_READ_ONLY, &self.context)?;
+        ensure_buf(&mut ws.v, &mut ws.cap_v, v.len(), CL_MEM_READ_ONLY, &self.context)?;
+        ensure_buf(&mut ws.decay, &mut ws.cap_decay, decay.len(), CL_MEM_READ_ONLY, &self.context)?;
+        ensure_buf(&mut ws.beta, &mut ws.cap_beta, beta.len(), CL_MEM_READ_ONLY, &self.context)?;
+        ensure_buf(&mut ws.out, &mut ws.cap_out, out.len(), CL_MEM_WRITE_ONLY, &self.context)?;
+        {
+            let wr = |b: &mut Buffer<cl_float>, data: &[f32]| -> Result<(), OpenClError> {
+                unsafe {
+                    self.queue
+                        .enqueue_write_buffer(b, CL_BLOCKING, 0, data, &[])
+                        .map_err(|e| OpenClError::ClError(format!("deltanet write: {e}")))?;
+                }
+                Ok(())
             };
-            unsafe {
-                self.queue
-                    .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, data, &[])
-                    .map_err(|e| OpenClError::ClError(format!("deltanet write: {e}")))?;
-            }
-            Ok(b)
-        };
-        let bq = mk(q.len(), q)?;
-        let bkk = mk(kk.len(), kk)?;
-        let bv = mk(v.len(), v)?;
-        let bdecay = mk(decay.len(), decay)?;
-        let bbeta = mk(beta.len(), beta)?;
-        let bout = unsafe {
-            Buffer::<cl_float>::create(&self.context, CL_MEM_WRITE_ONLY, out.len().max(1), ptr::null_mut())
-                .map_err(|e| OpenClError::ClError(format!("deltanet out: {e}")))?
-        };
+            wr(ws.q.as_mut().unwrap(), q)?;
+            wr(ws.kk.as_mut().unwrap(), kk)?;
+            wr(ws.v.as_mut().unwrap(), v)?;
+            wr(ws.decay.as_mut().unwrap(), decay)?;
+            wr(ws.beta.as_mut().unwrap(), beta)?;
+        }
         let (n_kh_i, n_vh_i, h_k_i, h_v_i) =
             (n_kh as cl_int, n_vh as cl_int, h_k as cl_int, h_v as cl_int);
         use opencl3::kernel::ExecuteKernel;
         let ev = unsafe {
             let mut exec = ExecuteKernel::new(&self.deltanet_step);
-            exec.set_arg(&bq)
-                .set_arg(&bkk)
-                .set_arg(&bv)
-                .set_arg(&bdecay)
-                .set_arg(&bbeta)
+            exec.set_arg(ws.q.as_ref().unwrap())
+                .set_arg(ws.kk.as_ref().unwrap())
+                .set_arg(ws.v.as_ref().unwrap())
+                .set_arg(ws.decay.as_ref().unwrap())
+                .set_arg(ws.beta.as_ref().unwrap())
                 .set_arg(&state.s)
-                .set_arg(&bout)
+                .set_arg(ws.out.as_ref().unwrap())
                 .set_arg(&n_kh_i)
                 .set_arg(&n_vh_i)
                 .set_arg(&h_k_i)
@@ -284,8 +408,75 @@ impl OpenClEngine {
         let wait = [ev.get()];
         unsafe {
             self.queue
-                .enqueue_read_buffer(&bout, CL_BLOCKING, 0, out, &wait)
+                .enqueue_read_buffer(ws.out.as_ref().unwrap(), CL_BLOCKING, 0, out, &wait)
                 .map_err(|e| OpenClError::ClError(format!("deltanet read out: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// `out = silu(g) * u` on device buffers (`out` may alias `g`). Lets the FFN keep
+    /// its gate/up merge on the device instead of downloading both to the host.
+    pub fn silu_mul_dev(
+        &self,
+        g: &Buffer<cl_float>,
+        u: &Buffer<cl_float>,
+        out: &Buffer<cl_float>,
+        n: usize,
+    ) -> Result<(), OpenClError> {
+        if n == 0 {
+            return Ok(());
+        }
+        use opencl3::kernel::ExecuteKernel;
+        let n_i = n as cl_int;
+        let local = 256usize.min(self.device_info.max_work_group_size.max(1));
+        let global = ((n + local - 1) / local) * local;
+        unsafe {
+            let mut exec = ExecuteKernel::new(&self.silu_mul);
+            exec.set_arg(g)
+                .set_arg(u)
+                .set_arg(out)
+                .set_arg(&n_i)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue silu_mul: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Row-wise RMSNorm `y = x * rsqrt(mean(x^2) + eps) * w` on device buffers.
+    pub fn rms_norm_dev(
+        &self,
+        x: &Buffer<cl_float>,
+        w: &Buffer<cl_float>,
+        y: &Buffer<cl_float>,
+        n: usize,
+        eps: f32,
+    ) -> Result<(), OpenClError> {
+        if n == 0 {
+            return Ok(());
+        }
+        use opencl3::kernel::ExecuteKernel;
+        let n_i = n as cl_int;
+        let eps_f = eps;
+        let max_ls = 256usize.min(self.device_info.max_work_group_size.max(1));
+        let mut ls = 1usize;
+        while ls * 2 <= max_ls {
+            ls *= 2;
+        }
+        let local_bytes = ls * std::mem::size_of::<cl_float>();
+        unsafe {
+            let mut exec = ExecuteKernel::new(&self.rms_norm);
+            exec.set_arg(x)
+                .set_arg(w)
+                .set_arg(y)
+                .set_arg(&n_i)
+                .set_arg(&eps_f)
+                .set_arg_local_buffer(local_bytes)
+                .set_global_work_size(ls)
+                .set_local_work_size(ls)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue rms_norm: {e}")))?;
         }
         Ok(())
     }
@@ -349,6 +540,56 @@ mod tests {
         for (a, b) in out.iter().zip(ref_out.iter()) {
             assert!((a - b).abs() < 1e-4, "attn mismatch: {a} vs {b}");
         }
+
+        // Long context exercises the FlashDecoding split-K + combine path.
+        let (nh2, nkv2, hd2, seq2) = (8usize, 2usize, 16usize, 300usize);
+        let scale2 = 1.0 / (hd2 as f32).sqrt();
+        let q2: Vec<f32> = (0..nh2 * hd2).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let k2: Vec<f32> = (0..seq2 * nkv2 * hd2)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let v2: Vec<f32> = (0..seq2 * nkv2 * hd2)
+            .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.2)
+            .collect();
+        let g2 = nh2 / nkv2;
+        let mut ref2 = vec![0.0f32; nh2 * hd2];
+        for h in 0..nh2 {
+            let kh = h / g2;
+            let mut scores = vec![0.0f32; seq2];
+            let mut m = f32::NEG_INFINITY;
+            for j in 0..seq2 {
+                let mut dot = 0.0f32;
+                for d in 0..hd2 {
+                    dot += q2[h * hd2 + d] * k2[(j * nkv2 + kh) * hd2 + d];
+                }
+                scores[j] = dot * scale2;
+                m = m.max(scores[j]);
+            }
+            let mut l = 0.0f32;
+            for j in 0..seq2 {
+                scores[j] = (scores[j] - m).exp();
+                l += scores[j];
+            }
+            for d in 0..hd2 {
+                let mut acc = 0.0f32;
+                for j in 0..seq2 {
+                    acc += scores[j] * v2[(j * nkv2 + kh) * hd2 + d];
+                }
+                ref2[h * hd2 + d] = acc / l;
+            }
+        }
+        let mut cache2 = DeviceKvCache::new(&eng, nkv2, hd2, seq2).unwrap();
+        for j in 0..seq2 {
+            let krow = &k2[j * nkv2 * hd2..(j + 1) * nkv2 * hd2];
+            let vrow = &v2[j * nkv2 * hd2..(j + 1) * nkv2 * hd2];
+            eng.kv_append(&mut cache2, j, krow, vrow).unwrap();
+        }
+        let mut out2 = vec![0.0f32; nh2 * hd2];
+        eng.attn_decode(&q2, &cache2, &mut out2, nh2, seq2, scale2)
+            .unwrap();
+        for (a, b) in out2.iter().zip(ref2.iter()) {
+            assert!((a - b).abs() < 1e-4, "attn split mismatch: {a} vs {b}");
+        }
     }
 
     #[test]
@@ -401,6 +642,70 @@ mod tests {
             .unwrap();
         for (a, b) in out.iter().zip(ref_out.iter()) {
             assert!((a - b).abs() < 1e-4, "deltanet mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn nn_ops_match_reference() {
+        use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
+        use opencl3::types::CL_BLOCKING;
+        use std::ptr;
+
+        let Ok(eng) = OpenClEngine::try_init_any() else {
+            eprintln!("nn_ops parity: SKIP (no OpenCL device)");
+            return;
+        };
+        let n = 1000usize;
+        let upload = |data: &[f32], flags| -> Buffer<cl_float> {
+            let mut b = unsafe {
+                Buffer::<cl_float>::create(&eng.context, flags, n, ptr::null_mut()).unwrap()
+            };
+            unsafe {
+                eng.queue
+                    .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, data, &[])
+                    .unwrap();
+            }
+            b
+        };
+        let g: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 5.0).collect();
+        let u: Vec<f32> = (0..n).map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1).collect();
+        let bg = upload(&g, CL_MEM_READ_ONLY);
+        let bu = upload(&u, CL_MEM_READ_ONLY);
+        let bo = unsafe {
+            Buffer::<cl_float>::create(&eng.context, CL_MEM_WRITE_ONLY, n, ptr::null_mut()).unwrap()
+        };
+        eng.silu_mul_dev(&bg, &bu, &bo, n).unwrap();
+        let mut got = vec![0.0f32; n];
+        unsafe {
+            eng.queue
+                .enqueue_read_buffer(&bo, CL_BLOCKING, 0, &mut got, &[])
+                .unwrap();
+        }
+        for i in 0..n {
+            let want = (g[i] / (1.0 + (-g[i]).exp())) * u[i];
+            assert!((got[i] - want).abs() < 1e-4, "silu_mul {i}: {} vs {}", got[i], want);
+        }
+
+        let x: Vec<f32> = (0..n).map(|i| ((i * 3 % 17) as f32 - 8.0) * 0.2).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 3) as f32 * 0.1).collect();
+        let eps = 1e-5f32;
+        let bx = upload(&x, CL_MEM_READ_ONLY);
+        let bw = upload(&w, CL_MEM_READ_ONLY);
+        let by = unsafe {
+            Buffer::<cl_float>::create(&eng.context, CL_MEM_WRITE_ONLY, n, ptr::null_mut()).unwrap()
+        };
+        eng.rms_norm_dev(&bx, &bw, &by, n, eps).unwrap();
+        let mut goty = vec![0.0f32; n];
+        unsafe {
+            eng.queue
+                .enqueue_read_buffer(&by, CL_BLOCKING, 0, &mut goty, &[])
+                .unwrap();
+        }
+        let mean: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let inv = 1.0 / (mean + eps).sqrt();
+        for i in 0..n {
+            let want = x[i] * inv * w[i];
+            assert!((goty[i] - want).abs() < 1e-3, "rms_norm {i}: {} vs {}", goty[i], want);
         }
     }
 }

@@ -90,3 +90,127 @@ __kernel void hayai_attn_decode(
 
 
 
+
+// ---------------------------------------------------------------------------
+// FlashDecoding split-K: the sequence is split into `n_splits` contiguous
+// chunks; one work-item per (head, split) runs the online softmax over its
+// chunk and writes (m, l, acc[head_dim]) to `partial`. A second pass
+// (`hayai_attn_decode_combine`) merges the per-split states. This lifts the
+// kernel from `n_heads` work-items (under-occupying the GPU) to
+// `n_heads * n_splits` without per-position barriers. Used for long contexts;
+// short contexts keep the single-work-item kernel above.
+// ---------------------------------------------------------------------------
+__kernel void hayai_attn_decode_split(
+    __global const float* restrict q,   // [n_heads * head_dim]
+    __global const float* restrict k,   // [max_seq * n_kv * head_dim]
+    __global const float* restrict v,   // [max_seq * n_kv * head_dim]
+    __global float* restrict partial,   // [n_heads * n_splits * (head_dim + 2)]
+    const int n_heads,
+    const int n_kv,
+    const int groups,
+    const int head_dim,
+    const int seq,
+    const float scale,
+    const int n_splits,
+    const int chunk)
+{
+    int gid = (int)get_global_id(0);
+    int h = gid / n_splits;
+    int s = gid - h * n_splits;
+    if (h >= n_heads || head_dim > HAYAI_MAX_HEAD_DIM) {
+        return;
+    }
+    int stride = head_dim + 2;
+    __global float* P = partial + (h * n_splits + s) * stride;
+    int start = s * chunk;
+    int end = min(start + chunk, seq);
+    if (start >= end) {
+        P[0] = -INFINITY;
+        P[1] = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            P[2 + d] = 0.0f;
+        }
+        return;
+    }
+    int kh = (groups > 0) ? (h / groups) : 0;
+    __private float qv[HAYAI_MAX_HEAD_DIM];
+    __private float acc[HAYAI_MAX_HEAD_DIM];
+    for (int d = 0; d < head_dim; ++d) {
+        qv[d] = q[h * head_dim + d];
+        acc[d] = 0.0f;
+    }
+    __global const float* k0 = k + ((long)start * n_kv + kh) * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        dot += qv[d] * k0[d];
+    }
+    float m = dot * scale;
+    float l = 1.0f;
+    __global const float* v0 = v + ((long)start * n_kv + kh) * head_dim;
+    for (int d = 0; d < head_dim; ++d) {
+        acc[d] = v0[d];
+    }
+    for (int j = start + 1; j < end; ++j) {
+        __global const float* kj = k + ((long)j * n_kv + kh) * head_dim;
+        float dj = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dj += qv[d] * kj[d];
+        }
+        dj *= scale;
+        float mn = fmax(m, dj);
+        float p = exp(dj - mn);
+        float corr = exp(m - mn);
+        l = l * corr + p;
+        __global const float* vj = v + ((long)j * n_kv + kh) * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            acc[d] = acc[d] * corr + p * vj[d];
+        }
+        m = mn;
+    }
+    P[0] = m;
+    P[1] = l;
+    for (int d = 0; d < head_dim; ++d) {
+        P[2 + d] = acc[d];
+    }
+}
+
+__kernel void hayai_attn_decode_combine(
+    __global const float* restrict partial,  // [n_heads * n_splits * (head_dim + 2)]
+    __global float* restrict out,            // [n_heads * head_dim]
+    const int n_heads,
+    const int n_splits,
+    const int head_dim)
+{
+    int h = (int)get_global_id(0);
+    if (h >= n_heads || head_dim > HAYAI_MAX_HEAD_DIM) {
+        return;
+    }
+    int stride = head_dim + 2;
+    __global const float* base = partial + (long)h * n_splits * stride;
+    float M = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        if (base[s * stride + 1] > 0.0f) {
+            M = fmax(M, base[s * stride]);
+        }
+    }
+    __private float acc[HAYAI_MAX_HEAD_DIM];
+    for (int d = 0; d < head_dim; ++d) {
+        acc[d] = 0.0f;
+    }
+    float L = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        float ls = base[s * stride + 1];
+        if (ls <= 0.0f) {
+            continue;
+        }
+        float w = exp(base[s * stride] - M);
+        L += ls * w;
+        for (int d = 0; d < head_dim; ++d) {
+            acc[d] += base[s * stride + 2 + d] * w;
+        }
+    }
+    float inv = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        out[h * head_dim + d] = acc[d] * inv;
+    }
+}
