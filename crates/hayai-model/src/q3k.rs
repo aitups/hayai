@@ -98,47 +98,79 @@ pub fn gemv_q3_k(
     assert_eq!(input.len(), ncols);
     assert_eq!(output.len(), nrows);
 
+    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
     output.par_iter_mut().with_min_len(64).enumerate().for_each(|(row, out)| {
-        let row_base = row * row_bytes;
-        let mut sum = 0.0f32;
-        for b in 0..blocks_per_row {
-            let block = &data[row_base + b * Q3_K_BLOCK_BYTES..];
-            let hmask = &block[0..32];
-            let mut q = &block[32..96];
-            let scales = unpack_q3_k_scales(&block[96..108]);
-            let d_all = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
-            let x_base = b * QK_K;
-            let mut xo = 0usize;
-            let mut is = 0usize;
-            let mut m: u8 = 1;
-            for _ in 0..(QK_K / 128) {
-                let mut shift = 0u32;
-                for _ in 0..4 {
-                    let dl = d_all * (scales[is] as i32 - 32) as f32;
-                    is += 1;
-                    for l in 0..16 {
-                        let qv = ((q[l] >> shift) & 3) as i8;
-                        let hm = if hmask[l] & m != 0 { 0 } else { 4 };
-                        sum += dl * (qv - hm) as f32 * input[x_base + xo + l];
-                    }
-                    xo += 16;
-                    let dl = d_all * (scales[is] as i32 - 32) as f32;
-                    is += 1;
-                    for l in 0..16 {
-                        let qv = ((q[l + 16] >> shift) & 3) as i8;
-                        let hm = if hmask[l + 16] & m != 0 { 0 } else { 4 };
-                        sum += dl * (qv - hm) as f32 * input[x_base + xo + l];
-                    }
-                    xo += 16;
-                    shift += 2;
-                    m <<= 1;
-                }
-                q = &q[32..];
-            }
-        }
-        *out = sum;
+        *out = q3_k_row_dispatch(use_avx2, data, input, row * row_bytes, blocks_per_row);
     });
     Ok(())
+}
+
+#[inline(always)]
+fn q3_k_row(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    use std::simd::f32x8;
+    use std::simd::num::SimdFloat;
+    let mut sum = 0.0f32;
+    let mut w = [0.0f32; 16];
+    for b in 0..blocks_per_row {
+        let block = &data[row_base + b * Q3_K_BLOCK_BYTES..];
+        let hmask = &block[0..32];
+        let mut q = &block[32..96];
+        let scales = unpack_q3_k_scales(&block[96..108]);
+        let d_all = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+        let x_base = b * QK_K;
+        let mut xo = 0usize;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        for _ in 0..(QK_K / 128) {
+            let mut shift = 0u32;
+            for _ in 0..4 {
+                for half in 0..2 {
+                    let dl = d_all * (scales[is] as i32 - 32) as f32;
+                    is += 1;
+                    let off = half * 16;
+                    for l in 0..16 {
+                        let qv = ((q[off + l] >> shift) & 3) as i32;
+                        let hm = if hmask[off + l] & m != 0 { 0 } else { 4 };
+                        w[l] = dl * (qv - hm) as f32;
+                    }
+                    let lo = f32x8::from_slice(&w[0..8])
+                        * f32x8::from_slice(&input[x_base + xo..x_base + xo + 8]);
+                    let hi = f32x8::from_slice(&w[8..16])
+                        * f32x8::from_slice(&input[x_base + xo + 8..x_base + xo + 16]);
+                    sum += (lo + hi).reduce_sum();
+                    xo += 16;
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q = &q[32..];
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q3_k_row_avx2(data: &[u8], input: &[f32], row_base: usize, blocks_per_row: usize) -> f32 {
+    q3_k_row(data, input, row_base, blocks_per_row)
+}
+
+#[inline]
+fn q3_k_row_dispatch(
+    use_avx2: bool,
+    data: &[u8],
+    input: &[f32],
+    row_base: usize,
+    blocks_per_row: usize,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if use_avx2 {
+            return unsafe { q3_k_row_avx2(data, input, row_base, blocks_per_row) };
+        }
+    }
+    let _ = use_avx2;
+    q3_k_row(data, input, row_base, blocks_per_row)
 }
 
 pub fn extract_q3_k_row(
