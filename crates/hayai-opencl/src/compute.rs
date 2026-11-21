@@ -356,8 +356,6 @@ impl OpenClEngine {
         let local = if split > 1 { (local / split * split).max(split) } else { local };
         let global = ((m.saturating_mul(split) + local - 1) / local) * local;
 
-        // Must match HAYAI_X_TILE in ggml_gemv_q4.cl (tiled __local input).
-        let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let kernel_event = unsafe {
             ExecuteKernel::new(kernel)
                 .set_arg(&m_i)
@@ -366,7 +364,6 @@ impl OpenClEngine {
                 .set_arg(ws.weights.as_ref().unwrap())
                 .set_arg(ws.input.as_ref().unwrap())
                 .set_arg(ws.output.as_ref().unwrap())
-                .set_arg_local_buffer(local_bytes)
                 .set_global_work_size(global)
                 .set_local_work_size(local)
                 .enqueue_nd_range(&self.queue)
@@ -444,7 +441,6 @@ impl OpenClEngine {
         let split = gemv_split(label);
         let local = if split > 1 { (local / split * split).max(split) } else { local };
         let global = ((m.saturating_mul(split) + local - 1) / local) * local;
-        let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let ev = unsafe {
             let mut exec = ExecuteKernel::new(kernel);
             exec.set_arg(&m_i).set_arg(&n_i).set_arg(&off_i);
@@ -455,7 +451,6 @@ impl OpenClEngine {
             exec_ref
                 .set_arg(ws.input.as_ref().unwrap())
                 .set_arg(ws.output.as_ref().unwrap())
-                .set_arg_local_buffer(local_bytes)
                 .set_global_work_size(global)
                 .set_local_work_size(local)
                 .enqueue_nd_range(&self.queue)

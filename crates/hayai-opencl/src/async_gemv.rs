@@ -155,7 +155,6 @@ impl OpenClEngine {
         let local = if split > 1 { (local / split * split).max(split) } else { local };
         let global = ((m.saturating_mul(split) + local - 1) / local) * local;
 
-        let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let kernel_event = unsafe {
             ExecuteKernel::new(kernel)
                 .set_arg(&m_i)
@@ -164,7 +163,6 @@ impl OpenClEngine {
                 .set_arg_svm(svm_base)
                 .set_arg(&input_buf)
                 .set_arg(&output_buf)
-                .set_arg_local_buffer(local_bytes)
                 .set_global_work_size(global)
                 .set_local_work_size(local)
                 .enqueue_nd_range(&self.queue)
@@ -264,7 +262,6 @@ impl OpenClEngine {
         let local = if split > 1 { (local / split * split).max(split) } else { local };
         let global = ((m.saturating_mul(split) + local - 1) / local) * local;
 
-        let local_bytes = 2048 * std::mem::size_of::<cl_float>();
         let kernel_event = unsafe {
             ExecuteKernel::new(kernel)
                 .set_arg(&m_i)
@@ -273,7 +270,6 @@ impl OpenClEngine {
                 .set_arg(weights_dev)
                 .set_arg(&input_buf)
                 .set_arg(&output_buf)
-                .set_arg_local_buffer(local_bytes)
                 .set_global_work_size(global)
                 .set_local_work_size(local)
                 .enqueue_nd_range(&self.queue)

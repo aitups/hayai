@@ -39,24 +39,12 @@ inline float hayai_half_bits_to_float(ushort h) {
 }
 
 
-// Host always passes __local float[HAYAI_X_TILE]. Hot kernels tile over N.
+// Tiling bound for the batched q4_k kernel. The warp-striped kernels read `input`
+// straight from global memory (no `__local` staging), so they take no input buffer.
 #ifndef HAYAI_X_TILE
 #define HAYAI_X_TILE 2048
 #endif
 
-inline void hayai_load_input_tile(int base, int ntile, __global const float* g_in, __local float* lx) {
-    int lid = get_local_id(0);
-    int ls = get_local_size(0);
-    for (int i = lid; i < ntile; i += ls) {
-        lx[i] = g_in[base + i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-}
-
-inline void hayai_wg_barrier(__local float* lx) {
-    if (get_local_id(0) == 0) lx[0] = 0.0f;
-    barrier(CLK_LOCAL_MEM_FENCE);
-}
 
 __kernel void ggml_gemv_q4_0(
     const int M,
@@ -64,8 +52,7 @@ __kernel void ggml_gemv_q4_0(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` handles one weight of each 32-block
     // (16 qs bytes shared by 32 lanes → coalesced). Reduces the 32 partials in __local.
@@ -104,8 +91,7 @@ __kernel void ggml_gemv_q4_1(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` reads qs[l&15] of each 20-byte block.
     int lid = (int)get_local_id(0);
@@ -143,8 +129,7 @@ __kernel void ggml_gemv_q8_0(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` reads qs[l] of each 34-byte block
     // (32 contiguous int8 bytes = fully coalesced).
@@ -180,8 +165,7 @@ __kernel void ggml_gemv_q5_0(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -220,8 +204,7 @@ __kernel void ggml_gemv_q5_1(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -282,8 +265,7 @@ __kernel void ggml_gemv_q4_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -416,8 +398,7 @@ __kernel void ggml_gemv_q6_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` handles the 4 weights (l, l+32, l+64,
     // l+96) of each 128-weight half. ql/qh/scales reads are contiguous across the warp.
@@ -480,8 +461,7 @@ __kernel void ggml_gemv_f32(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -513,8 +493,7 @@ __kernel void ggml_gemv_f16(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: lane reads f16 element `c = lane, lane+32, ...` (contiguous per step).
     int lid = (int)get_local_id(0);
@@ -547,8 +526,7 @@ __kernel void ggml_gemv_q2_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` = weight `l` of each 32-weight shift
     // (16 low + 16 high sub-halves); q/scales reads are contiguous across the warp.
@@ -599,8 +577,7 @@ __kernel void ggml_gemv_q3_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -678,8 +655,7 @@ __kernel void ggml_gemv_q5_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     // Warp-striped: one warp per row, lane `l` handles the low/high weight `l` of each
     // 64-weight sub-block; ql/qh reads are contiguous across the warp.
@@ -741,8 +717,7 @@ __kernel void ggml_gemv_iq4_nl(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -778,8 +753,7 @@ __kernel void ggml_gemv_iq4_xs(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -950,8 +924,7 @@ __kernel void ggml_gemv_iq3_xxs(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1004,8 +977,7 @@ __kernel void ggml_gemv_iq3_s(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1536,8 +1508,7 @@ __kernel void ggml_gemv_iq2_xxs(
     const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1584,8 +1555,7 @@ __kernel void ggml_gemv_iq2_xs(
     const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1632,8 +1602,7 @@ __kernel void ggml_gemv_iq2_s(
     const int M, const int N, const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1685,8 +1654,7 @@ __kernel void ggml_gemv_bf16(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1719,8 +1687,7 @@ __kernel void ggml_gemv_q8_1(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
@@ -1755,8 +1722,7 @@ __kernel void ggml_gemv_q8_k(
     const long weight_off,
     __global const uchar* restrict weights,
     __global const float* restrict input,
-    __global float* restrict output,
-    __local float* restrict local_input
+    __global float* restrict output
 ) {
     int lid = (int)get_local_id(0);
     int gid = (int)get_global_id(0);
