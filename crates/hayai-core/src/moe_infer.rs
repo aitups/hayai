@@ -389,6 +389,65 @@ fn forward_moe_inner(
                         acc[j] += w * d[j];
                     }
                 }
+            } else if scratch.resident {
+                // Resident MoE: gate/up -> SiLU -> down from the per-layer mirror
+                // slice (compact expert layout). No per-expert clCreateBuffer / PCIe
+                // uploads (audit N3).
+                for &(i, eid, base_off, ff) in &expert_meta {
+                    let expert = unit
+                        .experts
+                        .iter()
+                        .find(|e| e.expert_id == eid)
+                        .ok_or_else(|| {
+                            StreamInferError::Msg(format!("top-k expert {eid} not in plan"))
+                        })?;
+                    let goff = expert_op_offset(expert, LayerOpKind::ExpertGate).unwrap_or(0);
+                    let uoff = expert_op_offset(expert, LayerOpKind::ExpertUp).unwrap_or(0);
+                    let doff = expert_op_offset(expert, LayerOpKind::ExpertDown).unwrap_or(0);
+                    let gate = expert_view(&base, expert, base_off, LayerOpKind::ExpertGate)?;
+                    let up = expert_view(&base, expert, base_off, LayerOpKind::ExpertUp)?;
+                    let down = expert_view(&base, expert, base_off, LayerOpKind::ExpertDown)?;
+                    let mut g = vec![0.0f32; ff];
+                    let mut u = vec![0.0f32; ff];
+                    let mut d = vec![0.0f32; h];
+                    orch.execute_op_bound(
+                        LayerOpKind::ExpertGate,
+                        op_binding(LayerOpKind::ExpertGate),
+                        &gate,
+                        &xn,
+                        &mut g,
+                        Some(&*scratch),
+                        layer,
+                        base_off + goff,
+                    )?;
+                    orch.execute_op_bound(
+                        LayerOpKind::ExpertUp,
+                        op_binding(LayerOpKind::ExpertUp),
+                        &up,
+                        &xn,
+                        &mut u,
+                        Some(&*scratch),
+                        layer,
+                        base_off + uoff,
+                    )?;
+                    for j in 0..ff {
+                        g[j] = (g[j] / (1.0 + (-g[j]).exp())) * u[j];
+                    }
+                    orch.execute_op_bound(
+                        LayerOpKind::ExpertDown,
+                        op_binding(LayerOpKind::ExpertDown),
+                        &down,
+                        &g,
+                        &mut d,
+                        Some(&*scratch),
+                        layer,
+                        base_off + doff,
+                    )?;
+                    let w = weights[i];
+                    for j in 0..h {
+                        acc[j] += w * d[j];
+                    }
+                }
             } else {
                 // GPU: async across experts — enqueue all gate∥up, wait, SiLU, down.
                 gen.used_dgpu = true;
@@ -823,6 +882,11 @@ fn expert_view<'a>(
         t.ggml_type,
         &base[base_off + t.offset..base_off + t.offset + t.nbytes],
     ))
+}
+
+/// Byte offset of one expert matrix inside the compact expert slot (`t.offset`).
+fn expert_op_offset(expert: &ExpertUnit, op: LayerOpKind) -> Option<usize> {
+    expert.tensors.iter().find(|t| t.op == op).map(|t| t.offset)
 }
 
 /// View over a shared-expert matrix (`ffn_shexp.*` / `shared_expert.*`).
