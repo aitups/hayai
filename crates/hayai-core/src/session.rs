@@ -25,7 +25,9 @@ pub struct HeadCache {
 pub struct GenerationSession {
     gen: StreamingGenerator,
     orch: Arc<Mutex<EngineOrchestrator>>,
-    scratch: hayai_opencl::StreamingScratch,
+    scratch: Option<hayai_opencl::StreamingScratch>,
+    /// Where to return the scratch on drop so the next request reuses it (server).
+    scratch_slot: Option<Arc<Mutex<Option<hayai_opencl::StreamingScratch>>>>,
     last_logits: Vec<f32>,
     prompt_tokens: usize,
     generated_ids: Vec<u32>,
@@ -33,6 +35,15 @@ pub struct GenerationSession {
     grammar: Option<Grammar>,
     grammar_state: Option<GrammarState>,
     grammar_token_texts: Vec<Option<String>>,
+}
+
+impl Drop for GenerationSession {
+    fn drop(&mut self) {
+        // Return the scratch to the model's slot so the next request reuses it.
+        if let (Some(slot), Some(sc)) = (&self.scratch_slot, self.scratch.take()) {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sc);
+        }
+    }
 }
 
 impl GenerationSession {
@@ -45,6 +56,7 @@ impl GenerationSession {
         tokenizer: Arc<Tokenizer>,
         head_cache: Arc<Mutex<HeadCache>>,
         header: Option<Arc<hayai_model::GgufHeader>>,
+        scratch_slot: Option<Arc<Mutex<Option<hayai_opencl::StreamingScratch>>>>,
         sinks: usize,
         window: usize,
         memory_strategy: MemoryStrategy,
@@ -63,13 +75,19 @@ impl GenerationSession {
         };
         gen.set_memory_strategy(memory_strategy);
         gen.set_head_cache(head_cache);
+        // Reuse the model's scratch across requests (audit D.2.3): a resident scratch
+        // already holds the weights, so its per-request preload is skipped.
+        let reuse = scratch_slot
+            .as_ref()
+            .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take());
         let mut guard = orch.lock().unwrap_or_else(|e| e.into_inner());
-        let scratch = gen.prepare_session(&mut guard)?;
+        let scratch = gen.prepare_session_reuse(&mut guard, reuse)?;
         drop(guard);
         Ok(Self {
             gen,
             orch,
-            scratch,
+            scratch: Some(scratch),
+            scratch_slot,
             last_logits: Vec::new(),
             prompt_tokens: 0,
             generated_ids: Vec::new(),
@@ -149,7 +167,7 @@ impl GenerationSession {
             return Err(StreamInferError::Msg("empty prompt tokenization".into()));
         }
         let mut guard = self.orch.lock().unwrap_or_else(|e| e.into_inner());
-        self.last_logits = self.gen.prefill(&mut guard, &ids, &mut self.scratch)?;
+        self.last_logits = self.gen.prefill(&mut guard, &ids, self.scratch.as_mut().expect("session scratch"))?;
         self.prompt_tokens = ids.len();
         if let Some(g) = &self.grammar {
             self.grammar_state = Some(g.initial_state());
@@ -184,7 +202,7 @@ impl GenerationSession {
         }
         self.generated_ids.push(next);
         let mut guard = self.orch.lock().unwrap_or_else(|e| e.into_inner());
-        self.last_logits = self.gen.decode_step(&mut guard, next, &mut self.scratch)?;
+        self.last_logits = self.gen.decode_step(&mut guard, next, self.scratch.as_mut().expect("session scratch"))?;
         Ok(Some(next))
     }
 
@@ -217,6 +235,75 @@ impl GenerationSession {
     /// Decode arbitrary ids (deltas etc.).
     pub fn decode(&self, ids: &[u32]) -> String {
         self.gen.tokenizer.decode(ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::ExecutionMode;
+    use hayai_model::{GgufCatalog, SamplerConfig, Tokenizer};
+    use std::path::PathBuf;
+
+    fn acceptance_model() -> Option<PathBuf> {
+        std::env::var("HAYAI_ACCEPTANCE_MODEL")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|p| p.exists())
+    }
+
+    #[test]
+    fn resident_scratch_is_reused_across_sessions() {
+        let Some(path) = acceptance_model() else {
+            eprintln!("session reuse: SKIP (set HAYAI_ACCEPTANCE_MODEL)");
+            return;
+        };
+        let cat = GgufCatalog::open(&path).unwrap();
+        let tok = Arc::new(Tokenizer::from_catalog(&cat).unwrap());
+        let header = Some(Arc::new(cat.header_snapshot()));
+        let cfg = crate::load_config(&cat).unwrap();
+        drop(cat);
+        let orch = Arc::new(Mutex::new(EngineOrchestrator::new(
+            ExecutionMode::CpuOnly,
+            cfg,
+        )));
+        let head = Arc::new(Mutex::new(HeadCache::default()));
+        let slot: Arc<Mutex<Option<hayai_opencl::StreamingScratch>>> = Arc::new(Mutex::new(None));
+        let make = || {
+            GenerationSession::start(
+                &path,
+                tok.clone(),
+                head.clone(),
+                header.clone(),
+                Some(slot.clone()),
+                4,
+                512,
+                MemoryStrategy::CapBytes(2_000_000_000),
+                SamplerConfig::Greedy,
+                0,
+                orch.clone(),
+            )
+        };
+        let run = |s: &mut GenerationSession| -> Vec<u32> {
+            s.prefill("The capital of France is").unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..8 {
+                match s.next_token().unwrap() {
+                    Some(t) => ids.push(t),
+                    None => break,
+                }
+            }
+            ids
+        };
+        let mut s1 = make().unwrap();
+        let first = run(&mut s1);
+        drop(s1);
+        assert!(slot.lock().unwrap().is_some(), "scratch returned to the slot");
+        assert!(!first.is_empty(), "expected some generated tokens");
+        // Second session reuses the resident scratch (no re-preload) and is identical.
+        let mut s2 = make().unwrap();
+        let second = run(&mut s2);
+        assert_eq!(first, second, "reused resident scratch changed the output");
     }
 }
 

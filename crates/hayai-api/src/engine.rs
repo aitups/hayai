@@ -69,6 +69,7 @@ pub fn generate_text(
         handle.tokenizer.clone(),
         handle.head_cache.clone(),
         handle.header.clone(),
+        Some(handle.scratch_slot.clone()),
         handle.sinks,
         handle.window,
         handle.memory_strategy,

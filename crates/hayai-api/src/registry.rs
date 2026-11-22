@@ -27,6 +27,9 @@ pub struct ModelHandle {
     /// Parsed GGUF header/directory, reused across requests so each session skips the
     /// header read/parse (audit D.2.3). `None` for split GGUFs.
     pub header: Option<Arc<hayai_model::GgufHeader>>,
+    /// Session scratch reused across requests (audit D.2.3): a resident scratch skips
+    /// the per-request resident preload entirely.
+    pub scratch_slot: Arc<Mutex<Option<hayai_opencl::StreamingScratch>>>,
 }
 
 /// Server-wide registry (models discovered at startup; handles built lazily).
@@ -138,6 +141,7 @@ impl ModelRegistry {
             encoder_decoder,
             head_cache: Arc::new(Mutex::new(hayai_core::HeadCache::default())),
             header,
+            scratch_slot: Arc::new(Mutex::new(None)),
         })
     }
 }

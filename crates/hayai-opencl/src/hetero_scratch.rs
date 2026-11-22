@@ -70,6 +70,12 @@ pub struct StreamingScratch {
     dma_inflight: Vec<opencl3::event::Event>,
 }
 
+// SAFETY: the scratch owns its host SVM / pinned regions and its device buffers (which
+// `OpenClEngine` already treats as shareable `cl_mem` handles). The server stores it in a
+// `Mutex` next to the engine orchestrator and only touches it while holding that lock, so
+// moving it between blocking-worker threads is sound (same contract as `OwnedSvmBuffer`).
+unsafe impl Send for StreamingScratch {}
+
 /// How a pool device should bind weights for Base+Offset GEMV.
 pub enum WeightBind<'a> {
     /// APU / SVM owner: pass SVM pointer via `set_arg_svm`.
@@ -651,6 +657,18 @@ impl StreamingScratch {
     /// device kernel reads the mirror (the DMA is issued async to overlap CPU attention).
     pub fn wait_pending_dma(&mut self) {
         self.wait_dma();
+    }
+
+    /// Reset transient per-session state so a scratch can be reused by the next request
+    /// (audit D.2.3). Waits any in-flight DMA; non-resident slots are marked empty so the
+    /// next layer load refills them. The resident base already holds this model's weights.
+    pub fn reset_for_reuse(&mut self, _pool: &OpenClDevicePool) {
+        self.wait_dma();
+        if !self.resident {
+            for b in self.block_staged.iter_mut() {
+                *b = 0;
+            }
+        }
     }
 
     /// Map SVM (if any) so the host can write/read the layer pack (Attn CPU GEMV).

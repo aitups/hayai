@@ -2438,6 +2438,18 @@ impl StreamingGenerator {
         &mut self,
         orch: &mut EngineOrchestrator,
     ) -> Result<hayai_opencl::StreamingScratch, StreamInferError> {
+        self.prepare_session_reuse(orch, None)
+    }
+
+    /// Like [`Self::prepare_session`] but can reuse a previously built scratch (the
+    /// server keeps one per model). A resident scratch already holds the model's weights,
+    /// so the per-request resident preload is skipped (audit D.2.3). An incompatible
+    /// scratch (different mode/geometry) is ignored and a fresh one is allocated.
+    pub fn prepare_session_reuse(
+        &mut self,
+        orch: &mut EngineOrchestrator,
+        reuse: Option<hayai_opencl::StreamingScratch>,
+    ) -> Result<hayai_opencl::StreamingScratch, StreamInferError> {
         // Metadata-driven plan: fail only on unknown layer ops (not arch name).
         {
             let n_gpu = orch.pool.len();
@@ -2659,7 +2671,20 @@ impl StreamingGenerator {
             self.memory_strategy,
         );
 
-        let (xfer, mut scratch) = if resident {
+        let reuse = reuse.filter(|sc| {
+            sc.resident == resident
+                && if resident {
+                    sc.resident_layers >= self.config.num_layers
+                } else {
+                    sc.block_k == win.k_chunk && sc.n_slots >= 2
+                }
+        });
+        let reused = reuse.is_some();
+        let (xfer, mut scratch) = if let Some(mut sc) = reuse {
+            sc.reset_for_reuse(&orch.pool);
+            let p = sc.path;
+            (p, sc)
+        } else if resident {
             hayai_opencl::StreamingScratch::allocate_resident_for_pool(
                 &orch.pool,
                 layer_bytes,
@@ -2734,7 +2759,7 @@ impl StreamingGenerator {
         // Resident mode: preload every layer pack once (disk → device memory) and
         // cache the final projection + embedding matrices for zero-I/O decode.
         // Mamba has no llama-shaped layer pack (its weights live in `mamba_cache`).
-        if resident && self.model_kind() != ModelKind::Mamba {
+        if resident && !reused && self.model_kind() != ModelKind::Mamba {
             info!(
                 "Resident mode: pre-loading all {} layers into device memory",
                 self.config.num_layers
@@ -2804,20 +2829,28 @@ impl StreamingGenerator {
                 self.io_secs += t0.elapsed().as_secs_f64();
             }
             info!("Resident preload complete: {} layers in device memory", self.config.num_layers);
+        }
+        if resident {
+            // Resident head via the shared cross-request cache (audit D.2.3): a reused
+            // session/scratch must not re-read the (300–550 MiB) projection from disk.
             if self.has_output_weight {
-                self.resident_output = Some(Arc::new(self.catalog.load_quant_matrix("output.weight")?));
+                if let Some(arc) = self.head_cache_get(true) {
+                    self.resident_output = Some(arc);
+                } else {
+                    let m = Arc::new(self.catalog.load_quant_matrix("output.weight")?);
+                    self.head_cache_put(true, m.clone());
+                    self.io_bytes += m.nbytes() as u64;
+                    self.resident_output = Some(m);
+                }
             }
-            self.resident_embed = Some(Arc::new(self.catalog.load_quant_matrix("token_embd.weight")?));
-            self.io_bytes += self
-                .resident_output
-                .as_ref()
-                .map(|m| m.nbytes() as u64)
-                .unwrap_or(0)
-                + self
-                    .resident_embed
-                    .as_ref()
-                    .map(|m| m.nbytes() as u64)
-                    .unwrap_or(0);
+            if let Some(arc) = self.head_cache_get(false) {
+                self.resident_embed = Some(arc);
+            } else {
+                let m = Arc::new(self.catalog.load_quant_matrix("token_embd.weight")?);
+                self.head_cache_put(false, m.clone());
+                self.io_bytes += m.nbytes() as u64;
+                self.resident_embed = Some(m);
+            }
         }
 
         Ok(scratch)
