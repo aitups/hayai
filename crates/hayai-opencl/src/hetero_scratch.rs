@@ -353,6 +353,16 @@ impl StreamingScratch {
             return Ok(mirrors);
         }
         for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
+            // Audit R3/N5: an Apu/IntegratedGpu device mirror is backed by the same
+            // system RAM as the resident host base, so mirroring the whole model there
+            // doubles RAM and can OOM. UMA owners use the host base (or host-upload);
+            // only discrete devices get a per-layer VRAM mirror.
+            if matches!(
+                eng.device_info.device_kind,
+                DeviceKind::Apu | DeviceKind::IntegratedGpu
+            ) {
+                continue;
+            }
             // Audit P0.1a/R1: one buffer per layer, each under
             // CL_DEVICE_MAX_MEM_ALLOC_SIZE, instead of one monolithic buffer.
             if !mirror_fits(eng, layer_bytes) {

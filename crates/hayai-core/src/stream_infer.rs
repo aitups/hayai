@@ -2754,6 +2754,19 @@ impl StreamingGenerator {
                 };
             }
         }
+        // Hybrid (Qwen3.5 DeltaNet): the DeltaNet FFN weights are not part of the generic
+        // resident layer pack (they are read per token), so a resident window gives no
+        // speedup and doubles RAM. Under AutoFit, keep the fast streaming cadence.
+        if self.memory_strategy == MemoryStrategy::AutoFit
+            && self.model_kind() == ModelKind::Hybrid
+            && win.resident
+        {
+            win = WindowPlan {
+                k_chunk: 1,
+                resident: false,
+                window_bytes: 2 * full_bytes as u64,
+            };
+        }
         self.window_plan = Some(win);
         let resident = win.resident && win.k_chunk >= self.config.num_layers;
         let layer_bytes = if resident { full_bytes } else { window_bytes };
