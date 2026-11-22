@@ -158,8 +158,53 @@ pub fn gemv_q6_k_q8k(
     if data.len() < nrows * row_bytes {
         return Err(GgufError::Truncated("q6_k gemv"));
     }
-    // Honest fallback: integer Q6_K dot is not implemented yet (do not pretend).
-    gemv_q6_k(nrows, ncols, data, input, output)
+    // Real integer dot (audit C.2/I1): accumulate `sum((q-32)*xq)` per (stream, 16-group)
+    // in i32, then apply `d_weights * d_q8 * scale` once.
+    let q8 = crate::q8k::Q8K::quantize(input);
+    for (row, out) in output.iter_mut().enumerate() {
+        *out = gemv_q6k_row_q8k(data, &q8, row, blocks_per_row);
+    }
+    Ok(())
+}
+
+#[inline]
+fn gemv_q6k_row_q8k(data: &[u8], q8: &crate::q8k::Q8K, row: usize, blocks: usize) -> f32 {
+    let row_base = row * blocks * Q6_K_BLOCK_BYTES;
+    let mut sum = 0.0f32;
+    for b in 0..blocks {
+        let block = &data[row_base + b * Q6_K_BLOCK_BYTES..];
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let dq = q8.d[b] * d;
+        let xq = q8.qs_block(b);
+        for chunk in 0..2 {
+            let qlo = chunk * 64;
+            let qho = chunk * 32;
+            let sco = chunk * 8;
+            let xbase = chunk * 128;
+            let mut acc = [[0i32; 2]; 4];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[qlo + l] & 0x0F) | (((qh[qho + l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[qlo + l + 32] & 0x0F) | (((qh[qho + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4)) as i32 - 32;
+                acc[0][is] += q1 * (xq[xbase + l] as i32);
+                acc[1][is] += q2 * (xq[xbase + l + 32] as i32);
+                acc[2][is] += q3 * (xq[xbase + l + 64] as i32);
+                acc[3][is] += q4 * (xq[xbase + l + 96] as i32);
+            }
+            for (st, row_acc) in acc.iter().enumerate() {
+                for (is, a) in row_acc.iter().enumerate() {
+                    let sc = scales[sco + 2 * st + is] as i8 as f32;
+                    sum += dq * sc * *a as f32;
+                }
+            }
+        }
+    }
+    sum
 }
 
 pub fn extract_q6_k_row(

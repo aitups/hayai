@@ -318,8 +318,71 @@ pub fn gemv_q4_k_q8k(
     }
     assert_eq!(input.len(), ncols);
     assert_eq!(output.len(), nrows);
-    // Honest fallback: integer Q4_K dot is not implemented yet (do not pretend).
-    gemv_q4_k(nrows, ncols, data, input, output)
+    // Real integer dot (audit C.2/I1): quantise the activation once and accumulate
+    // `sum(q_i * xq_i)` / `sum(xq_i)` per 32-sub-block in i32, applying the block
+    // scale/min once. Consumes `Q8K.qs`; no dequantised f32 copy.
+    let q8 = crate::q8k::Q8K::quantize(input);
+    for (row, out) in output.iter_mut().enumerate() {
+        *out = gemv_q4k_row_q8k(data, &q8, row, blocks_per_row);
+    }
+    Ok(())
+}
+
+/// Integer Q4_K row dot against a Q8_K activation for one row.
+#[inline]
+fn gemv_q4k_row_q8k(data: &[u8], q8: &crate::q8k::Q8K, row: usize, blocks: usize) -> f32 {
+    let row_base = row * blocks * Q4_K_BLOCK_BYTES;
+    let mut sum = 0.0f32;
+    for b in 0..blocks {
+        let block = &data[row_base + b * Q4_K_BLOCK_BYTES..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        let dq = q8.d[b];
+        let xq = q8.qs_block(b);
+        let mut is = 0usize;
+        let mut xo = 0usize;
+        let mut qo = 0usize;
+        for _ in 0..4 {
+            let (sc0, m0) = get_scale_min_k4(is, scales);
+            let (sc1, m1) = get_scale_min_k4(is + 1, scales);
+            let (sqx0, sx0) = int_dot_nibbles_low(&qs[qo..qo + 32], &xq[xo..xo + 32]);
+            sum += dq * (d * sc0 as f32 * sqx0 as f32 - min * m0 as f32 * sx0 as f32);
+            let (sqx1, sx1) = int_dot_nibbles_high(&qs[qo..qo + 32], &xq[xo + 32..xo + 64]);
+            sum += dq * (d * sc1 as f32 * sqx1 as f32 - min * m1 as f32 * sx1 as f32);
+            xo += 64;
+            qo += 32;
+            is += 2;
+        }
+    }
+    sum
+}
+
+#[inline]
+fn int_dot_nibbles_low(bytes: &[u8], xq: &[i8]) -> (i32, i32) {
+    let mut sqx = 0i32;
+    let mut sx = 0i32;
+    for j in 0..32 {
+        let q = (bytes[j] & 0x0F) as i32;
+        let x = xq[j] as i32;
+        sqx += q * x;
+        sx += x;
+    }
+    (sqx, sx)
+}
+
+#[inline]
+fn int_dot_nibbles_high(bytes: &[u8], xq: &[i8]) -> (i32, i32) {
+    let mut sqx = 0i32;
+    let mut sx = 0i32;
+    for j in 0..32 {
+        let q = (bytes[j] >> 4) as i32;
+        let x = xq[j] as i32;
+        sqx += q * x;
+        sx += x;
+    }
+    (sqx, sx)
 }
 /// Extract one embedding row from a Q4_K matrix (nrows = vocab, ncols = hidden).
 pub fn extract_q4_k_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
