@@ -72,18 +72,19 @@ __kernel void hayai_rope_apply(
     __global const float* restrict sinv)
 {
     int idx = (int)get_global_id(0);          // one work-item per (row, pair)
-    int half = rotary_dim >> 1;
-    int total = n_rows * half;
+    int hd2 = rotary_dim >> 1;
+    int total = n_rows * hd2;
     if (idx >= total) {
         return;
     }
-    int row = idx / half;
-    int p = idx - row * half;
+    int row = idx / hd2;
+    int p = idx - row * hd2;
     int base = row * head_dim;
     float a = x[base + p];
-    float b = x[base + half + p];
+    float b = x[base + hd2 + p];
     float c = cosv[p];
     float s = sinv[p];
     x[base + p] = a * c - b * s;
-    x[base + half + p] = a * s + b * c;
+    x[base + hd2 + p] = a * s + b * c;
 }
+
