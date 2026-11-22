@@ -1,5 +1,6 @@
 //! Gemma4 text-only forward: SWA/global heads, shared KV, per-layer embeddings, GELU FFN.
 
+use crate::exec_plan::op_binding;
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
     ffn_begin_gate_up_scratch, ffn_finish_gelu_scratch, StreamInferError, StreamingGenerator,
@@ -7,7 +8,58 @@ use crate::stream_infer::{
 use hayai_cpu::{attention_decode_step_ex, rms_norm, AttentionConfig, LayerKvCache};
 use hayai_model::GgufCatalog;
 use hayai_opencl::StreamingScratch;
+use std::sync::Arc;
 use std::time::Instant;
+
+/// Per-model cache of Gemma4 PLE matrices (audit I4): `per_layer_model_proj` and each
+/// layer's `inp_gate`/`proj`/`post_norm` are loaded from disk **once**, not per layer and
+/// per token.
+#[derive(Default)]
+pub(crate) struct PleCache {
+    inited: bool,
+    model_proj: Option<Arc<hayai_model::QuantMatrix>>,
+    proj_norm: Option<Vec<f32>>,
+    inp_gate: Vec<Option<Arc<hayai_model::QuantMatrix>>>,
+    proj: Vec<Option<Arc<hayai_model::QuantMatrix>>>,
+    post_norm: Vec<Option<Vec<f32>>>,
+}
+
+impl PleCache {
+    fn ensure(&mut self, gen: &mut StreamingGenerator) -> Result<(), StreamInferError> {
+        if self.inited {
+            return Ok(());
+        }
+        let n = gen.config.num_layers;
+        self.model_proj = Some(Arc::new(
+            gen.catalog.load_quant_matrix("per_layer_model_proj.weight")?,
+        ));
+        self.proj_norm = gen.catalog.dequant_f32("per_layer_proj_norm.weight").ok();
+        self.inp_gate = Vec::with_capacity(n);
+        self.proj = Vec::with_capacity(n);
+        self.post_norm = Vec::with_capacity(n);
+        for layer in 0..n {
+            self.inp_gate.push(
+                gen.catalog
+                    .load_quant_matrix(&format!("blk.{layer}.inp_gate.weight"))
+                    .ok()
+                    .map(Arc::new),
+            );
+            self.proj.push(
+                gen.catalog
+                    .load_quant_matrix(&format!("blk.{layer}.proj.weight"))
+                    .ok()
+                    .map(Arc::new),
+            );
+            self.post_norm.push(
+                gen.catalog
+                    .dequant_f32(&format!("blk.{layer}.post_norm.weight"))
+                    .ok(),
+            );
+        }
+        self.inited = true;
+        Ok(())
+    }
+}
 
 /// Build per-layer KV caches with SWA vs global head dims / windows.
 pub(crate) fn build_layer_kv_caches(
@@ -279,7 +331,7 @@ fn forward_gemma_inner(
         let kv_dim = layer_cfg.kv_dim();
         let mut q = vec![0.0f32; pack.wq.nrows.max(q_dim)];
         q.truncate(pack.wq.nrows);
-        pack.wq.gemv(&xn, &mut q)?;
+        orch.execute_op_bound(crate::LayerOpKind::AttnQ, op_binding(crate::LayerOpKind::AttnQ), &pack.wq, &xn, &mut q, Some(&*scratch), layer, layout.wq_off)?;
         q.resize(q_dim, 0.0);
         if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
             apply_head_rmsnorm(&mut q, qn, layer_cfg.num_heads, layer_cfg.head_dim);
@@ -291,7 +343,7 @@ fn forward_gemma_inner(
         let mut v = vec![0.0f32; kv_dim];
         if write_kv {
             let mut k_raw = vec![0.0f32; pack.wk.nrows];
-            pack.wk.gemv(&xn, &mut k_raw)?;
+            orch.execute_op_bound(crate::LayerOpKind::AttnK, op_binding(crate::LayerOpKind::AttnK), &pack.wk, &xn, &mut k_raw, Some(&*scratch), layer, layout.wk_off)?;
             k_raw.resize(kv_dim, 0.0);
             let k_pre_norm = k_raw.clone();
             if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
@@ -300,7 +352,7 @@ fn forward_gemma_inner(
             k = k_raw;
             if pack.wv.nrows > 0 {
                 let mut v_raw = vec![0.0f32; pack.wv.nrows];
-                pack.wv.gemv(&xn, &mut v_raw)?;
+                orch.execute_op_bound(crate::LayerOpKind::AttnV, op_binding(crate::LayerOpKind::AttnV), &pack.wv, &xn, &mut v_raw, Some(&*scratch), layer, layout.wv_off)?;
                 v_raw.resize(kv_dim, 0.0);
                 // Gemma4: per-head RMSNorm V without learned weight (llama ggml_rms_norm
                 // after reshape to [head_dim, n_kv, tokens]).
@@ -346,7 +398,7 @@ fn forward_gemma_inner(
 
         let mut attn_proj = vec![0.0f32; h];
         if pack.wo.ncols == attn_out.len() {
-            pack.wo.gemv(&attn_out, &mut attn_proj)?;
+            orch.execute_op_bound(crate::LayerOpKind::AttnO, op_binding(crate::LayerOpKind::AttnO), &pack.wo, &attn_out, &mut attn_proj, Some(&*scratch), layer, layout.wo_off)?;
         } else {
             return Err(StreamInferError::Msg(format!(
                 "gemma wo ncols {} != attn {}",
@@ -464,9 +516,11 @@ fn build_per_layer_inputs(
         *v *= scale;
     }
 
-    let proj = gen
-        .catalog
-        .load_quant_matrix("per_layer_model_proj.weight")?;
+    let mut cache = gen.ple_cache.take().unwrap_or_default();
+    cache.ensure(gen)?;
+    let proj = cache.model_proj.clone().expect("ple model proj");
+    let pn_opt = cache.proj_norm.clone();
+    gen.ple_cache = Some(cache);
     // proj: [n_embd → n_layers * d]
     let mut h_proj = vec![0.0f32; total];
     orch.execute_quant_gemv(&proj, h_emb, &mut h_proj)?;
@@ -474,7 +528,7 @@ fn build_per_layer_inputs(
     for v in h_proj.iter_mut() {
         *v *= proj_scale;
     }
-    if let Ok(pn) = gen.catalog.dequant_f32("per_layer_proj_norm.weight") {
+    if let Some(pn) = pn_opt {
         // Norm is over the per_layer_dim axis for each layer slice.
         for layer in 0..n_layers {
             let base = layer * d;
@@ -493,7 +547,6 @@ fn build_per_layer_inputs(
     for i in 0..total {
         tok_ple[i] = (tok_ple[i] + h_proj[i]) * input_scale;
     }
-    gen.io_bytes += proj.nbytes() as u64;
     Ok(tok_ple)
 }
 
@@ -511,10 +564,16 @@ fn apply_per_layer_emb(
     if base + d > ple_all.len() {
         return Ok(());
     }
+    let mut cache = gen.ple_cache.take().unwrap_or_default();
+    cache.ensure(gen)?;
+    let gate_opt = cache.inp_gate.get(layer).and_then(|o| o.clone());
+    let proj_opt = cache.proj.get(layer).and_then(|o| o.clone());
+    let pn = cache.post_norm.get(layer).and_then(|o| o.clone());
+    gen.ple_cache = Some(cache);
+    let (Some(gate), Some(proj)) = (gate_opt, proj_opt) else {
+        return Ok(());
+    };
     let pe_in = x.to_vec();
-    let gate = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.inp_gate.weight"))?;
     // inp_gate: [n_embd → d]
     let mut g = vec![0.0f32; d];
     orch.execute_quant_gemv(&gate, x, &mut g)?;
@@ -529,22 +588,15 @@ fn apply_per_layer_emb(
     for i in 0..d {
         g[i] *= ple[i];
     }
-    let proj = gen
-        .catalog
-        .load_quant_matrix(&format!("blk.{layer}.proj.weight"))?;
     // proj: [d → n_embd]
     let mut delta = vec![0.0f32; h];
     orch.execute_quant_gemv(&proj, &g, &mut delta)?;
-    if let Ok(pn) = gen
-        .catalog
-        .dequant_f32(&format!("blk.{layer}.post_norm.weight"))
-    {
+    if let Some(pn) = pn {
         rms_norm(&mut delta, &pn, gen.config.rms_norm_eps);
     }
     for i in 0..h {
         x[i] = pe_in[i] + delta[i];
     }
-    gen.io_bytes += (gate.nbytes() + proj.nbytes()) as u64;
     Ok(())
 }
 

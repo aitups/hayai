@@ -527,6 +527,8 @@ pub struct StreamingGenerator {
     pub(crate) resident_embed: Option<Arc<QuantMatrix>>,
     /// Cross-request cache for the final projection / tied embedding (server only).
     pub(crate) head_cache: Option<Arc<std::sync::Mutex<crate::session::HeadCache>>>,
+    /// Gemma4 per-layer-input matrices, loaded once per model (audit I4).
+    pub(crate) ple_cache: Option<crate::gemma_infer::PleCache>,
     /// MoE resident non-expert (attn + router + shared expert) bytes per layer,
     /// cached after the first read so subsequent tokens skip the disk. Bounded by
     /// `moe_non_expert_cap`. Experts are streamed sparsely (never cached here).
@@ -1312,6 +1314,7 @@ impl StreamingGenerator {
             resident_output: None,
             resident_embed: None,
             head_cache: None,
+            ple_cache: None,
         })
     }
 
