@@ -453,14 +453,21 @@ impl Generator {
             prompt_tokens: prompt_len,
             new_tokens,
             total_positions: self.position,
+            ..Default::default()
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GenerateStats {
     pub text: String,
     pub prompt_tokens: usize,
     pub new_tokens: usize,
     pub total_positions: usize,
+    /// Wall time of session init (calibration + resident preload), excluded from decode.
+    pub init_secs: f64,
+    /// Wall time of prompt prefill.
+    pub prefill_secs: f64,
+    /// Wall time of the decode loop only.
+    pub decode_secs: f64,
 }

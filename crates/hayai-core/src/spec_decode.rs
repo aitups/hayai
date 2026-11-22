@@ -190,6 +190,7 @@ impl StreamingGenerator {
             prompt_tokens: prompt_len,
             new_tokens: all_new.len(),
             total_positions: self.position,
+            ..Default::default()
         })
     }
 }

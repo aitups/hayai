@@ -281,7 +281,7 @@ enum Commands {
         prompt: String,
         #[arg(long, default_value = "16")]
         max_tokens: usize,
-        #[arg(long, default_value = "cpu")]
+        #[arg(long, default_value = "auto")]
         device: String,
         #[arg(long, default_value = "4")]
         sinks: usize,
@@ -290,8 +290,8 @@ enum Commands {
         /// Disable ChatML wrap (send prompt as-is; better for fair llama.cpp compare)
         #[arg(long, default_value_t = false)]
         raw: bool,
-        /// Memory window strategy: auto (opt-in residency) | minimal (default) | cap_mb
-        #[arg(long, default_value = "minimal")]
+        /// Memory window strategy: auto (opt-in residency) | minimal | cap_mb
+        #[arg(long, default_value = "auto")]
         memory_strategy: String,
     },
 
@@ -1399,13 +1399,20 @@ fn cmd_bench_generate(
     println!("  Prompt tokens: {}", stats.prompt_tokens);
     println!("  New tokens:    {}", stats.new_tokens);
     println!("  Wall time:     {secs:.2}s");
+    // Audit P0.4b/N7: init (calibration + preload), prefill and decode are reported
+    // separately so `decode tok/s` is not diluted by init/prefill.
+    println!("  Init time:     {:.2}s", stats.init_secs);
     println!(
-        "  Decode tok/s:  {:.2}",
-        stats.new_tokens as f64 / secs.max(1e-9)
+        "  Prefill:       {:.2} tok/s ({} tok in {:.2}s)",
+        stats.prompt_tokens as f64 / stats.prefill_secs.max(1e-9),
+        stats.prompt_tokens,
+        stats.prefill_secs
     );
     println!(
-        "  Prefill+dec:   {:.2} tok/s",
-        stats.total_positions as f64 / secs.max(1e-9)
+        "  Decode tok/s:  {:.2} ({} tok in {:.2}s)",
+        stats.new_tokens as f64 / stats.decode_secs.max(1e-9),
+        stats.new_tokens,
+        stats.decode_secs
     );
     println!(
         "  Timers:        io={:.2}s attn={:.2}s ffn={:.2}s dma={:.2}s map={:.2}s",

@@ -2978,6 +2978,7 @@ impl StreamingGenerator {
             prompt_tokens,
             new_tokens: all_new.len(),
             total_positions: self.position,
+            ..Default::default()
         })
     }
 
@@ -3162,13 +3163,17 @@ impl StreamingGenerator {
         debug!("stream prompt tokens: {}", prompt_ids.len());
         let prompt_len = prompt_ids.len();
 
+        let t_init = Instant::now();
         let mut scratch = self.prepare_session(orch)?;
-        let wall0 = Instant::now();
+        let init_secs = t_init.elapsed().as_secs_f64();
+        let t_prefill = Instant::now();
         let mut last_logits = self.prefill(orch, &prompt_ids, &mut scratch)?;
+        let prefill_secs = t_prefill.elapsed().as_secs_f64();
         if let Some(g) = &self.grammar {
             self.grammar_state = Some(g.initial_state());
         }
         let mut all_new = Vec::new();
+        let t_decode = Instant::now();
         for _ in 0..max_new_tokens {
             if self.grammar.is_some() {
                 self.mask_logits_with_grammar(&mut last_logits);
@@ -3187,7 +3192,8 @@ impl StreamingGenerator {
             all_new.push(next);
             last_logits = self.decode_step(orch, next, &mut scratch)?;
         }
-        self.wall_compute_secs = wall0.elapsed().as_secs_f64();
+        let decode_secs = t_decode.elapsed().as_secs_f64();
+        self.wall_compute_secs = prefill_secs + decode_secs;
 
         if let (Some(mem), Some(budget)) = (self.owned_mem, self.memory_budget) {
             // El híbrido Qwen3.5 mantiene el cache DeltaNet/SSM (~1 GB) fuera del
@@ -3203,6 +3209,9 @@ impl StreamingGenerator {
             prompt_tokens: prompt_len,
             new_tokens: all_new.len(),
             total_positions: self.position,
+            init_secs,
+            prefill_secs,
+            decode_secs,
         })
     }
 
@@ -3365,6 +3374,7 @@ impl StreamingGenerator {
             prompt_tokens: prompt_len,
             new_tokens: all_new.len(),
             total_positions: self.position,
+            ..Default::default()
         })
     }
 
