@@ -277,5 +277,18 @@ deterministically from disk (ping-pong buffers), never via OS `mmap`.
   layer reads in flight. Depth > 2 is enabled only with no device mirror (the CPU path is
   validated at depth 3); the GPU mirror DMA path is validated at depth 2 and N-slot
   mirrors still need work.
+- **GPU/OpenCL recent (audit follow-up):** all GGML GEMV kernels with a GPU path are
+  warp-striped (32 lanes/row, incl. the IQ2/IQ3 grid-LUT quants) and take no `__local`
+  input buffer. `hayai_attn_decode` has a FlashDecoding split-K path for long contexts
+  (`hayai_attn_decode_split` + `_combine`, `n_heads*n_splits`); `deltanet_step` reuses a
+  `DeltanetWorkspace`; `silu_mul`/`rms_norm` live in `nn_ops.cl`. Coarse-SVM
+  Apu/Integrated owners read the host base **zero-copy** (no mirror); coarse SVM is bound
+  only on UMA owners and discrete devices always use their mirror. `HAYAI_FFN_DEV=1`
+  runs a Dense FFN gate → `silu_mul` → down entirely on one mirrored device (off by
+  default; prefill-batched, GELU/gemma and override/CSR paths opt out). `HAYAI_CALIB_QUANTS=1`
+  reports per-quant resident GB/s for every quant label incl. IQ. **Open:** macro-chunk
+  still host-uploads the FFN (the mirror GEMV is byte-identical to the upload path, but
+  the full decode diverges when the mirror is bound — root cause open), and the GPU
+  N-slot mirror (`HAYAI_PREFETCH_DEPTH > 2`) still needs the T4.
 - `PRD.md`, `implementation_plan.md`, and `pr_soporte_gguf_disperso_v3.md` are the design
   sources of truth.
