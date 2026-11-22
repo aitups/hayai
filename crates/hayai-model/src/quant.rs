@@ -447,9 +447,32 @@ fn f16_dot_impl(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn f16_dot_avx2(data: &[u8], base: usize, ncols: usize, x: &[f32]) -> f32 {
-    f16_dot_impl(data, base, ncols, x)
+    // Audit P0.3: convert FP16 weights with the hardware `vcvtph2ps` (F16C) and
+    // accumulate with FMA, instead of decoding each half in software.
+    use core::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut c = 0usize;
+    while c + 8 <= ncols {
+        let h = _mm_loadu_si128(data.as_ptr().add(base + c * 2) as *const __m128i);
+        let f = _mm256_cvtph_ps(h);
+        let xv = _mm256_loadu_ps(x.as_ptr().add(c));
+        acc = _mm256_fmadd_ps(f, xv, acc);
+        c += 8;
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let mut s4 = _mm_add_ps(lo, hi);
+    s4 = _mm_hadd_ps(s4, s4);
+    s4 = _mm_hadd_ps(s4, s4);
+    let mut s = _mm_cvtss_f32(s4);
+    while c < ncols {
+        let o = base + c * 2;
+        s += f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]])) * x[c];
+        c += 1;
+    }
+    s
 }
 
 #[inline]
