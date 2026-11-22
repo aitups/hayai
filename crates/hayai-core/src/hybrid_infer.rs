@@ -311,24 +311,15 @@ fn output_logits(
     gen.last_hidden_nextn.extend_from_slice(x);
     let vocab = gen.config.vocab_size;
     let mut logits = vec![0.0f32; vocab];
+    // Audit I3: load the head once through the shared cache (was re-read from disk on
+    // every token in streaming mode).
+    gen.ensure_head_loaded()?;
     if gen.has_output_weight {
-        if let Some(ow) = &gen.resident_output {
-            orch.execute_quant_gemv(ow, x, &mut logits)?;
-        } else {
-            let t0 = Instant::now();
-            let ow = gen.catalog.load_quant_matrix("output.weight")?;
-            gen.io_secs += t0.elapsed().as_secs_f64();
-            gen.io_bytes += ow.nbytes() as u64;
-            orch.execute_quant_gemv(&ow, x, &mut logits)?;
-        }
-    } else if let Some(emb) = &gen.resident_embed {
-        orch.execute_quant_gemv(emb, x, &mut logits)?;
+        let ow = gen.resident_output.as_ref().expect("head loaded");
+        orch.execute_quant_gemv(ow, x, &mut logits)?;
     } else {
-        let t0 = Instant::now();
-        let emb = gen.catalog.load_quant_matrix("token_embd.weight")?;
-        gen.io_secs += t0.elapsed().as_secs_f64();
-        gen.io_bytes += emb.nbytes() as u64;
-        orch.execute_quant_gemv(&emb, x, &mut logits)?;
+        let emb = gen.resident_embed.as_ref().expect("head loaded");
+        orch.execute_quant_gemv(emb, x, &mut logits)?;
     }
     Ok(logits)
 }

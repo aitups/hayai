@@ -440,26 +440,14 @@ impl StreamingGenerator {
         rms_norm(&mut xn, &self.output_norm, eps);
         let vocab = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab];
+        // Audit I3: head via the shared cache, not a per-token disk read.
+        self.ensure_head_loaded()?;
         if self.has_output_weight {
-            if let Some(ow) = &self.resident_output {
-                orch.execute_quant_gemv(ow, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let ow = self.catalog.load_quant_matrix("output.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += ow.nbytes() as u64;
-                orch.execute_quant_gemv(&ow, &xn, &mut logits)?;
-            }
+            let ow = self.resident_output.as_ref().expect("head loaded");
+            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
         } else {
-            if let Some(emb) = &self.resident_embed {
-                orch.execute_quant_gemv(emb, &xn, &mut logits)?;
-            } else {
-                let t0 = Instant::now();
-                let emb = self.catalog.load_quant_matrix("token_embd.weight")?;
-                self.io_secs += t0.elapsed().as_secs_f64();
-                self.io_bytes += emb.nbytes() as u64;
-                orch.execute_quant_gemv(&emb, &xn, &mut logits)?;
-            }
+            let emb = self.resident_embed.as_ref().expect("head loaded");
+            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
         }
         self.apply_logit_scale(&mut logits);
         if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
