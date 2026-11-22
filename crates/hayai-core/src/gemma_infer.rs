@@ -235,10 +235,250 @@ pub(crate) fn prefill_gemma(
     tokens: &[u32],
     scratch: &mut StreamingScratch,
 ) -> Result<Vec<f32>, StreamInferError> {
-    let n = tokens.len();
-    let mut logits = Vec::new();
-    for (i, &tok) in tokens.iter().enumerate() {
-        logits = forward_gemma_inner(gen, orch, Some(tok), None, scratch, i + 1 == n)?;
+    let h = gen.config.hidden_size;
+    let eps = gen.config.rms_norm_eps;
+    let n_layers = gen.config.num_layers;
+    let t_count = tokens.len();
+    if t_count == 0 {
+        return Ok(Vec::new());
+    }
+    let meta = GemmaMeta::from_catalog(&gen.catalog, &gen.config)?;
+    let rope_freqs = gen.gemma_rope_freqs.clone();
+    let emb_scale = (h as f32).sqrt();
+
+    // Initial hidden state + per-layer inputs (PLE) for every prompt token, computed once.
+    let mut xs: Vec<Vec<f32>> = Vec::with_capacity(t_count);
+    let mut ples: Vec<Option<Vec<f32>>> = Vec::with_capacity(t_count);
+    for &tok in tokens {
+        let mut x = vec![0.0f32; h];
+        gen.embed_row("token_embd.weight", tok, h, &mut x)?;
+        for v in x.iter_mut() {
+            *v *= emb_scale;
+        }
+        let ple = if meta.per_layer_dim > 0 {
+            Some(build_per_layer_inputs(gen, orch, tok, &x, &meta)?)
+        } else {
+            None
+        };
+        xs.push(x);
+        ples.push(ple);
+    }
+
+    // Layer-major: read each layer pack once and run every prompt token through it
+    // (audit I4). Previously the whole model was re-read once per prompt token.
+    for layer in 0..n_layers {
+        if gen
+            .catalog
+            .tensor(&format!("blk.{layer}.attn_q.weight"))
+            .is_err()
+        {
+            continue;
+        }
+        let slot = layer % 2;
+        let (pack, layout) = gen.stage_pack(orch, scratch, slot, layer)?;
+        gen.begin_ffn_dma(orch, scratch, slot, &layout)?;
+        let t_attn = Instant::now();
+        let layer_cfg = meta.layer_attn(layer);
+        let q_dim = layer_cfg.hidden_size();
+        let kv_dim = layer_cfg.kv_dim();
+        let write_kv = meta.has_kv(layer);
+        let kv_i = meta.kv_source(layer);
+        let factors = if meta.is_swa(layer) {
+            None
+        } else {
+            rope_freqs.as_deref()
+        };
+
+        for t in 0..t_count {
+            let mut xn = xs[t].clone();
+            rms_norm(&mut xn, &gen.layer_norms[layer].attn_norm, eps);
+
+            let mut q = vec![0.0f32; pack.wq.nrows.max(q_dim)];
+            q.truncate(pack.wq.nrows);
+            orch.execute_op_bound(
+                crate::LayerOpKind::AttnQ,
+                op_binding(crate::LayerOpKind::AttnQ),
+                &pack.wq,
+                &xn,
+                &mut q,
+                Some(&*scratch),
+                layer,
+                layout.wq_off,
+            )?;
+            q.resize(q_dim, 0.0);
+            if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
+                apply_head_rmsnorm(&mut q, qn, layer_cfg.num_heads, layer_cfg.head_dim);
+            }
+
+            let mut k = vec![0.0f32; kv_dim];
+            let mut v = vec![0.0f32; kv_dim];
+            if write_kv {
+                let mut k_raw = vec![0.0f32; pack.wk.nrows];
+                orch.execute_op_bound(
+                    crate::LayerOpKind::AttnK,
+                    op_binding(crate::LayerOpKind::AttnK),
+                    &pack.wk,
+                    &xn,
+                    &mut k_raw,
+                    Some(&*scratch),
+                    layer,
+                    layout.wk_off,
+                )?;
+                k_raw.resize(kv_dim, 0.0);
+                let k_pre_norm = k_raw.clone();
+                if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
+                    apply_head_rmsnorm(&mut k_raw, kn, layer_cfg.num_kv_heads, layer_cfg.head_dim);
+                }
+                k = k_raw;
+                if pack.wv.nrows > 0 {
+                    let mut v_raw = vec![0.0f32; pack.wv.nrows];
+                    orch.execute_op_bound(
+                        crate::LayerOpKind::AttnV,
+                        op_binding(crate::LayerOpKind::AttnV),
+                        &pack.wv,
+                        &xn,
+                        &mut v_raw,
+                        Some(&*scratch),
+                        layer,
+                        layout.wv_off,
+                    )?;
+                    v_raw.resize(kv_dim, 0.0);
+                    rms_norm_plain_heads(
+                        &mut v_raw,
+                        layer_cfg.num_kv_heads,
+                        layer_cfg.head_dim,
+                        eps,
+                    );
+                    v = v_raw;
+                } else {
+                    let mut v_raw = k_pre_norm;
+                    rms_norm_plain_heads(
+                        &mut v_raw,
+                        layer_cfg.num_kv_heads,
+                        layer_cfg.head_dim,
+                        eps,
+                    );
+                    v = v_raw;
+                }
+            }
+
+            let mut attn_out = vec![0.0f32; q_dim];
+            attention_decode_step_ex(
+                &layer_cfg,
+                &mut gen.kv[kv_i],
+                &mut q,
+                &mut k,
+                &v,
+                t,
+                &mut attn_out,
+                write_kv,
+                factors,
+                None,
+                true,
+            );
+
+            let mut attn_proj = vec![0.0f32; h];
+            if pack.wo.ncols == attn_out.len() {
+                orch.execute_op_bound(
+                    crate::LayerOpKind::AttnO,
+                    op_binding(crate::LayerOpKind::AttnO),
+                    &pack.wo,
+                    &attn_out,
+                    &mut attn_proj,
+                    Some(&*scratch),
+                    layer,
+                    layout.wo_off,
+                )?;
+            } else {
+                return Err(StreamInferError::Msg(format!(
+                    "gemma wo ncols {} != attn {}",
+                    pack.wo.ncols,
+                    attn_out.len()
+                )));
+            }
+            if let Some(pn) = &gen.layer_norms[layer].post_attn_norm {
+                rms_norm(&mut attn_proj, pn, eps);
+            }
+            for i in 0..h {
+                xs[t][i] += attn_proj[i];
+            }
+
+            // FFN: norm → GELU-gated → post_ffw_norm → residual
+            let attn_residual = xs[t].clone();
+            let mut xn2 = xs[t].clone();
+            rms_norm(&mut xn2, &gen.layer_norms[layer].ffn_norm, eps);
+            gen.ws_gate.fill(0.0);
+            gen.ws_up.fill(0.0);
+            gen.ws_down.fill(0.0);
+            let t_ffn = Instant::now();
+            let inflight = ffn_begin_gate_up_scratch(
+                orch,
+                &pack.gate,
+                &pack.up,
+                &xn2,
+                &mut gen.ws_gate,
+                &mut gen.ws_up,
+                &mut gen.used_dgpu,
+                &mut gen.used_apu,
+                Some(scratch),
+                layer,
+                Some(&layout),
+                false,
+            )?;
+            ffn_finish_gelu_scratch(
+                orch,
+                inflight,
+                &pack.down,
+                &mut gen.ws_gate,
+                &mut gen.ws_up,
+                &mut gen.ws_down,
+                &mut gen.used_dgpu,
+                Some(scratch),
+                layer,
+                Some(&layout),
+            )?;
+            gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
+            let mut down = gen.ws_down.clone();
+            if let Some(pn) = &gen.layer_norms[layer].post_ffw_norm {
+                rms_norm(&mut down, pn, eps);
+            }
+            for i in 0..h {
+                xs[t][i] = attn_residual[i] + down[i];
+            }
+
+            if let Some(ple_all) = ples[t].as_ref() {
+                apply_per_layer_emb(gen, orch, layer, &meta, ple_all, &mut xs[t])?;
+            }
+            if let Some(s) = gen.layer_norms[layer].layer_output_scale {
+                for v in xs[t].iter_mut() {
+                    *v *= s;
+                }
+            }
+        }
+        gen.finish_ffn_unmap(orch, scratch, slot)?;
+        gen.attn_secs += t_attn.elapsed().as_secs_f64();
+    }
+
+    gen.position += t_count;
+
+    // Logits for the last prompt token only.
+    let mut xn = xs.pop().expect("prompt tokens");
+    rms_norm(&mut xn, &gen.output_norm, eps);
+    let vocab = gen.config.vocab_size;
+    let mut logits = vec![0.0f32; vocab];
+    gen.ensure_head_loaded()?;
+    if gen.has_output_weight {
+        let ow = gen.resident_output.clone().expect("head loaded");
+        gen.head_gemv(orch, &ow, &xn, &mut logits)?;
+    } else {
+        let emb = gen.resident_embed.clone().expect("head loaded");
+        gen.head_gemv(orch, &emb, &xn, &mut logits)?;
+    }
+    if meta.softcap > 0.0 {
+        let inv = 1.0 / meta.softcap;
+        for l in logits.iter_mut() {
+            *l = meta.softcap * (*l * inv).tanh();
+        }
     }
     Ok(logits)
 }
