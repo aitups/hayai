@@ -839,17 +839,55 @@ fn q8_0_row_dispatch(
     q8_0_row(data, input, row_base, blocks_per_row)
 }
 
-/// Q4_0 × Q8_0 GEMV (audit C.2): quantise the activation to Q8_0 (32-element blocks)
-/// once, then dot the pre-scaled int8 activations (exact for these small ints).
+/// Q4_0 × Q8_0 GEMV (audit C.2/I1): quantise the activation once to Q8_0 (32-element
+/// blocks) and compute the dot in **integer** (`i32`) accumulators, scaled per block.
 pub fn gemv_q4_0_q8k(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    assert_eq!(input.len(), ncols);
+    let blocks = ncols / 32;
+    let row_bytes = blocks * 18;
+    assert!(data.len() >= output.len() * row_bytes, "q4_0 q8k: truncated");
     let q8 = crate::q8k::Q8K::quantize_blocked(input, 32);
-    gemv_q4_0(ncols, data, &q8.scaled, output);
+    for (row, out) in output.iter_mut().enumerate() {
+        let mut sum = 0.0f32;
+        for b in 0..blocks {
+            let bb = row * row_bytes + b * 18;
+            let d = f16_to_f32(u16::from_le_bytes([data[bb], data[bb + 1]]));
+            let qs = &data[bb + 2..bb + 18];
+            let xq = q8.qs_block(b);
+            let mut idot = 0i32;
+            for i in 0..16 {
+                let lo = (qs[i] & 0x0F) as i32 - 8;
+                let hi = (qs[i] >> 4) as i32 - 8;
+                idot += lo * (xq[i] as i32) + hi * (xq[i + 16] as i32);
+            }
+            sum += d * q8.d[b] * idot as f32;
+        }
+        *out = sum;
+    }
 }
 
-/// Q8_0 × Q8_0 GEMV (audit C.2), same Q8_0 input quantisation.
+/// Q8_0 × Q8_0 GEMV (audit C.2/I1): integer dot of the int8 weights with the int8
+/// activation (`dot_i8`, AVX2 `madd_epi16` when available), scaled per block.
 pub fn gemv_q8_0_q8k(ncols: usize, data: &[u8], input: &[f32], output: &mut [f32]) {
+    assert_eq!(input.len(), ncols);
+    let blocks = ncols / 32;
+    let row_bytes = blocks * 34;
+    assert!(data.len() >= output.len() * row_bytes, "q8_0 q8k: truncated");
     let q8 = crate::q8k::Q8K::quantize_blocked(input, 32);
-    gemv_q8_0(ncols, data, &q8.scaled, output);
+    for (row, out) in output.iter_mut().enumerate() {
+        let mut sum = 0.0f32;
+        for b in 0..blocks {
+            let bb = row * row_bytes + b * 34;
+            let d = f16_to_f32(u16::from_le_bytes([data[bb], data[bb + 1]]));
+            let wbytes = &data[bb + 2..bb + 34];
+            // SAFETY: `wbytes` is a 32-byte slice; reinterpreting as i8 is valid.
+            let wi: &[i8] =
+                unsafe { std::slice::from_raw_parts(wbytes.as_ptr() as *const i8, 32) };
+            let idot = crate::q8k::dot_i8(wi, q8.qs_block(b));
+            sum += d * q8.d[b] * idot as f32;
+        }
+        *out = sum;
+    }
 }
 
 fn extract_q4_0_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
@@ -1035,6 +1073,59 @@ mod tests {
         let expect: f32 = w.iter().zip(&x).map(|(a, b)| a * b).sum();
         let got = f32_dot_impl(&w, &x);
         assert!((got - expect).abs() < 1e-3, "got={got} expect={expect}");
+    }
+
+    #[test]
+    fn q8_0_integer_dot_matches_f32_within_quant_error() {
+        let (ncols, nrows, blocks) = (64usize, 3usize, 2usize);
+        let mut data = Vec::new();
+        for r in 0..nrows {
+            for _ in 0..blocks {
+                data.extend_from_slice(&[0x00, 0x3C]); // f16 d = 1.0
+                for k in 0..32usize {
+                    let w = ((r * 7 + k * 3) % 11) as i32 - 5;
+                    data.push(w as i8 as u8);
+                }
+            }
+        }
+        let input: Vec<f32> = (0..ncols).map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.3).collect();
+        let mut a = vec![0.0f32; nrows];
+        gemv_q8_0(ncols, &data, &input, &mut a);
+        let mut b = vec![0.0f32; nrows];
+        gemv_q8_0_q8k(ncols, &data, &input, &mut b);
+        let d = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d < 0.6, "q8_0 q8k vs f32 diff {d}");
+    }
+
+    #[test]
+    fn q4_0_integer_dot_matches_f32_within_quant_error() {
+        let (ncols, nrows, blocks) = (64usize, 2usize, 2usize);
+        let mut data = Vec::new();
+        for r in 0..nrows {
+            for _ in 0..blocks {
+                data.extend_from_slice(&[0x00, 0x3C]); // f16 d = 1.0
+                for k in 0..16usize {
+                    let lo = ((r + k) % 16) as u8;
+                    let hi = ((r + k + 5) % 16) as u8;
+                    data.push(lo | (hi << 4));
+                }
+            }
+        }
+        let input: Vec<f32> = (0..ncols).map(|i| ((i * 5 % 9) as f32 - 4.0) * 0.25).collect();
+        let mut a = vec![0.0f32; nrows];
+        gemv_q4_0(ncols, &data, &input, &mut a);
+        let mut b = vec![0.0f32; nrows];
+        gemv_q4_0_q8k(ncols, &data, &input, &mut b);
+        let d = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(d < 0.5, "q4_0 q8k vs f32 diff {d}");
     }
 }
 

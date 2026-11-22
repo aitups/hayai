@@ -158,17 +158,8 @@ pub fn gemv_q6_k_q8k(
     if data.len() < nrows * row_bytes {
         return Err(GgufError::Truncated("q6_k gemv"));
     }
-    let q8 = crate::q8k::Q8K::quantize(input);
-    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
-    output
-        .par_iter_mut()
-        .with_min_len(64)
-        .enumerate()
-        .for_each(|(row, out)| {
-            let row_base = row * row_bytes;
-            *out = gemv_q6k_dispatch(use_avx2, data, &q8.scaled, row_base, blocks_per_row);
-        });
-    Ok(())
+    // Honest fallback: integer Q6_K dot is not implemented yet (do not pretend).
+    gemv_q6_k(nrows, ncols, data, input, output)
 }
 
 pub fn extract_q6_k_row(

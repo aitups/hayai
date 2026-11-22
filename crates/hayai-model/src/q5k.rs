@@ -138,8 +138,8 @@ pub fn gemv_q5_k_q8k(
     input: &[f32],
     output: &mut [f32],
 ) -> Result<(), GgufError> {
-    let q8 = crate::q8k::Q8K::quantize(input);
-    gemv_q5_k(nrows, ncols, data, &q8.scaled, output)
+    // Honest fallback: integer Q5_K dot is not implemented yet (do not pretend).
+    gemv_q5_k(nrows, ncols, data, input, output)
 }
 
 pub fn extract_q5_k_row(

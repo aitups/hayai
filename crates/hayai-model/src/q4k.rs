@@ -318,17 +318,8 @@ pub fn gemv_q4_k_q8k(
     }
     assert_eq!(input.len(), ncols);
     assert_eq!(output.len(), nrows);
-    let q8 = crate::q8k::Q8K::quantize(input);
-    let use_avx2 = crate::simd_dispatch::x86_avx2_fma();
-    output
-        .par_iter_mut()
-        .with_min_len(64)
-        .enumerate()
-        .for_each(|(row, out)| {
-            let row_base = row * row_bytes;
-            *out = gemv_q4k_dispatch(use_avx2, data, &q8.scaled, row_base, blocks_per_row);
-        });
-    Ok(())
+    // Honest fallback: integer Q4_K dot is not implemented yet (do not pretend).
+    gemv_q4_k(nrows, ncols, data, input, output)
 }
 /// Extract one embedding row from a Q4_K matrix (nrows = vocab, ncols = hidden).
 pub fn extract_q4_k_row(data: &[u8], ncols: usize, row: usize, out: &mut [f32]) -> Result<(), GgufError> {
