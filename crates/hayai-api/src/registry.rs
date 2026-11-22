@@ -24,6 +24,9 @@ pub struct ModelHandle {
     pub encoder_decoder: bool,
     /// Final projection / tied embedding, loaded once per model and shared across requests.
     pub head_cache: Arc<Mutex<hayai_core::HeadCache>>,
+    /// Parsed GGUF header/directory, reused across requests so each session skips the
+    /// header read/parse (audit D.2.3). `None` for split GGUFs.
+    pub header: Option<Arc<hayai_model::GgufHeader>>,
 }
 
 /// Server-wide registry (models discovered at startup; handles built lazily).
@@ -115,6 +118,11 @@ impl ModelRegistry {
         let encoder_decoder = hayai_core::encoder_decoder_infer::is_encoder_decoder(&cat);
         let tokenizer = Arc::new(Tokenizer::from_catalog(&cat).map_err(|e| ApiError::internal(e.to_string()))?);
         let config = hayai_core::load_config(&cat).map_err(|e| ApiError::internal(e.to_string()))?;
+        let header = if cat.is_sharded() {
+            None
+        } else {
+            Some(Arc::new(cat.header_snapshot()))
+        };
         drop(cat);
         let orch = hayai_core::EngineOrchestrator::new(self.device.clone(), config);
         let chat_template = ChatTemplate::from_model(&tokenizer, self.chat_template_override.as_deref());
@@ -129,6 +137,7 @@ impl ModelRegistry {
             memory_strategy: self.memory_strategy,
             encoder_decoder,
             head_cache: Arc::new(Mutex::new(hayai_core::HeadCache::default())),
+            header,
         })
     }
 }

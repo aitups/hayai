@@ -44,6 +44,7 @@ impl GenerationSession {
         model: impl AsRef<Path>,
         tokenizer: Arc<Tokenizer>,
         head_cache: Arc<Mutex<HeadCache>>,
+        header: Option<Arc<hayai_model::GgufHeader>>,
         sinks: usize,
         window: usize,
         memory_strategy: MemoryStrategy,
@@ -52,9 +53,14 @@ impl GenerationSession {
         orch: Arc<Mutex<EngineOrchestrator>>,
     ) -> Result<Self, StreamInferError> {
         let path = model.as_ref();
-        // Reuse the model's shared tokenizer (audit D.2.3) instead of re-opening the GGUF
-        // and rebuilding it per request: `StreamingGenerator::open` opens the catalog once.
-        let mut gen = StreamingGenerator::open(path, tokenizer, sinks, window, sampler, seed)?;
+        // Reuse the model's shared tokenizer and (when present) its parsed GGUF header
+        // (audit D.2.3) instead of re-reading/re-parsing the header per request.
+        let mut gen = match header.as_deref() {
+            Some(h) => {
+                StreamingGenerator::open_with_header(path, tokenizer, sinks, window, sampler, seed, h)?
+            }
+            None => StreamingGenerator::open(path, tokenizer, sinks, window, sampler, seed)?,
+        };
         gen.set_memory_strategy(memory_strategy);
         gen.set_head_cache(head_cache);
         let mut guard = orch.lock().unwrap_or_else(|e| e.into_inner());

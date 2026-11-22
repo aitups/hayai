@@ -809,8 +809,37 @@ impl StreamingGenerator {
         sampler: SamplerConfig,
         seed: u64,
     ) -> Result<Self, StreamInferError> {
+        Self::open_impl(path, tokenizer, sink, window, sampler, seed, None)
+    }
+
+    /// Like [`Self::open`] but reuses a previously parsed GGUF header (audit D.2.3),
+    /// skipping the header read/parse on every request.
+    pub fn open_with_header(
+        path: impl AsRef<std::path::Path>,
+        tokenizer: Arc<Tokenizer>,
+        sink: usize,
+        window: usize,
+        sampler: SamplerConfig,
+        seed: u64,
+        header: &hayai_model::GgufHeader,
+    ) -> Result<Self, StreamInferError> {
+        Self::open_impl(path, tokenizer, sink, window, sampler, seed, Some(header))
+    }
+
+    fn open_impl(
+        path: impl AsRef<std::path::Path>,
+        tokenizer: Arc<Tokenizer>,
+        sink: usize,
+        window: usize,
+        sampler: SamplerConfig,
+        seed: u64,
+        header: Option<&hayai_model::GgufHeader>,
+    ) -> Result<Self, StreamInferError> {
         let path = path.as_ref().to_path_buf();
-        let mut catalog = GgufCatalog::open(&path)?;
+        let mut catalog = match header {
+            Some(h) => GgufCatalog::open_with_header(&path, h)?,
+            None => GgufCatalog::open(&path)?,
+        };
         // Encoder-decoder (T5/BART) is a distinct architecture class handled by
         // `encoder_decoder_infer`; the decoder-only paths would misread `enc.blk`/`dec.blk`.
         if crate::encoder_decoder_infer::is_encoder_decoder(&catalog) {

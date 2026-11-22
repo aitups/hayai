@@ -48,6 +48,49 @@ impl GgufCatalog {
         Self::from_header(path, io, header, None)
     }
 
+    /// Whether this catalog spans split GGUF shards. Header-snapshot reuse
+    /// (`open_with_header`) is only valid for single-file GGUFs (a sharded catalog
+    /// rebuilds its `ShardedIo` from the shard files).
+    pub fn is_sharded(&self) -> bool {
+        self.shard_paths.is_some()
+    }
+
+    /// Snapshot of the parsed header + tensor directory, cheap to clone and safe to
+    /// cache across requests. A server can reuse it with [`Self::open_with_header`] to
+    /// skip re-reading and re-parsing the header on every request (audit D.2.3).
+    pub fn header_snapshot(&self) -> crate::gguf::GgufHeader {
+        crate::gguf::GgufHeader {
+            version: self.version,
+            alignment: self.alignment,
+            metadata: self.metadata.clone(),
+            tensors: self.tensors.clone(),
+            tensor_index: self.tensor_index.clone(),
+            data_offset: self.data_offset,
+            header_bytes: self.header_bytes,
+        }
+    }
+
+    /// Open a single-file GGUF using an already-parsed header (no header read/parse).
+    /// Split GGUFs fall back to a normal [`Self::open`] because their shard layout must
+    /// be rebuilt from the files.
+    pub fn open_with_header<P: AsRef<Path>>(
+        path: P,
+        header: &crate::gguf::GgufHeader,
+    ) -> Result<Self, GgufError> {
+        let path = path.as_ref().to_path_buf();
+        let count = header
+            .metadata
+            .get("split.count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1) as usize;
+        if count > 1 {
+            return Self::open(path);
+        }
+        let io = open_weight_io(&path).map_err(GgufError::from)?;
+        Self::from_header(path, io, header.clone(), None)
+    }
+
     fn from_header(
         path: PathBuf,
         io: Box<dyn WeightIo>,
@@ -1941,6 +1984,36 @@ mod tests {
         assert_eq!(f32s(pack.wq.data()), vec![0.0, 0.0, 3.0, 30.0]);
         assert_eq!(f32s(pack.wk.data()), vec![1.0, 10.0, 4.0, 40.0]);
         assert_eq!(f32s(pack.wv.data()), vec![2.0, 20.0, 5.0, 50.0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn header_snapshot_open_with_header_matches_open() {
+        let path = temp_dir().join("hayai_header_snapshot.gguf");
+        let h = 8usize;
+        let values: Vec<f32> = (0..h * 2).map(|i| i as f32 + 0.5).collect();
+        write_minimal_gguf(
+            &path,
+            &[(
+                "general.architecture",
+                MetadataValue::String("test".into()),
+            )],
+            &[("token_embd.weight", vec![h as u64, 2], values.clone())],
+        )
+        .unwrap();
+        let mut cat = GgufCatalog::open(&path).unwrap();
+        assert!(!cat.is_sharded());
+        let snap = cat.header_snapshot();
+        let mut cat2 = GgufCatalog::open_with_header(&path, &snap).unwrap();
+        assert_eq!(cat2.tensors.len(), cat.tensors.len());
+        assert_eq!(cat2.tensor_index.len(), cat.tensor_index.len());
+        assert_eq!(cat2.data_offset, cat.data_offset);
+        assert_eq!(cat2.header_bytes, cat.header_bytes);
+        // Payload reads through the reused header match the freshly parsed catalog.
+        let a = cat.dequant_f32("token_embd.weight").unwrap();
+        let b = cat2.dequant_f32("token_embd.weight").unwrap();
+        assert_eq!(a, values);
+        assert_eq!(b, values);
         let _ = std::fs::remove_file(&path);
     }
 }

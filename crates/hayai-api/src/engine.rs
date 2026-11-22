@@ -68,6 +68,7 @@ pub fn generate_text(
         &handle.path,
         handle.tokenizer.clone(),
         handle.head_cache.clone(),
+        handle.header.clone(),
         handle.sinks,
         handle.window,
         handle.memory_strategy,
