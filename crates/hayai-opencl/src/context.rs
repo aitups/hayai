@@ -69,6 +69,10 @@ pub struct OpenClEngine {
     pub silu_mul: Kernel,
     /// Row-wise RMSNorm on device buffers.
     pub rms_norm: Kernel,
+    /// `x += y` on device buffers.
+    pub residual_add: Kernel,
+    /// In-place rotary embedding on a device buffer (q/k).
+    pub rope_apply: Kernel,
     /// Number of FFN GEMVs dispatched to this device (load-distribution metric).
     pub ffn_calls: std::sync::atomic::AtomicU64,
     /// Reusable device buffers for the synchronous GEMV path (no per-call
@@ -260,6 +264,10 @@ impl OpenClEngine {
             .map_err(|e| OpenClError::ClError(format!("silu_mul kernel: {}", e)))?;
         let rms_norm = Kernel::create(&program, "hayai_rms_norm")
             .map_err(|e| OpenClError::ClError(format!("rms_norm kernel: {}", e)))?;
+        let residual_add = Kernel::create(&program, "hayai_residual_add")
+            .map_err(|e| OpenClError::ClError(format!("residual_add kernel: {}", e)))?;
+        let rope_apply = Kernel::create(&program, "hayai_rope_apply")
+            .map_err(|e| OpenClError::ClError(format!("rope_apply kernel: {}", e)))?;
 
         info!(
             "Successfully initialized OpenCL Engine on device: {}",
@@ -304,6 +312,8 @@ impl OpenClEngine {
             attn_decode_combine,
             silu_mul,
             rms_norm,
+            residual_add,
+            rope_apply,
             ffn_calls: std::sync::atomic::AtomicU64::new(0),
             sync_ws: std::sync::Mutex::new(Default::default()),
             deltanet_ws: std::sync::Mutex::new(Default::default()),

@@ -102,6 +102,19 @@ impl OpenClEngine {
         Ok(b)
     }
 
+    /// Allocate a read/write device buffer for a resident activation (float).
+    pub fn create_rw_buffer(&self, len: usize) -> Result<Buffer<cl_float>, OpenClError> {
+        unsafe {
+            Buffer::<cl_float>::create(
+                &self.context,
+                CL_MEM_READ_WRITE,
+                len.max(1),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("rw buffer: {e}")))
+        }
+    }
+
     /// GEMV with the activation already on a device buffer: reads `input_dev`, writes
     /// `output_dev`, no host upload or readback. Weights come from a mirror/SVM bind.
     #[allow(clippy::too_many_arguments)]

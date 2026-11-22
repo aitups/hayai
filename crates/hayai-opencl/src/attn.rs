@@ -82,7 +82,74 @@ impl OpenClEngine {
         Ok(())
     }
 
-    /// Single-query attention over the device cache: `q` and `out` are
+    /// Append one K/V row from **device buffers** (device→device copy; no host round-trip).
+    pub fn kv_append_dev(
+        &self,
+        cache: &mut DeviceKvCache,
+        pos: usize,
+        k_dev: &Buffer<cl_float>,
+        v_dev: &Buffer<cl_float>,
+    ) -> Result<(), OpenClError> {
+        let row = cache.n_kv * cache.head_dim;
+        if pos >= cache.max_seq {
+            return Err(OpenClError::ClError(format!(
+                "kv_append_dev pos {pos} >= max {}",
+                cache.max_seq
+            )));
+        }
+        let off = pos * row * std::mem::size_of::<cl_float>();
+        let bytes = row * std::mem::size_of::<cl_float>();
+        unsafe {
+            self.queue
+                .enqueue_copy_buffer(k_dev, &mut cache.k, 0, off, bytes, &[])
+                .map_err(|e| OpenClError::ClError(format!("kv copy k: {e}")))?;
+            self.queue
+                .enqueue_copy_buffer(v_dev, &mut cache.v, 0, off, bytes, &[])
+                .map_err(|e| OpenClError::ClError(format!("kv copy v: {e}")))?;
+        }
+        cache.len = cache.len.max(pos + 1);
+        Ok(())
+    }
+
+    /// Attention decode with **device-resident** q and out (no host round-trip).
+    pub fn attn_decode_dev(
+        &self,
+        q_dev: &Buffer<cl_float>,
+        cache: &DeviceKvCache,
+        out_dev: &Buffer<cl_float>,
+        n_heads: usize,
+        seq: usize,
+        scale: f32,
+    ) -> Result<(), OpenClError> {
+        use opencl3::kernel::ExecuteKernel;
+        let hd = cache.head_dim;
+        let n_heads_i = n_heads as cl_int;
+        let n_kv_i = cache.n_kv as cl_int;
+        let groups_i = (n_heads / cache.n_kv.max(1)).max(1) as cl_int;
+        let hd_i = hd as cl_int;
+        let seq_i = seq as cl_int;
+        let scale_f = scale;
+        let local = 64usize.min(self.device_info.max_work_group_size.max(1));
+        let global = ((n_heads + local - 1) / local) * local;
+        unsafe {
+            let mut exec = ExecuteKernel::new(&self.attn_decode);
+            exec.set_arg(q_dev)
+                .set_arg(&cache.k)
+                .set_arg(&cache.v)
+                .set_arg(out_dev)
+                .set_arg(&n_heads_i)
+                .set_arg(&n_kv_i)
+                .set_arg(&groups_i)
+                .set_arg(&hd_i)
+                .set_arg(&seq_i)
+                .set_arg(&scale_f)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue attn_decode_dev: {e}")))?;
+        }
+        Ok(())
+    }
     /// `n_heads * head_dim`. Reuses the persistent input/output workspace.
     pub fn attn_decode(
         &self,
@@ -480,6 +547,70 @@ impl OpenClEngine {
         }
         Ok(())
     }
+
+    /// `x += y` on device buffers (residual stream stays on-device).
+    pub fn residual_add_dev(
+        &self,
+        x: &Buffer<cl_float>,
+        y: &Buffer<cl_float>,
+        n: usize,
+    ) -> Result<(), OpenClError> {
+        if n == 0 {
+            return Ok(());
+        }
+        use opencl3::kernel::ExecuteKernel;
+        let n_i = n as cl_int;
+        let local = 256usize.min(self.device_info.max_work_group_size.max(1));
+        let global = ((n + local - 1) / local) * local;
+        unsafe {
+            let mut exec = ExecuteKernel::new(&self.residual_add);
+            exec.set_arg(x)
+                .set_arg(y)
+                .set_arg(&n_i)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue residual_add: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// In-place rotary embedding of `x` (`n_rows × head_dim`, GPT-NeoX pair layout)
+    /// using a per-position `(cos, sin)` table of `rotary_dim/2` entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_apply_dev(
+        &self,
+        x: &Buffer<cl_float>,
+        n_rows: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        cos: &Buffer<cl_float>,
+        sin: &Buffer<cl_float>,
+    ) -> Result<(), OpenClError> {
+        let half = rotary_dim / 2;
+        let total = n_rows * half;
+        if total == 0 {
+            return Ok(());
+        }
+        use opencl3::kernel::ExecuteKernel;
+        let (nr_i, hd_i, rd_i) = (n_rows as cl_int, head_dim as cl_int, rotary_dim as cl_int);
+        let local = 64usize.min(self.device_info.max_work_group_size.max(1));
+        let global = ((total + local - 1) / local) * local;
+        unsafe {
+            let mut exec = ExecuteKernel::new(&self.rope_apply);
+            exec.set_arg(x)
+                .set_arg(&nr_i)
+                .set_arg(&hd_i)
+                .set_arg(&rd_i)
+                .set_arg(cos)
+                .set_arg(sin)
+                .set_global_work_size(global)
+                .set_local_work_size(local)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| OpenClError::ClError(format!("enqueue rope_apply: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -706,6 +837,73 @@ mod tests {
         for i in 0..n {
             let want = x[i] * inv * w[i];
             assert!((goty[i] - want).abs() < 1e-3, "rms_norm {i}: {} vs {}", goty[i], want);
+        }
+    }
+
+    #[test]
+    fn residual_add_and_rope_match_reference() {
+        use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
+        use opencl3::types::{cl_float, CL_BLOCKING};
+        use std::ptr;
+
+        let Ok(eng) = OpenClEngine::try_init_any() else {
+            eprintln!("dev ops parity: SKIP (no OpenCL device)");
+            return;
+        };
+        let mk = |data: &[f32], flags| {
+            let n = data.len();
+            let mut b = unsafe {
+                Buffer::<cl_float>::create(&eng.context, flags, n.max(1), ptr::null_mut()).unwrap()
+            };
+            unsafe {
+                eng.queue
+                    .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, data, &[])
+                    .unwrap();
+            }
+            b
+        };
+        // residual_add
+        let n = 64usize;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| 0.5 * i as f32).collect();
+        let bx = mk(&x, CL_MEM_READ_WRITE);
+        let by = mk(&y, CL_MEM_READ_ONLY);
+        eng.residual_add_dev(&bx, &by, n).unwrap();
+        let mut got = vec![0.0f32; n];
+        unsafe {
+            eng.queue
+                .enqueue_read_buffer(&bx, CL_BLOCKING, 0, &mut got, &[])
+                .unwrap();
+        }
+        for i in 0..n {
+            assert!((got[i] - (x[i] + y[i])).abs() < 1e-6);
+        }
+
+        // rope_apply (rotate_half pairs i, i+half within head_dim)
+        let (rows, hd, rd) = (2usize, 8usize, 8usize);
+        let half = rd / 2;
+        let cos: Vec<f32> = (0..half).map(|i| (0.3 * i as f32).cos()).collect();
+        let sin: Vec<f32> = (0..half).map(|i| (0.3 * i as f32).sin()).collect();
+        let xr: Vec<f32> = (0..rows * hd).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let bxr = mk(&xr, CL_MEM_READ_WRITE);
+        let bc = mk(&cos, CL_MEM_READ_ONLY);
+        let bs = mk(&sin, CL_MEM_READ_ONLY);
+        eng.rope_apply_dev(&bxr, rows, hd, rd, &bc, &bs).unwrap();
+        let mut gr = vec![0.0f32; rows * hd];
+        unsafe {
+            eng.queue
+                .enqueue_read_buffer(&bxr, CL_BLOCKING, 0, &mut gr, &[])
+                .unwrap();
+        }
+        for r in 0..rows {
+            for p in 0..half {
+                let a = xr[r * hd + p];
+                let b = xr[r * hd + half + p];
+                let want0 = a * cos[p] - b * sin[p];
+                let want1 = a * sin[p] + b * cos[p];
+                assert!((gr[r * hd + p] - want0).abs() < 1e-5, "rope 0");
+                assert!((gr[r * hd + half + p] - want1).abs() < 1e-5, "rope 1");
+            }
         }
     }
 }

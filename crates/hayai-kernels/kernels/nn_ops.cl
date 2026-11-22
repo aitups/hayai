@@ -47,3 +47,43 @@ __kernel void hayai_rms_norm(
         y[i] = x[i] * inv * w[i];
     }
 }
+// Residual add: x += y (in place on x). Keeps the residual stream on-device.
+__kernel void hayai_residual_add(
+    __global float* restrict x,
+    __global const float* restrict y,
+    const int n)
+{
+    int i = (int)get_global_id(0);
+    if (i >= n) {
+        return;
+    }
+    x[i] += y[i];
+}
+
+// Rotary position embedding (GPT-NeoX / llama pair layout): rotate (x[2i], x[2i+1])
+// with the per-position cos/sin table. `n_rows` rows of `head_dim`; only the first
+// `rotary_dim` columns are rotated (partial RoPE).
+__kernel void hayai_rope_apply(
+    __global float* restrict x,
+    const int n_rows,
+    const int head_dim,
+    const int rotary_dim,
+    __global const float* restrict cosv,
+    __global const float* restrict sinv)
+{
+    int idx = (int)get_global_id(0);          // one work-item per (row, pair)
+    int half = rotary_dim >> 1;
+    int total = n_rows * half;
+    if (idx >= total) {
+        return;
+    }
+    int row = idx / half;
+    int p = idx - row * half;
+    int base = row * head_dim;
+    float a = x[base + p];
+    float b = x[base + half + p];
+    float c = cosv[p];
+    float s = sinv[p];
+    x[base + p] = a * c - b * s;
+    x[base + half + p] = a * s + b * c;
+}
