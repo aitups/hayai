@@ -543,7 +543,7 @@ impl OpenClEngine {
             let ibuf = ws.input.as_mut().unwrap();
             unsafe {
                 self.queue
-                    .enqueue_write_buffer(ibuf, CL_BLOCKING, 0, input, &[])
+                    .enqueue_write_buffer(ibuf, CL_NON_BLOCKING, 0, input, &[])
                     .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
             }
         }
@@ -630,7 +630,7 @@ impl OpenClEngine {
             let ib = ws.input.as_mut().unwrap();
             unsafe {
                 self.queue
-                    .enqueue_write_buffer(ib, CL_BLOCKING, 0, input, &[])
+                    .enqueue_write_buffer(ib, CL_NON_BLOCKING, 0, input, &[])
                     .map_err(|e| OpenClError::ClError(format!("write input: {e}")))?;
             }
         }
