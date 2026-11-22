@@ -11,7 +11,7 @@ pub use attention::{
     apply_rope, apply_rope_partial, apply_rope_partial_factors,
     apply_rope_partial_factors_scaled, attention_decode_step,
     attention_decode_step_alibi, attention_decode_step_ex, attention_fp32_reference, rms_norm,
-    simd_dot, softmax,
+    rope_cos_sin_table, simd_dot, softmax,
     AttentionConfig, RopeScaling,
 };
 pub use kv_cache::{BoundedKvCache, LayerKvCache, DEFAULT_RECENT_FP_TOKENS};

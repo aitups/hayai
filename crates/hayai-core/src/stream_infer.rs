@@ -405,6 +405,44 @@ impl ModelKind {
     }
 }
 
+/// Device-resident Dense decode state (audit #4): the residual stream and all
+/// intermediates live in VRAM; the per-token loop runs norm/RoPE/KV/attention/FFN on
+/// the device with a single logits readback.
+pub(crate) struct DenseDevState {
+    pub(crate) h: usize,
+    pub(crate) q_dim: usize,
+    pub(crate) kv_dim: usize,
+    pub(crate) ffn: usize,
+    pub(crate) n_heads: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rope_dim: usize,
+    pub(crate) scale: f32,
+    pub(crate) max_seq: usize,
+    pub(crate) x: hayai_opencl::Buffer<f32>,
+    pub(crate) xn: hayai_opencl::Buffer<f32>,
+    pub(crate) q: hayai_opencl::Buffer<f32>,
+    pub(crate) k: hayai_opencl::Buffer<f32>,
+    pub(crate) v: hayai_opencl::Buffer<f32>,
+    pub(crate) attn: hayai_opencl::Buffer<f32>,
+    pub(crate) proj: hayai_opencl::Buffer<f32>,
+    pub(crate) gate: hayai_opencl::Buffer<f32>,
+    pub(crate) up: hayai_opencl::Buffer<f32>,
+    pub(crate) down: hayai_opencl::Buffer<f32>,
+    pub(crate) logits: hayai_opencl::Buffer<f32>,
+    pub(crate) cos: hayai_opencl::Buffer<f32>,
+    pub(crate) sin: hayai_opencl::Buffer<f32>,
+    pub(crate) out_norm: hayai_opencl::Buffer<f32>,
+    pub(crate) attn_norm: Vec<hayai_opencl::Buffer<f32>>,
+    pub(crate) ffn_norm: Vec<hayai_opencl::Buffer<f32>>,
+    pub(crate) qb: Vec<Option<hayai_opencl::Buffer<f32>>>,
+    pub(crate) kb: Vec<Option<hayai_opencl::Buffer<f32>>>,
+    pub(crate) vb: Vec<Option<hayai_opencl::Buffer<f32>>>,
+    pub(crate) ob: Vec<Option<hayai_opencl::Buffer<f32>>>,
+    pub(crate) kv: Vec<hayai_opencl::DeviceKvCache>,
+    pub(crate) dev: usize,
+}
+
 pub struct StreamingGenerator {
     pub catalog: GgufCatalog,
     pub path: PathBuf,
@@ -532,6 +570,8 @@ pub struct StreamingGenerator {
     /// Device-resident final projection/embedding: `(device_id, nbytes, buffer)`.
     /// Uploaded once so the lm_head is not re-uploaded every token (audit P0.1b).
     pub(crate) head_dev: Option<(usize, usize, hayai_opencl::Buffer<u8>)>,
+    /// Device-resident Dense decode state (audit #4).
+    pub(crate) dense_dev: Option<DenseDevState>,
     /// MoE resident non-expert (attn + router + shared expert) bytes per layer,
     /// cached after the first read so subsequent tokens skip the disk. Bounded by
     /// `moe_non_expert_cap`. Experts are streamed sparsely (never cached here).
@@ -1392,6 +1432,7 @@ impl StreamingGenerator {
             head_cache: None,
             ple_cache: None,
             head_dev: None,
+            dense_dev: None,
         })
     }
 
@@ -1806,6 +1847,282 @@ impl StreamingGenerator {
         Ok(PrefetchSlotPtr::new(ptr, len))
     }
 
+    /// Whether the resident Dense device pipeline (#4) can run this model: plain Dense
+    /// with standard full RoPE, no qk-norm, no parallel residual, no post-attn norm /
+    /// layer scale / attn gate / learned positions / ALiBi / RoPE scaling or factors,
+    /// and no FFN bias. Anything else falls back to the host path.
+    fn dense_dev_eligible(&self) -> bool {
+        if self.model_kind() != ModelKind::Dense || self.parallel_residual {
+            return false;
+        }
+        if self.learned_pos.is_some()
+            || self.alibi_slopes.is_some()
+            || self.token_embed_norm.is_some()
+            || self.rope_freq_factors.is_some()
+        {
+            return false;
+        }
+        let c = &self.attn_cfg;
+        if !c.use_rope || !c.rope.is_none() || c.head_dim == 0 || c.num_kv_heads == 0 {
+            return false;
+        }
+        if self.layer_apply_rope.iter().any(|b| !*b) {
+            return false;
+        }
+        for ln in &self.layer_norms {
+            if ln.post_attn_norm.is_some()
+                || ln.layer_output_scale.is_some()
+                || ln.attn_q_norm.is_some()
+                || ln.attn_k_norm.is_some()
+            {
+                return false;
+            }
+        }
+        for i in 0..self.config.num_layers {
+            if self
+                .catalog
+                .tensor(&format!("blk.{i}.attn_gate.weight"))
+                .is_ok()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Build the device-resident Dense state once (activation buffers, norm/bias weights
+    /// in VRAM, per-layer device KV caches sized to sinks+window).
+    fn ensure_dense_dev(
+        &mut self,
+        orch: &EngineOrchestrator,
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<(), StreamInferError> {
+        if self.dense_dev.is_some() {
+            return Ok(());
+        }
+        let Some(eng) = orch.pool.engines.first() else {
+            return Err(StreamInferError::Msg("no device".into()));
+        };
+        let (pack0, _) = self.stage_pack(orch, scratch, 0, 0)?;
+        let h = pack0.wq.ncols;
+        let q_dim = pack0.wq.nrows;
+        let kv_dim = pack0.wk.nrows;
+        let ffn = pack0.gate.nrows;
+        let c = &self.attn_cfg;
+        let n_layers = self.config.num_layers;
+        let vocab = self.config.vocab_size;
+        let max_seq = (self.kv_sinks + self.kv_window).max(1);
+        let scale = c.scale_override.unwrap_or(1.0 / (c.head_dim as f32).sqrt());
+        let mk = |l: usize| eng.create_rw_buffer(l);
+        let upload = |buf: &mut hayai_opencl::Buffer<f32>, v: &[f32]| -> Result<(), StreamInferError> {
+            eng.upload_f32(buf, v).map_err(StreamInferError::from)
+        };
+        let mut attn_norm = Vec::with_capacity(n_layers);
+        let mut ffn_norm = Vec::with_capacity(n_layers);
+        let mut qb = Vec::with_capacity(n_layers);
+        let mut kb = Vec::with_capacity(n_layers);
+        let mut vb = Vec::with_capacity(n_layers);
+        let mut ob = Vec::with_capacity(n_layers);
+        for i in 0..n_layers {
+            let mut an = mk(h)?;
+            upload(&mut an, &self.layer_norms[i].attn_norm)?;
+            attn_norm.push(an);
+            let mut fnm = mk(h)?;
+            upload(&mut fnm, &self.layer_norms[i].ffn_norm)?;
+            ffn_norm.push(fnm);
+            let bs = self.attn_bias.get(i);
+            let mut bq = None;
+            let mut bk = None;
+            let mut bv = None;
+            let mut bo = None;
+            if let Some(b) = bs {
+                if let Some(v) = &b.q {
+                    let mut x = mk(v.len())?;
+                    upload(&mut x, v)?;
+                    bq = Some(x);
+                }
+                if let Some(v) = &b.k {
+                    let mut x = mk(v.len())?;
+                    upload(&mut x, v)?;
+                    bk = Some(x);
+                }
+                if let Some(v) = &b.v {
+                    let mut x = mk(v.len())?;
+                    upload(&mut x, v)?;
+                    bv = Some(x);
+                }
+                if let Some(v) = &b.o {
+                    let mut x = mk(v.len())?;
+                    upload(&mut x, v)?;
+                    bo = Some(x);
+                }
+            }
+            qb.push(bq);
+            kb.push(bk);
+            vb.push(bv);
+            ob.push(bo);
+        }
+        let mut out_norm = mk(h)?;
+        upload(&mut out_norm, &self.output_norm)?;
+        let half = (c.rope_dim.min(c.head_dim)) / 2;
+        let kv = (0..n_layers)
+            .map(|_| hayai_opencl::DeviceKvCache::new(eng, c.num_kv_heads, c.head_dim, max_seq))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dense_dev = Some(DenseDevState {
+            h,
+            q_dim,
+            kv_dim,
+            ffn,
+            n_heads: c.num_heads,
+            n_kv: c.num_kv_heads,
+            head_dim: c.head_dim,
+            rope_dim: c.rope_dim.min(c.head_dim),
+            scale,
+            max_seq,
+            x: mk(h)?,
+            xn: mk(h)?,
+            q: mk(q_dim)?,
+            k: mk(kv_dim)?,
+            v: mk(kv_dim)?,
+            attn: mk(q_dim)?,
+            proj: mk(h)?,
+            gate: mk(ffn)?,
+            up: mk(ffn)?,
+            down: mk(h)?,
+            logits: mk(vocab)?,
+            cos: mk(half.max(1))?,
+            sin: mk(half.max(1))?,
+            out_norm,
+            attn_norm,
+            ffn_norm,
+            qb,
+            kb,
+            vb,
+            ob,
+            kv,
+            dev: 0,
+        });
+        Ok(())
+    }
+
+    /// Run one token through all layers on the device (resident Dense #4). Returns
+    /// `Ok(None)` when the model/scratch is not eligible (caller falls back).
+    fn forward_dense_device(
+        &mut self,
+        orch: &EngineOrchestrator,
+        token: u32,
+        scratch: &mut hayai_opencl::StreamingScratch,
+    ) -> Result<Option<Vec<f32>>, StreamInferError> {
+        if !self.dense_dev_eligible() {
+            return Ok(None);
+        }
+        self.ensure_dense_dev(orch, scratch)?;
+        let eng = match orch.pool.engines.first() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let h = self.config.hidden_size;
+        let eps = self.config.rms_norm_eps;
+        let n_layers = self.config.num_layers;
+        let pos = self.position;
+        // Embedding (host) then one upload.
+        let mut x_host = vec![0.0f32; h];
+        self.embed_row("token_embd.weight", token, h, &mut x_host)?;
+        {
+            let d = self.dense_dev.as_mut().unwrap();
+            eng.upload_f32(&mut d.x, &x_host)?;
+        }
+        // RoPE table for this position.
+        let table = hayai_cpu::rope_cos_sin_table(
+            pos,
+            self.attn_cfg.head_dim,
+            self.attn_cfg.rope_dim.min(self.attn_cfg.head_dim),
+            self.attn_cfg.rope_theta,
+            None,
+            self.attn_cfg.rope,
+        );
+        {
+            let d = self.dense_dev.as_mut().unwrap();
+            let cosv: Vec<f32> = table.iter().map(|p| p.0).collect();
+            let sinv: Vec<f32> = table.iter().map(|p| p.1).collect();
+            if !cosv.is_empty() {
+                eng.upload_f32(&mut d.cos, &cosv)?;
+                eng.upload_f32(&mut d.sin, &sinv)?;
+            }
+        }
+        let (sinks, window) = (self.kv_sinks, self.kv_window.max(1));
+        let slot = if pos < sinks {
+            pos
+        } else {
+            sinks + (pos - sinks) % window
+        };
+        let max_seq = self.dense_dev.as_ref().unwrap().max_seq;
+        let valid = (pos + 1).min(max_seq);
+        for layer in 0..n_layers {
+            let (pack, layout) = self.stage_pack(orch, scratch, layer % 2, layer)?;
+            // Bail cleanly if this layer can't be device-bound (e.g. no mirror).
+            if scratch
+                .weight_bind_and_offset(eng, layer, layout.wq_off)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            let d = self.dense_dev.as_mut().unwrap();
+            let (n_heads, n_kv, hd, rd, scale) =
+                (d.n_heads, d.n_kv, d.head_dim, d.rope_dim, d.scale);
+            eng.rms_norm_dev(&d.x, &d.attn_norm[layer], &d.xn, h, eps)?;
+            dev_gemv(eng, scratch, layer, &pack.wq, layout.wq_off, &d.xn, &d.q)?;
+            if let Some(b) = &d.qb[layer] {
+                eng.residual_add_dev(&d.q, b, d.q_dim)?;
+            }
+            dev_gemv(eng, scratch, layer, &pack.wk, layout.wk_off, &d.xn, &d.k)?;
+            if let Some(b) = &d.kb[layer] {
+                eng.residual_add_dev(&d.k, b, d.kv_dim)?;
+            }
+            dev_gemv(eng, scratch, layer, &pack.wv, layout.wv_off, &d.xn, &d.v)?;
+            if let Some(b) = &d.vb[layer] {
+                eng.residual_add_dev(&d.v, b, d.kv_dim)?;
+            }
+            if rd >= 2 && !table.is_empty() {
+                eng.rope_apply_dev(&d.q, n_heads, hd, rd, &d.cos, &d.sin)?;
+                eng.rope_apply_dev(&d.k, n_kv, hd, rd, &d.cos, &d.sin)?;
+            }
+            eng.kv_append_dev(&mut d.kv[layer], slot, &d.k, &d.v)?;
+            eng.attn_decode_dev(&d.q, &d.kv[layer], &d.attn, n_heads, valid, scale)?;
+            dev_gemv(eng, scratch, layer, &pack.wo, layout.wo_off, &d.attn, &d.proj)?;
+            if let Some(b) = &d.ob[layer] {
+                eng.residual_add_dev(&d.proj, b, h)?;
+            }
+            eng.residual_add_dev(&d.x, &d.proj, h)?;
+            eng.rms_norm_dev(&d.x, &d.ffn_norm[layer], &d.xn, h, eps)?;
+            dev_gemv(eng, scratch, layer, &pack.gate, layout.gate_off, &d.xn, &d.gate)?;
+            dev_gemv(eng, scratch, layer, &pack.up, layout.up_off, &d.xn, &d.up)?;
+            eng.silu_mul_dev(&d.gate, &d.up, &d.gate, d.ffn)?;
+            dev_gemv(eng, scratch, layer, &pack.down, layout.down_off, &d.gate, &d.down)?;
+            eng.residual_add_dev(&d.x, &d.down, h)?;
+        }
+        // One readback of the final hidden state, then norm + head (upload once).
+        let mut xh = vec![0.0f32; h];
+        {
+            let d = self.dense_dev.as_ref().unwrap();
+            eng.read_f32(&d.x, &mut xh)?;
+        }
+        self.position += 1;
+        rms_norm(&mut xh, &self.output_norm, eps);
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        self.ensure_head_loaded()?;
+        if self.has_output_weight {
+            let ow = self.resident_output.clone().unwrap();
+            self.head_gemv(orch, &ow, &xh, &mut logits)?;
+        } else {
+            let emb = self.resident_embed.clone().unwrap();
+            self.head_gemv(orch, &emb, &xh, &mut logits)?;
+        }
+        self.apply_logit_scale(&mut logits);
+        Ok(Some(logits))
+    }
+
     fn forward_inner(
         &mut self,
         orch: &mut EngineOrchestrator,
@@ -1813,6 +2130,17 @@ impl StreamingGenerator {
         mut scratch: Option<&mut hayai_opencl::StreamingScratch>,
         override_ffn: Option<&[FfnOverride]>,
     ) -> Result<Vec<f32>, StreamInferError> {
+        // Device-resident Dense pipeline (audit #4): all layers on the GPU, one readback.
+        if let Some(sc) = scratch.as_deref_mut() {
+            if sc.resident
+                && override_ffn.is_none()
+                && std::env::var("HAYAI_DENSE_DEV").ok().as_deref() == Some("1")
+            {
+                if let Some(logits) = self.forward_dense_device(orch, token, sc)? {
+                    return Ok(logits);
+                }
+            }
+        }
         let h = self.config.hidden_size;
         self.act_sel = 0;
         self.act_pp[0].fill(0.0);
@@ -3122,9 +3450,18 @@ impl StreamingGenerator {
                     crate::moe_infer::prefill_moe(self, orch, prompt_ids, scratch)
                 }
                 ModelKind::Dense => {
-                    // Classic-transformer Dense features (LayerNorm/positions/ungated
-                    // FFN) run through the per-token Dense path.
-                    if self.simple_dense {
+                    // Device-resident pipeline: prefill must also run on the device so
+                    // the device KV is primed for decode.
+                    let use_dev = scratch.resident
+                        && self.dense_dev_eligible()
+                        && std::env::var("HAYAI_DENSE_DEV").ok().as_deref() == Some("1");
+                    if use_dev {
+                        let mut last = Vec::new();
+                        for &tok in prompt_ids {
+                            last = self.forward_inner(orch, tok, Some(&mut *scratch), None)?;
+                        }
+                        Ok(last)
+                    } else if self.simple_dense {
                         let mut last = Vec::new();
                         for &tok in prompt_ids {
                             last = self.forward_inner(orch, tok, Some(scratch), None)?;
@@ -4065,6 +4402,32 @@ pub(crate) fn begin_gemv_from_scratch(
 /// OpenCL GEMV kernel + label for a GGML type, or `None` when no GPU kernel exists
 /// (CPU-only formats F64/I*/IQ1/TQ). Shared by the mirror bind and the device-resident
 /// FFN fast path.
+/// Device-to-device GEMV for the resident Dense pipeline: binds the layer mirror at
+/// `off` and reads/writes device activation buffers (no host round-trip).
+fn dev_gemv(
+    eng: &hayai_opencl::OpenClEngine,
+    scratch: &hayai_opencl::StreamingScratch,
+    layer: usize,
+    m: &QuantMatrix,
+    off: usize,
+    inb: &hayai_opencl::Buffer<f32>,
+    outb: &hayai_opencl::Buffer<f32>,
+) -> Result<(), StreamInferError> {
+    let (b, o) = scratch
+        .weight_bind_and_offset(eng, layer, off)
+        .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+    let gb = match b {
+        hayai_opencl::WeightBind::Device { buf } => hayai_opencl::GgmlWeightBind::Device(buf),
+        hayai_opencl::WeightBind::Svm { ptr } => hayai_opencl::GgmlWeightBind::Svm(ptr),
+    };
+    let (k, l) = gemv_kernel_for(eng, m.ggml_type).ok_or_else(|| {
+        StreamInferError::Msg(format!("no device GEMV kernel for {:?}", m.ggml_type))
+    })?;
+    eng.ggml_gemv_dev_io(k, l, m.nrows, m.ncols, gb, o, inb, outb)
+        .map_err(StreamInferError::from)?;
+    Ok(())
+}
+
 fn gemv_kernel_for<'a>(
     eng: &'a hayai_opencl::OpenClEngine,
     t: GgmlType,

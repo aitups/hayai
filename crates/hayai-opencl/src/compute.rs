@@ -115,6 +115,34 @@ impl OpenClEngine {
         }
     }
 
+    /// Upload a host f32 slice into a device buffer (blocking).
+    pub fn upload_f32(
+        &self,
+        buf: &mut Buffer<cl_float>,
+        data: &[f32],
+    ) -> Result<(), OpenClError> {
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(buf, CL_BLOCKING, 0, data, &[])
+                .map_err(|e| OpenClError::ClError(format!("upload f32: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Read a device f32 buffer into host memory (blocking).
+    pub fn read_f32(
+        &self,
+        buf: &Buffer<cl_float>,
+        out: &mut [f32],
+    ) -> Result<(), OpenClError> {
+        unsafe {
+            self.queue
+                .enqueue_read_buffer(buf, CL_BLOCKING, 0, out, &[])
+                .map_err(|e| OpenClError::ClError(format!("read f32: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// GEMV with the activation already on a device buffer: reads `input_dev`, writes
     /// `output_dev`, no host upload or readback. Weights come from a mirror/SVM bind.
     #[allow(clippy::too_many_arguments)]
