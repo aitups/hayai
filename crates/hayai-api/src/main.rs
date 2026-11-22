@@ -28,8 +28,9 @@ struct Args {
     /// auto | cpu | <OpenCL device name substring>
     #[arg(long, default_value = "auto", env = "HAYAI_DEVICE")]
     device: String,
-    /// auto | minimal | cap_mb (server default minimal avoids per-request resident preload)
-    #[arg(long, default_value = "minimal", env = "HAYAI_MEMORY_STRATEGY")]
+    /// auto | minimal | cap_mb. Default `auto`: the planner picks residency from measured
+    /// caps; a resident scratch is reused across requests so it is preloaded only once.
+    #[arg(long, default_value = "auto", env = "HAYAI_MEMORY_STRATEGY")]
     memory_strategy: String,
     #[arg(long, default_value = "4", env = "HAYAI_SINKS")]
     sinks: usize,
