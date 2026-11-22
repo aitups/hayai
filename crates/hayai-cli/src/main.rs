@@ -268,8 +268,8 @@ enum Commands {
         /// DEV ONLY: load weights via full-file mmap (violates PRD streaming design)
         #[arg(long, default_value_t = false)]
         dev_mmap: bool,
-        /// Memory window strategy: auto (opt-in residency) | minimal (default) | cap_mb
-        #[arg(long, default_value = "minimal")]
+        /// Memory window strategy: auto (default; residency from measured caps) | minimal | cap_mb
+        #[arg(long, default_value = "auto")]
         memory_strategy: String,
     },
 

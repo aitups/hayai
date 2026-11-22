@@ -4304,7 +4304,14 @@ pub(crate) fn ffn_begin_gate_up_scratch(
         orch.execute_quant_gemv(up, xn, up_out)?;
         return Ok(GateUpInflight::Pending { gate: None, up: None });
     }
-    if dev_resident_ok && std::env::var("HAYAI_FFN_DEV").ok().as_deref() == Some("1") {
+    // Device-resident FFN (gate -> silu_mul -> down on one device, one input upload and
+    // one output readback per layer instead of 3 blocking round-trips). Enabled
+    // automatically for resident sessions (that is where per-op host round-trips
+    // dominate), or explicitly with HAYAI_FFN_DEV=1.
+    let want_dev_ffn = dev_resident_ok
+        && (std::env::var("HAYAI_FFN_DEV").ok().as_deref() == Some("1")
+            || scratch.map_or(false, |s| s.resident));
+    if want_dev_ffn {
         if let (Some(sc), Some(lay)) = (scratch, layout) {
             if try_ffn_dev_begin(orch, gate, up, xn, sc, layer, lay)? {
                 *used_dgpu = true;
