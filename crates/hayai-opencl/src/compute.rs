@@ -79,6 +79,29 @@ fn ensure_dev_buf(
 }
 
 impl OpenClEngine {
+    /// Upload a weight blob into a READ_ONLY device buffer once (keeps the lm_head in
+    /// VRAM instead of re-uploading it every token, audit P0.1b).
+    pub fn create_weight_buffer(
+        &self,
+        bytes: &[u8],
+    ) -> Result<Buffer<cl_uchar>, OpenClError> {
+        let mut b = unsafe {
+            Buffer::<cl_uchar>::create(
+                &self.context,
+                CL_MEM_READ_ONLY,
+                bytes.len().max(1),
+                ptr::null_mut(),
+            )
+            .map_err(|e| OpenClError::ClError(format!("weight buffer: {e}")))?
+        };
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut b, CL_BLOCKING, 0, bytes, &[])
+                .map_err(|e| OpenClError::ClError(format!("weight upload: {e}")))?;
+        }
+        Ok(b)
+    }
+
     /// GEMV with the activation already on a device buffer: reads `input_dev`, writes
     /// `output_dev`, no host upload or readback. Weights come from a mirror/SVM bind.
     #[allow(clippy::too_many_arguments)]

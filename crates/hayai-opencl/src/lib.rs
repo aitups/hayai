@@ -14,6 +14,8 @@ pub use context::{OpenClEngine, OpenClError};
 pub use device::{discover_opencl_devices, DeviceKind, OpenClDeviceInfo};
 /// Re-exported so callers can name the GEMV kernel type when selecting one.
 pub use opencl3::kernel::Kernel;
+/// Re-exported for callers that keep a weight buffer resident on the device.
+pub use opencl3::memory::Buffer;
 pub use hetero_scratch::{StreamingScratch, WeightBind};
 pub use memory::{
     select_transfer_path, DeviceLayerBuffer, OwnedSvmBuffer, PinnedHostBuffer, SvmLayerBuffer,

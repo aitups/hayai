@@ -277,11 +277,11 @@ fn output_logits(
     // every token in streaming mode).
     gen.ensure_head_loaded()?;
     if gen.has_output_weight {
-        let ow = gen.resident_output.as_ref().expect("head loaded");
-        orch.execute_quant_gemv(ow, x, &mut logits)?;
+        let ow = gen.resident_output.clone().expect("head loaded");
+        gen.head_gemv(orch, &ow, x, &mut logits)?;
     } else {
-        let emb = gen.resident_embed.as_ref().expect("head loaded");
-        orch.execute_quant_gemv(emb, x, &mut logits)?;
+        let emb = gen.resident_embed.clone().expect("head loaded");
+        gen.head_gemv(orch, &emb, x, &mut logits)?;
     }
     Ok(logits)
 }

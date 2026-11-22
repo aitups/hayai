@@ -482,11 +482,11 @@ fn forward_gemma_inner(
     let mut logits = vec![0.0f32; vocab];
     gen.ensure_head_loaded()?;
     if gen.has_output_weight {
-        let ow = gen.resident_output.as_ref().unwrap();
-        orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+        let ow = gen.resident_output.clone().expect("head loaded");
+        gen.head_gemv(orch, &ow, &xn, &mut logits)?;
     } else {
-        let emb = gen.resident_embed.as_ref().unwrap();
-        orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+        let emb = gen.resident_embed.clone().expect("head loaded");
+        gen.head_gemv(orch, &emb, &xn, &mut logits)?;
     }
     if meta.softcap > 0.0 {
         let inv = 1.0 / meta.softcap;

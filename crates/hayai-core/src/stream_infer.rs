@@ -529,6 +529,9 @@ pub struct StreamingGenerator {
     pub(crate) head_cache: Option<Arc<std::sync::Mutex<crate::session::HeadCache>>>,
     /// Gemma4 per-layer-input matrices, loaded once per model (audit I4).
     pub(crate) ple_cache: Option<crate::gemma_infer::PleCache>,
+    /// Device-resident final projection/embedding: `(device_id, nbytes, buffer)`.
+    /// Uploaded once so the lm_head is not re-uploaded every token (audit P0.1b).
+    pub(crate) head_dev: Option<(usize, usize, hayai_opencl::Buffer<u8>)>,
     /// MoE resident non-expert (attn + router + shared expert) bytes per layer,
     /// cached after the first read so subsequent tokens skip the disk. Bounded by
     /// `moe_non_expert_cap`. Experts are streamed sparsely (never cached here).
@@ -648,6 +651,79 @@ impl StreamingGenerator {
     /// Share the final projection / tied embedding across sessions (server, audit D.2.3).
     pub fn set_head_cache(&mut self, cache: Arc<std::sync::Mutex<crate::session::HeadCache>>) {
         self.head_cache = Some(cache);
+    }
+
+    /// Project the final hidden state through `head` (lm_head / tied embedding) keeping
+    /// the matrix resident in a device buffer: uploaded once, then one bound GEMV per
+    /// token with **no** per-token `enqueue_write_buffer` of the 160–550 MiB head
+    /// (audit P0.1b). Falls back to CPU when there is no OpenCL device.
+    pub(crate) fn head_gemv(
+        &mut self,
+        orch: &EngineOrchestrator,
+        head: &QuantMatrix,
+        xn: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), StreamInferError> {
+        let Some(eng) = orch.opencl_engine() else {
+            return head
+                .gemv(xn, out)
+                .map_err(|e| StreamInferError::Msg(e.to_string()));
+        };
+        let need = head.nbytes();
+        let dev = eng.device_info.device_id as usize;
+        let reuse = matches!(&self.head_dev, Some((d, l, _)) if *d == dev && *l >= need);
+        if !reuse {
+            let buf = eng.create_weight_buffer(head.data())?;
+            self.head_dev = Some((dev, need, buf));
+        }
+        let (matches, label) = gemv_kernel_for(eng, head.ggml_type).ok_or_else(|| {
+            StreamInferError::Msg(format!(
+                "OpenCL head GEMV missing for {:?}",
+                head.ggml_type
+            ))
+        })?;
+        let Some((_, _, buf)) = self.head_dev.as_ref() else {
+            return Err(StreamInferError::Msg("head buffer missing".into()));
+        };
+        eng.ggml_gemv_dispatch_bound(
+            matches,
+            label,
+            head.nrows,
+            head.ncols,
+            hayai_opencl::GgmlWeightBind::Device(buf),
+            0,
+            xn,
+            out,
+        )
+        .map_err(StreamInferError::from)?;
+        Ok(())
+    }
+
+    /// Upload the (already loaded) head to VRAM during session init so decode does no
+    /// head transfer (audit P0.1b). No-op without a device or before the head is loaded.
+    pub(crate) fn preload_head_device(
+        &mut self,
+        orch: &EngineOrchestrator,
+    ) -> Result<(), StreamInferError> {
+        let Some(eng) = orch.opencl_engine() else {
+            return Ok(());
+        };
+        let head = if self.has_output_weight {
+            self.resident_output.clone()
+        } else {
+            self.resident_embed.clone()
+        };
+        let Some(head) = head else {
+            return Ok(());
+        };
+        let need = head.nbytes();
+        let dev = eng.device_info.device_id as usize;
+        if matches!(&self.head_dev, Some((d, l, _)) if *d == dev && *l >= need) {
+            return Ok(());
+        }
+        let buf = eng.create_weight_buffer(head.data())?;
+        self.head_dev = Some((dev, need, buf));
+        Ok(())
     }
 
     pub(crate) fn run_ffn_block(
@@ -1315,6 +1391,7 @@ impl StreamingGenerator {
             resident_embed: None,
             head_cache: None,
             ple_cache: None,
+            head_dev: None,
         })
     }
 
@@ -2165,11 +2242,11 @@ impl StreamingGenerator {
         let t_head = Instant::now();
         self.ensure_head_loaded()?;
         if self.has_output_weight {
-            let ow = self.resident_output.as_ref().unwrap();
-            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            let ow = self.resident_output.clone().unwrap();
+            self.head_gemv(orch, &ow, &xn, &mut logits)?;
         } else {
-            let emb = self.resident_embed.as_ref().unwrap();
-            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            let emb = self.resident_embed.clone().unwrap();
+            self.head_gemv(orch, &emb, &xn, &mut logits)?;
         }
         self.ffn_secs += t_head.elapsed().as_secs_f64();
 
@@ -2391,11 +2468,11 @@ impl StreamingGenerator {
         let t_head = Instant::now();
         self.ensure_head_loaded()?;
         if self.has_output_weight {
-            let ow = self.resident_output.as_ref().unwrap();
-            orch.execute_quant_gemv(ow, &xn, &mut logits)?;
+            let ow = self.resident_output.clone().unwrap();
+            self.head_gemv(orch, &ow, &xn, &mut logits)?;
         } else {
-            let emb = self.resident_embed.as_ref().unwrap();
-            orch.execute_quant_gemv(emb, &xn, &mut logits)?;
+            let emb = self.resident_embed.clone().unwrap();
+            self.head_gemv(orch, &emb, &xn, &mut logits)?;
         }
         self.ffn_secs += t_head.elapsed().as_secs_f64();
 
@@ -2868,6 +2945,11 @@ impl StreamingGenerator {
                 self.resident_embed = Some(m);
             }
         }
+
+        // Audit P0.1b: load + upload the lm_head during init so decode performs no
+        // head transfer (no per-token enqueue_write_buffer of the projection).
+        self.ensure_head_loaded()?;
+        self.preload_head_device(orch)?;
 
         Ok(scratch)
     }
