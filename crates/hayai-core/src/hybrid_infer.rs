@@ -200,46 +200,8 @@ pub(crate) fn forward_hybrid(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(n_layers)
         .min(n_layers);
-    let mut pre: Option<(usize, std::thread::JoinHandle<Result<FfnMats, hayai_model::GgufError>>)> =
-        None;
     for layer in 0..max_layers {
         let ov = override_ffn.and_then(|o| o.get(layer));
-        // Holds the joined prefetch for this layer so `preloaded` can borrow it.
-        let pre_holder: Option<FfnMats>;
-
-        // Join the prefetch targeting this layer (started one/more layers ago, so
-        // it overlapped the intermediate compute). A prefetch for a later layer is
-        // put back untouched.
-        let preloaded: Option<&FfnMats> = match pre.take() {
-            Some((pl, handle)) if pl == layer => {
-                let mats = handle
-                    .join()
-                    .map_err(|_| StreamInferError::Msg("ffn prefetch thread panicked".into()))??;
-                gen.io_bytes += (mats.0.nbytes() + mats.1.nbytes() + mats.2.nbytes()) as u64;
-                pre_holder = Some(mats);
-                pre_holder.as_ref()
-            }
-            other => {
-                pre = other;
-                None
-            }
-        };
-
-        // Prefetch the next layer that loads its FFN from disk (DeltaNet, or a
-        // FullAttn layer whose attention is skipped). FullAttn layers stage the
-        // whole pack through the ping-pong scratch and need no prefetch here.
-        if pre.is_none() {
-            let next = (layer + 1..max_layers)
-                .find(|&l| needs_ffn_prefetch(&gen.catalog, l, skip_fa));
-            if let Some(next) = next {
-                let mut cat = gen.catalog.fork_reader()?;
-                pre = Some((
-                    next,
-                    std::thread::spawn(move || cat.load_ffn_matrices(next)),
-                ));
-            }
-        }
-
         match hybrid_layer_kind(&gen.catalog, layer) {
             HybridLayerKind::NextN => {
                 // MTP / next-n draft head is not executed yet; report it once
@@ -254,14 +216,14 @@ pub(crate) fn forward_hybrid(
             }
             HybridLayerKind::DeltaNet => {
                 if skip_dn {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, None)?;
                 } else {
-                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
+                    run_deltanet_block(gen, orch, scratch, layer, eps, &mut x, ov, None)?;
                 }
             }
             HybridLayerKind::FullAttn => {
                 if skip_fa {
-                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, preloaded)?;
+                    run_ffn_only_block(gen, orch, scratch, layer, eps, &mut x, ov, None)?;
                 } else {
                     // FullAttn stages via scratch; a pending prefetch is for a
                     // later layer and was retained above.
@@ -365,14 +327,6 @@ pub(crate) fn ensure_deltanet_cache(gen: &mut StreamingGenerator) -> Result<(), 
 /// Whether a layer's FFN is loaded outside the full-pack scratch staging
 /// (`run_deltanet_block` / `run_ffn_only_block`) and can therefore use the
 /// prefetched FFN.
-fn needs_ffn_prefetch(cat: &hayai_model::GgufCatalog, layer: usize, skip_fa: bool) -> bool {
-    match hybrid_layer_kind(cat, layer) {
-        HybridLayerKind::NextN => false,
-        HybridLayerKind::DeltaNet => true,
-        HybridLayerKind::FullAttn => skip_fa,
-    }
-}
-
 /// FFN-only residual block (ablation helper): `x += FFN(rms_norm(x))`.
 fn run_ffn_only_block(
     gen: &mut StreamingGenerator,
