@@ -250,13 +250,13 @@ mod iouring_weight {
     impl IoUringWeightIo {
         pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
             let path = path.as_ref().to_path_buf();
-            // Audit D.1.2: direct I/O is the streaming default on Linux (it bypasses the
-            // page cache — no double copy, no kswapd storms on models larger than RAM).
-            // Opt out with HAYAI_O_DIRECT=0; an unaligned/unsupported device still falls
-            // back to buffered per-read.
+            // Audit R2: O_DIRECT must NOT be the default while `read_many_at` still
+            // serialises per-tensor padded reads (it would disable io_uring batching and
+            // add a copy). The buffered batched path (deep NVMe queue) is the default;
+            // O_DIRECT is opt-in until the single-enveloping-aligned-read path lands.
             let want_direct = std::env::var_os("HAYAI_O_DIRECT")
                 .map(|v| v != "0")
-                .unwrap_or(true);
+                .unwrap_or(false);
             let (file, direct) = if want_direct {
                 match std::fs::OpenOptions::new()
                     .read(true)

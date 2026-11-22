@@ -2489,6 +2489,20 @@ impl StreamingGenerator {
                                 c.resident_bytes = host_ram;
                             }
                         }
+                        // Audit R1: a device is a residency target only if each per-layer
+                        // mirror buffer fits CL_DEVICE_MAX_MEM_ALLOC_SIZE (residency is now
+                        // per-layer, so total VRAM — not ¼ VRAM — is the real budget).
+                        for c in caps.iter_mut() {
+                            if let crate::planner::ComputeTarget::Device(i) = c.target {
+                                if let Some(eng) = orch.pool.engines.get(i) {
+                                    if (plan.max_full_block_bytes as u64)
+                                        > eng.device_info.max_alloc_size as u64
+                                    {
+                                        c.resident_bytes = 0;
+                                    }
+                                }
+                            }
+                        }
                         // Per-quant calibration: price each device's resident GEMV with
                         // the model's real dominant quant (audit A.4.2 — f32/q4_k alone
                         // mis-prices q4_0/q5_k/q6_k models).
@@ -2496,15 +2510,14 @@ impl StreamingGenerator {
                             for c in caps.iter_mut() {
                                 if let crate::planner::ComputeTarget::Device(i) = c.target {
                                     if let Some(eng) = orch.pool.engines.get(i) {
-                                        if let Ok(bw) = eng
-                                            .bench_resident_gemv_quant_gbytes_s(label, 4096, 4096)
-                                        {
-                                            if bw > 0.0 {
-                                                // The mirror path prices at the resident
-                                                // rate (attention/FFN read the mirror).
-                                                c.resident_gemv_bw = bw * 1e9;
-                                                c.gemv_bw = bw * 1e9;
-                                            }
+                                        let bw = crate::calibration::cached_resident_quant_bw(
+                                            eng, label, 4096, 4096,
+                                        );
+                                        if bw > 0.0 {
+                                            // Only the resident rate is updated; the
+                                            // streamed `gemv_bw` stays the measured
+                                            // upload rate (audit R1/R4).
+                                            c.resident_gemv_bw = bw * 1e9;
                                         }
                                     }
                                 }
@@ -3907,15 +3920,17 @@ pub(crate) fn begin_gemv_from_scratch(
         }
     };
     use hayai_opencl::WeightBind;
-    let woff = scratch.weight_offset(layer, tensor_off);
-    // Macro-chunk: the per-role DMA destination does not yet match `weight_offset`, so
-    // binding the mirror would read misaligned bytes; host-upload instead (correct, just
-    // slower). Mirrors `sync_gemv_from_scratch` (audit A.3.4).
+    // Macro-chunk: the streaming mirror DMA is still block-slot based; host-upload there.
     if scratch.block_k > 1 {
         return begin_gemv(eng, m, xn);
     }
-    match scratch.weight_bind(eng, layer) {
-        Ok(WeightBind::Svm { ptr }) => Ok(eng.ggml_gemv_async_from_svm(
+    // The bind resolves its matching offset (resident per-layer mirror vs SVM base).
+    let (bind, woff) = match scratch.weight_bind_and_offset(eng, layer, tensor_off) {
+        Ok(x) => x,
+        Err(_) => return begin_gemv(eng, m, xn),
+    };
+    match bind {
+        WeightBind::Svm { ptr } => Ok(eng.ggml_gemv_async_from_svm(
             kernel,
             label,
             m.nrows,
@@ -3924,7 +3939,7 @@ pub(crate) fn begin_gemv_from_scratch(
             woff,
             xn,
         )?),
-        Ok(WeightBind::Device { buf }) => Ok(eng.ggml_gemv_async_from_device(
+        WeightBind::Device { buf } => Ok(eng.ggml_gemv_async_from_device(
             kernel,
             label,
             m.nrows,
@@ -3933,10 +3948,6 @@ pub(crate) fn begin_gemv_from_scratch(
             woff,
             xn,
         )?),
-        // No SVM ownership and no VRAM mirror (e.g. the mirror did not fit in
-        // `CL_DEVICE_MAX_MEM_ALLOC_SIZE`, or the pool had no mirror): upload the
-        // host bytes for this GEMV instead of failing. Correct, just slower.
-        Err(_) => begin_gemv(eng, m, xn),
     }
 }
 
@@ -3993,18 +4004,17 @@ pub(crate) fn sync_gemv_from_scratch(
             m.ggml_type
         ))
     })?;
-    let woff = scratch.weight_offset(layer, tensor_off);
-    // Only the ping-pong layout maps a device mirror to the same offsets the read uses.
-    // In macro-chunk a layer sits at `(layer % block_k) * stride` and the per-role DMA
-    // destinations are slot-based, so a direct mirror read is currently mis-offset: fall
-    // back to the (correct) host-upload path (audit A.3.4: fix the DMA offset first).
+    // Macro-chunk's streaming mirror DMA is still block-slot based; host-upload there.
     if scratch.block_k > 1 {
         return Ok(false);
     }
-    let bind = match scratch.weight_bind(eng, layer) {
-        Ok(WeightBind::Device { buf }) => GgmlWeightBind::Device(buf),
-        Ok(WeightBind::Svm { ptr }) => GgmlWeightBind::Svm(ptr),
+    let (bind, woff) = match scratch.weight_bind_and_offset(eng, layer, tensor_off) {
+        Ok(x) => x,
         Err(_) => return Ok(false),
+    };
+    let bind = match bind {
+        WeightBind::Device { buf } => GgmlWeightBind::Device(buf),
+        WeightBind::Svm { ptr } => GgmlWeightBind::Svm(ptr),
     };
     eng.ggml_gemv_dispatch_bound(kernel, label, m.nrows, m.ncols, bind, woff, xn, out)
         .map_err(StreamInferError::from)?;
@@ -4068,17 +4078,26 @@ fn try_ffn_dev_begin(
     if gate.ncols != xn.len() || up.ncols != xn.len() || gate.nrows != up.nrows {
         return Ok(false);
     }
-    let wg = scratch.weight_offset(layer, layout.gate_off);
-    let wu = scratch.weight_offset(layer, layout.up_off);
-    let bg = match scratch.weight_bind(eng, layer) {
-        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
-        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
-        Err(_) => return Ok(false),
-    };
-    let bu = match scratch.weight_bind(eng, layer) {
-        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
-        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
-        Err(_) => return Ok(false),
+    let (bg, bu, wg, wu) = match (
+        scratch.weight_bind_and_offset(eng, layer, layout.gate_off),
+        scratch.weight_bind_and_offset(eng, layer, layout.up_off),
+    ) {
+        (
+            Ok((WeightBind::Device { buf: gb }, wg)),
+            Ok((WeightBind::Device { buf: ub }, wu)),
+        ) => (
+            hayai_opencl::GgmlWeightBind::Device(gb),
+            hayai_opencl::GgmlWeightBind::Device(ub),
+            wg,
+            wu,
+        ),
+        (Ok((WeightBind::Svm { ptr: gp }, wg)), Ok((WeightBind::Svm { ptr: up_ }, wu))) => (
+            hayai_opencl::GgmlWeightBind::Svm(gp),
+            hayai_opencl::GgmlWeightBind::Svm(up_),
+            wg,
+            wu,
+        ),
+        _ => return Ok(false),
     };
     eng.ffn_dev_upload_x(xn)?;
     eng.ffn_dev_gate_up(
@@ -4116,11 +4135,12 @@ fn try_ffn_dev_finish(
     if down.nrows != down_out.len() {
         return Ok(false);
     }
-    let wd = scratch.weight_offset(layer, layout.down_off);
-    let bd = match scratch.weight_bind(eng, layer) {
-        Ok(WeightBind::Device { buf }) => hayai_opencl::GgmlWeightBind::Device(buf),
-        Ok(WeightBind::Svm { ptr }) => hayai_opencl::GgmlWeightBind::Svm(ptr),
-        Err(_) => return Ok(false),
+    let Ok((bd, wd)) = scratch.weight_bind_and_offset(eng, layer, layout.down_off) else {
+        return Ok(false);
+    };
+    let bd = match bd {
+        WeightBind::Device { buf } => hayai_opencl::GgmlWeightBind::Device(buf),
+        WeightBind::Svm { ptr } => hayai_opencl::GgmlWeightBind::Svm(ptr),
     };
     eng.ffn_dev_down(dk, dl, down.nrows, down.ncols, bd, wd, down_out)?;
     Ok(true)
@@ -4315,8 +4335,19 @@ pub(crate) fn ffn_finish_scratch(
         match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
             Some(eng) => {
                 *used_dgpu = true;
-                let v = begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
-                down_out.copy_from_slice(&v);
+                // Prefer the synchronous mirror dispatch: it reuses the persistent
+                // GemvSyncWorkspace and does not allocate per-op buffers (audit R4).
+                let mut done = false;
+                if let Some(sc) = scratch {
+                    if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, down_off)? {
+                        done = true;
+                    }
+                }
+                if !done {
+                    let v =
+                        begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
+                    down_out.copy_from_slice(&v);
+                }
             }
             None => {
                 down.gemv(gate_out, down_out)
@@ -4371,8 +4402,19 @@ pub(crate) fn ffn_finish_gelu_scratch(
         match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
             Some(eng) => {
                 *used_dgpu = true;
-                let v = begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
-                down_out.copy_from_slice(&v);
+                // Prefer the synchronous mirror dispatch: it reuses the persistent
+                // GemvSyncWorkspace and does not allocate per-op buffers (audit R4).
+                let mut done = false;
+                if let Some(sc) = scratch {
+                    if sync_gemv_from_scratch(eng, down, gate_out, down_out, sc, layer, down_off)? {
+                        done = true;
+                    }
+                }
+                if !done {
+                    let v =
+                        begin_ffn_gemv(eng, down, gate_out, scratch, layer, down_off)?.wait()?;
+                    down_out.copy_from_slice(&v);
+                }
             }
             None => {
                 down.gemv(gate_out, down_out)

@@ -295,6 +295,40 @@ fn cache_path(fingerprint: &str) -> std::path::PathBuf {
 static MEM_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(String, HwProfile)>>> =
     std::sync::OnceLock::new();
 
+/// Process-wide cache of per-quant resident GEMV bandwidth, keyed by
+/// `(device_id, quant_label)`. The planner prices a device with the model's dominant
+/// quant, but that benchmark must run **at most once per device+quant for the process**
+/// — not on every session/HTTP request (audit R4).
+static QUANT_BW_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, String), f64>>,
+> = std::sync::OnceLock::new();
+
+/// Resident GEMV GB/s for `(device, quant)`, memoised for the process.
+pub fn cached_resident_quant_bw(
+    eng: &hayai_opencl::OpenClEngine,
+    label: &str,
+    m: usize,
+    n: usize,
+) -> f64 {
+    let key = (eng.device_info.device_id as usize, label.to_string());
+    let cache = QUANT_BW_CACHE.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    if let Ok(g) = cache.lock() {
+        if let Some(v) = g.get(&key) {
+            return *v;
+        }
+    }
+    let bw = eng
+        .bench_resident_gemv_quant_gbytes_s(label, m, n)
+        .unwrap_or(0.0);
+    if bw > 0.0 {
+        if let Ok(mut g) = cache.lock() {
+            g.insert(key, bw);
+        }
+    }
+    bw
+}
+
+
 /// Run the full calibration over the OpenCL pool and (optionally) a model file.
 ///
 /// Cached in memory and on disk (audit D.2: recalibrating on every session/HTTP request

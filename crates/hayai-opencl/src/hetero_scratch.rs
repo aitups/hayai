@@ -179,25 +179,6 @@ impl StreamingScratch {
         // every op, so one DMA per layer is strictly better; true UMA zero-copy via
         // CL_MEM_USE_HOST_PTR is the remaining refinement).
         for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
-            // A coarse-SVM UMA owner reads the host base directly once it is unmapped
-            // (`weight_bind` → SVM, `unmap_host_for_device`); a mirror would only add a
-            // redundant copy, so skip it and keep true zero-copy.
-            if let HostBase::Svm { owner_id, .. } = &host {
-                if eng.device_info.device_id == *owner_id
-                    && matches!(
-                        eng.device_info.device_kind,
-                        DeviceKind::Apu | DeviceKind::IntegratedGpu
-                    )
-                    && eng.device_info.svm_coarse()
-                    && !(eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
-                {
-                    info!(
-                        "HeteroScratch: {} reads host base zero-copy (coarse SVM, no mirror)",
-                        eng.device_info.device_name
-                    );
-                    continue;
-                }
-            }
             if !mirror_fits(eng, slot_bytes) {
                 warn!(
                     "Skipping VRAM mirror on {} ({} KiB > max alloc {} KiB); \
@@ -305,40 +286,7 @@ impl StreamingScratch {
                         n_layers,
                         layer_bytes / 1024
                     );
-                    let mut mirrors = Self::resident_mirrors(pool, total)?;
-                    // Coarse-SVM UMA owner reads the base zero-copy; a mirror only adds
-                    // a redundant copy (see `unmap_host_for_device` / `weight_bind`).
-                    if apu.device_info.svm_coarse()
-                        && !(apu.device_info.svm_fine_system()
-                            || apu.device_info.svm_fine_buffer())
-                        && matches!(
-                            apu.device_info.device_kind,
-                            DeviceKind::Apu | DeviceKind::IntegratedGpu
-                        )
-                    {
-                        mirrors.retain(|m| m.device_id != apu.device_info.device_id);
-                    }
-                    // Pinned-host fallback not needed here (SVM covers primary FFN).
-                    if mirrors.is_empty() {
-                        let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
-                        if prim.device_info.device_kind == DeviceKind::DiscreteGpu
-                            && mirror_fits(prim, total)
-                        {
-                            mirrors.push(DgpuMirror {
-                                device_id: prim.device_info.device_id,
-                                slots: vec![
-                                    DeviceLayerBuffer::new(prim, total)?,
-                                    DeviceLayerBuffer::new(prim, 1)?,
-                                ],
-                            });
-                        } else if prim.device_info.device_kind == DeviceKind::DiscreteGpu {
-                            warn!(
-                                "Resident: {} cannot mirror {} MiB; using host-upload FFN",
-                                prim.device_info.device_name,
-                                total / (1024 * 1024)
-                            );
-                        }
-                    }
+                    let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers)?;
                     return Ok((
                         TransferPath::SvmZeroCopy,
                         Self {
@@ -365,16 +313,7 @@ impl StreamingScratch {
         }
 
         let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
-        let mut mirrors = Self::resident_mirrors(pool, total)?;
-        if mirrors.is_empty() && mirror_fits(prim, total) {
-            mirrors.push(DgpuMirror {
-                device_id: prim.device_info.device_id,
-                slots: vec![
-                    DeviceLayerBuffer::new(prim, total)?,
-                    DeviceLayerBuffer::new(prim, 1)?,
-                ],
-            });
-        }
+        let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers)?;
         info!(
             "ResidentScratch: pinned host on {} ({} layers × {} KiB)",
             prim.device_info.device_name,
@@ -406,31 +345,36 @@ impl StreamingScratch {
     /// One big device mirror per discrete or integrated GPU for the resident base.
     fn resident_mirrors(
         pool: &OpenClDevicePool,
-        total: usize,
+        layer_bytes: usize,
+        n_layers: usize,
     ) -> Result<Vec<DgpuMirror>, OpenClError> {
         let mut mirrors = Vec::new();
+        if n_layers == 0 || layer_bytes == 0 {
+            return Ok(mirrors);
+        }
         for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
-            if !mirror_fits(eng, total) {
+            // Audit P0.1a/R1: one buffer per layer, each under
+            // CL_DEVICE_MAX_MEM_ALLOC_SIZE, instead of one monolithic buffer.
+            if !mirror_fits(eng, layer_bytes) {
                 warn!(
-                    "Resident: skipping VRAM mirror on {} ({} MiB > max alloc {} MiB); \
-                     that device will use host-upload FFN",
+                    "Resident: skipping VRAM mirror on {} (layer {} MiB > max alloc {} MiB)",
                     eng.device_info.device_name,
-                    total / (1024 * 1024),
+                    layer_bytes / (1024 * 1024),
                     eng.device_info.max_alloc_size / (1024 * 1024)
                 );
                 continue;
             }
+            let mut slots = Vec::with_capacity(n_layers);
+            for _ in 0..n_layers {
+                slots.push(DeviceLayerBuffer::new(eng, layer_bytes)?);
+            }
             mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
-                slots: vec![
-                    DeviceLayerBuffer::new(eng, total)?,
-                    DeviceLayerBuffer::new(eng, 1)?,
-                ],
+                slots,
             });
         }
         Ok(mirrors)
     }
-
     /// Legacy single-engine allocate (bench-io).
     pub fn allocate(
         engine: Option<&OpenClEngine>,
@@ -743,36 +687,14 @@ impl StreamingScratch {
     }
 
     /// Unmap SVM so the device can consume the slot (call after Attn, before FFN enqueue).
+    /// Keep the host slot mapped for the whole session: CPU attention reads the weights
+    /// and the device reads its mirror. No coarse-SVM binding is done, so no per-layer
+    /// map/unmap (audit R3).
     pub fn unmap_host_for_device(
         &mut self,
-        pool: &OpenClDevicePool,
-        idx: usize,
+        _pool: &OpenClDevicePool,
+        _idx: usize,
     ) -> Result<(), OpenClError> {
-        // Coarse-grain SVM must be unmapped before the device reads it. On a UMA APU
-        // this is a coherence hand-off, not a copy: the GEMV then reads the host bytes
-        // directly (`weight_bind` returns the SVM pointer) — true zero-copy. Fine-grain
-        // and pinned bases stay mapped (`prepare_for_device` is a no-op for them).
-        let slot = if self.resident { 0 } else { self.slot_for(idx) };
-        if let HostBase::Svm { slots, owner_id } = &mut self.host {
-            if !slots[slot].coarse {
-                return Ok(());
-            }
-            if let Some(apu) = pool
-                .engines
-                .iter()
-                .find(|e| e.device_info.device_id == *owner_id)
-            {
-                // Only UMA owners consume the coarse SVM directly (`weight_bind` gates
-                // coarse bind to Apu/IntegratedGpu); a discrete owner always uses its
-                // mirror, so keep its host base mapped (no unnecessary unmap/remap).
-                if matches!(
-                    apu.device_info.device_kind,
-                    DeviceKind::Apu | DeviceKind::IntegratedGpu
-                ) {
-                    slots[slot].prepare_for_device(apu)?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -921,10 +843,6 @@ impl StreamingScratch {
     /// Resolve Base+Offset bind for a pool device. Errors if the device has no
     /// SVM ownership and no VRAM mirror (HostUpload removed from product path).
     pub fn weight_bind(&self, eng: &OpenClEngine, slot: usize) -> Result<WeightBind<'_>, OpenClError> {
-        let uma = matches!(
-            eng.device_info.device_kind,
-            DeviceKind::Apu | DeviceKind::IntegratedGpu
-        );
         if self.resident {
             // Resident: single base allocation; `slot` is the layer index.
             // Only a **fine-grain** SVM owner can be read by the device while the
@@ -932,8 +850,7 @@ impl StreamingScratch {
             // (dGPU) or to host-upload (the `begin_gemv_from_scratch` fallback).
             if let HostBase::Svm { slots, owner_id } = &self.host {
                 if eng.device_info.device_id == *owner_id
-                    && slots[0].device_usable()
-                    && (uma || !slots[0].coarse)
+                    && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
                 {
                     return Ok(WeightBind::Svm {
                         ptr: slots[0].as_ptr(),
@@ -960,8 +877,7 @@ impl StreamingScratch {
             // mapping stays live. A coarse owner falls through to the mirror
             // (dGPU) or host-upload, so the slot never needs to be unmapped.
             if eng.device_info.device_id == *owner_id
-                && slots[slot].device_usable()
-                && (uma || !slots[slot].coarse)
+                && (eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer())
             {
                 return Ok(WeightBind::Svm {
                     ptr: slots[slot].as_ptr(),
@@ -979,6 +895,69 @@ impl StreamingScratch {
         }
         Err(OpenClError::ClError(format!(
             "no WeightBind for '{}' (need SVM owner or dGPU mirror; HostUpload disabled)",
+            eng.device_info.device_name
+        )))
+    }
+
+    /// Resolve a weight bind **and the byte offset that matches it** for one tensor of
+    /// `layer`. Resident device mirrors are per-layer buffers, so their offset is
+    /// layer-local (`tensor_off`); the resident SVM base and streaming block mirrors use
+    /// [`Self::weight_offset`]. This is the single source of truth the GEMV callers use.
+    pub fn weight_bind_and_offset(
+        &self,
+        eng: &OpenClEngine,
+        layer: usize,
+        tensor_off: usize,
+    ) -> Result<(WeightBind<'_>, usize), OpenClError> {
+        let fine = eng.device_info.svm_fine_system() || eng.device_info.svm_fine_buffer();
+        if self.resident {
+            if let HostBase::Svm { slots, owner_id } = &self.host {
+                if eng.device_info.device_id == *owner_id && fine {
+                    return Ok((
+                        WeightBind::Svm {
+                            ptr: slots[0].as_ptr(),
+                        },
+                        self.weight_offset(layer, tensor_off),
+                    ));
+                }
+            }
+            if let Some(m) = self
+                .dgpu_mirrors
+                .iter()
+                .find(|m| m.device_id == eng.device_info.device_id)
+            {
+                if let Some(buf) = m.slots.get(layer) {
+                    return Ok((WeightBind::Device { buf: &buf.cl_buffer }, tensor_off));
+                }
+            }
+            return Err(OpenClError::ClError(format!(
+                "no resident WeightBind for '{}'",
+                eng.device_info.device_name
+            )));
+        }
+        let slot = self.slot_for(layer);
+        let off = self.weight_offset(layer, tensor_off);
+        if let HostBase::Svm { slots, owner_id } = &self.host {
+            if eng.device_info.device_id == *owner_id && fine {
+                return Ok((
+                    WeightBind::Svm {
+                        ptr: slots[slot].as_ptr(),
+                    },
+                    off,
+                ));
+            }
+        }
+        if let Some(m) = self
+            .dgpu_mirrors
+            .iter()
+            .find(|m| m.device_id == eng.device_info.device_id)
+        {
+            if let Some(buf) = m.slots.get(slot) {
+                return Ok((WeightBind::Device { buf: &buf.cl_buffer }, off));
+            }
+        }
+        Err(OpenClError::ClError(format!(
+            "no WeightBind for '{}'",
             eng.device_info.device_name
         )))
     }
@@ -1044,7 +1023,12 @@ impl StreamingScratch {
             // SAFETY: host_ptr points into the resident base owned by `self`, which
             // outlives this call; the base stays host-visible while mapped above.
             let src = unsafe { std::slice::from_raw_parts(host_ptr.add(base_off), total) };
-            if let Some(ev) = dma_write_rect(eng, &mut mirror.slots[0].cl_buffer, base_off, src)? {
+            // Per-layer mirror (audit P0.1a): layer `L` lives in its own buffer at
+            // offset 0, so no single allocation exceeds CL_DEVICE_MAX_MEM_ALLOC_SIZE.
+            if layer >= mirror.slots.len() {
+                continue;
+            }
+            if let Some(ev) = dma_write_rect(eng, &mut mirror.slots[layer].cl_buffer, 0, src)? {
                 events.push(ev);
             }
         }
