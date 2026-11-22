@@ -144,6 +144,7 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
     let idx_of: BTreeMap<LayerOpKind, usize> =
         tasks.iter().enumerate().map(|(i, t)| (t.kind, i)).collect();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
     let mut indeg = vec![0usize; tasks.len()];
     for (i, t) in tasks.iter().enumerate() {
         let mut dep_idx: Vec<usize> = t.deps.iter().copied().filter(|&d| d < tasks.len()).collect();
@@ -156,6 +157,7 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
         }
         dep_idx.sort_unstable();
         dep_idx.dedup();
+        preds[i] = dep_idx.clone();
         for j in dep_idx {
             indeg[i] += 1;
             adj[j].push(i);
@@ -186,6 +188,9 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
     let mut busy: BTreeMap<ComputeTarget, f64> = caps.iter().map(|c| (c.target, 0.0)).collect();
     let mut avail: BTreeMap<ComputeTarget, f64> = busy.clone();
     let mut finish = vec![0.0f64; tasks.len()];
+    // Which cap index produced each task's finish (to price cross-device hand-offs).
+    let mut finish_dev = vec![usize::MAX; tasks.len()];
+    let cpu_ci = caps.iter().position(|c| !c.is_gpu).unwrap_or(0);
 
     for &i in &order {
         let t = &tasks[i];
@@ -198,10 +203,11 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
                 }
             }
             finish[i] = start;
+            finish_dev[i] = cpu_ci;
             continue;
         }
-        let mut best: Option<(ComputeTarget, f64, f64)> = None;
-        for c in caps {
+        let mut best: Option<(usize, ComputeTarget, f64, f64)> = None;
+        for (ci, c) in caps.iter().enumerate() {
             let resident =
                 placeable_layer_bytes > 0 && placeable_layer_bytes <= c.resident_bytes && c.is_gpu;
             let op_t = c.gemv_seconds(t.bytes, resident);
@@ -213,16 +219,28 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
             } else {
                 start
             };
-            let fin = begin + op_t;
-            if best.map(|(_, f, _)| fin < f).unwrap_or(true) {
-                best = Some((c.target, fin, op_t));
+            // Audit I2: a hand-off from a dependency on another device costs a
+            // BLOCKING round-trip + activation copy; price it so the scheduler does
+            // not split a layer across devices for a negligible gain.
+            let mut transfer = 0.0;
+            if concurrent
+                && preds[i]
+                    .iter()
+                    .any(|&p| finish_dev[p] != usize::MAX && finish_dev[p] != ci)
+            {
+                transfer = 60e-6 + 65_536.0 / c.link_bw.max(1.0);
+            }
+            let fin = begin + op_t + transfer;
+            if best.map(|(_, _, f, _)| fin < f).unwrap_or(true) {
+                best = Some((ci, c.target, fin, op_t));
             }
         }
-        let (chosen, fin, op_t) = match best {
+        let (chosen_ci, chosen, fin, op_t) = match best {
             Some(x) => x,
             None => {
                 out.assignments.insert(t.kind, ComputeTarget::Cpu);
                 finish[i] = start;
+                finish_dev[i] = cpu_ci;
                 for &j in &adj[i] {
                     if finish[j] < start {
                         finish[j] = start;
@@ -239,6 +257,7 @@ pub fn plan_placement(tasks: &[OpTask], caps: &[TargetCaps], concurrent: bool) -
         *avail.entry(chosen).or_insert(0.0) = fin;
         *busy.entry(chosen).or_insert(0.0) += op_t;
         finish[i] = fin;
+        finish_dev[i] = chosen_ci;
         out.assignments.insert(t.kind, chosen);
     }
 
@@ -393,7 +412,9 @@ pub fn plan_session(
     // kinds belong to *different* layers and must not be treated as concurrent spillover
     // (that is exactly what wrongly pushed attention onto the CPU). Cross-device spread
     // belongs to the per-layer split, not per-kind balancing.
-    let placement = plan_placement(tasks, caps, false);
+    // Audit I2: schedule independent ops (Q/K/V, gate/up) concurrently across devices,
+    // pricing cross-device hand-offs (see the `transfer` term in `plan_placement`).
+    let placement = plan_placement(tasks, caps, true);
 
     SessionPlan {
         compute,
