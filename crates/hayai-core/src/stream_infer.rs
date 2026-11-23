@@ -1965,6 +1965,29 @@ impl StreamingGenerator {
         let mut out_norm = mk(h)?;
         upload(&mut out_norm, &self.output_norm)?;
         let half = (c.rope_dim.min(c.head_dim)) / 2;
+        // Precompute the RoPE cos/sin table for every position once (no per-token upload).
+        let mut cos = mk((max_seq * half).max(1))?;
+        let mut sin = mk((max_seq * half).max(1))?;
+        if half > 0 {
+            let mut cosall = vec![0.0f32; max_seq * half];
+            let mut sinall = vec![0.0f32; max_seq * half];
+            for p in 0..max_seq {
+                let t = hayai_cpu::rope_cos_sin_table(
+                    p,
+                    c.head_dim,
+                    c.rope_dim.min(c.head_dim),
+                    c.rope_theta,
+                    None,
+                    c.rope,
+                );
+                for i in 0..half {
+                    cosall[p * half + i] = t.get(i).map(|x| x.0).unwrap_or(1.0);
+                    sinall[p * half + i] = t.get(i).map(|x| x.1).unwrap_or(0.0);
+                }
+            }
+            upload(&mut cos, &cosall)?;
+            upload(&mut sin, &sinall)?;
+        }
         let kv = (0..n_layers)
             .map(|_| hayai_opencl::DeviceKvCache::new(eng, c.num_kv_heads, c.head_dim, max_seq))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1990,8 +2013,8 @@ impl StreamingGenerator {
             up: mk(ffn)?,
             down: mk(h)?,
             logits: mk(vocab)?,
-            cos: mk(half.max(1))?,
-            sin: mk(half.max(1))?,
+            cos,
+            sin,
             out_norm,
             attn_norm,
             ffn_norm,
@@ -2030,25 +2053,7 @@ impl StreamingGenerator {
         self.embed_row("token_embd.weight", token, h, &mut x_host)?;
         {
             let d = self.dense_dev.as_mut().unwrap();
-            eng.upload_f32(&mut d.x, &x_host)?;
-        }
-        // RoPE table for this position.
-        let table = hayai_cpu::rope_cos_sin_table(
-            pos,
-            self.attn_cfg.head_dim,
-            self.attn_cfg.rope_dim.min(self.attn_cfg.head_dim),
-            self.attn_cfg.rope_theta,
-            None,
-            self.attn_cfg.rope,
-        );
-        {
-            let d = self.dense_dev.as_mut().unwrap();
-            let cosv: Vec<f32> = table.iter().map(|p| p.0).collect();
-            let sinv: Vec<f32> = table.iter().map(|p| p.1).collect();
-            if !cosv.is_empty() {
-                eng.upload_f32(&mut d.cos, &cosv)?;
-                eng.upload_f32(&mut d.sin, &sinv)?;
-            }
+            eng.upload_f32_nb(&mut d.x, &x_host)?;
         }
         let (sinks, window) = (self.kv_sinks, self.kv_window.max(1));
         let slot = if pos < sinks {
@@ -2083,9 +2088,9 @@ impl StreamingGenerator {
             if let Some(b) = &d.vb[layer] {
                 eng.residual_add_dev(&d.v, b, d.kv_dim)?;
             }
-            if rd >= 2 && !table.is_empty() {
-                eng.rope_apply_dev(&d.q, n_heads, hd, rd, &d.cos, &d.sin)?;
-                eng.rope_apply_dev(&d.k, n_kv, hd, rd, &d.cos, &d.sin)?;
+            if rd >= 2 {
+                eng.rope_apply_dev(&d.q, n_heads, hd, rd, pos, &d.cos, &d.sin)?;
+                eng.rope_apply_dev(&d.k, n_kv, hd, rd, pos, &d.cos, &d.sin)?;
             }
             eng.kv_append_dev(&mut d.kv[layer], slot, &d.k, &d.v)?;
             eng.attn_decode_dev(&d.q, &d.kv[layer], &d.attn, n_heads, valid, scale)?;
@@ -2101,26 +2106,51 @@ impl StreamingGenerator {
             dev_gemv(eng, scratch, layer, &pack.down, layout.down_off, &d.gate, &d.down)?;
             eng.residual_add_dev(&d.x, &d.down, h)?;
         }
-        // One readback of the final hidden state, then norm + head (upload once).
-        let mut xh = vec![0.0f32; h];
-        {
-            let d = self.dense_dev.as_ref().unwrap();
-            eng.read_f32(&d.x, &mut xh)?;
-        }
         self.position += 1;
-        rms_norm(&mut xh, &self.output_norm, eps);
         let vocab = self.config.vocab_size;
-        let mut logits = vec![0.0f32; vocab];
         self.ensure_head_loaded()?;
-        if self.has_output_weight {
-            let ow = self.resident_output.clone().unwrap();
-            self.head_gemv(orch, &ow, &xh, &mut logits)?;
+        let head = if self.has_output_weight {
+            self.resident_output.clone().unwrap()
         } else {
-            let emb = self.resident_embed.clone().unwrap();
-            self.head_gemv(orch, &emb, &xh, &mut logits)?;
+            self.resident_embed.clone().unwrap()
+        };
+        let hb_opt = self.head_dev.as_ref().map(|(_, _, b)| b);
+        if let Some(hb) = hb_opt {
+            // Final RMSNorm + lm_head on device; a single logits readback per token.
+            let mut logits = vec![0.0f32; vocab];
+            {
+                let d = self.dense_dev.as_mut().unwrap();
+                eng.rms_norm_dev(&d.x, &d.out_norm, &d.xn, h, eps)?;
+                let (hk, hl) = gemv_kernel_for(eng, head.ggml_type).ok_or_else(|| {
+                    StreamInferError::Msg("no device head kernel".into())
+                })?;
+                eng.ggml_gemv_dev_io(
+                    hk,
+                    hl,
+                    head.nrows,
+                    head.ncols,
+                    hayai_opencl::GgmlWeightBind::Device(hb),
+                    0,
+                    &d.xn,
+                    &d.logits,
+                )
+                .map_err(StreamInferError::from)?;
+                eng.read_f32(&d.logits, &mut logits)?;
+            }
+            self.apply_logit_scale(&mut logits);
+            Ok(Some(logits))
+        } else {
+            let mut xh = vec![0.0f32; h];
+            {
+                let d = self.dense_dev.as_ref().unwrap();
+                eng.read_f32(&d.x, &mut xh)?;
+            }
+            rms_norm(&mut xh, &self.output_norm, eps);
+            let mut logits = vec![0.0f32; vocab];
+            self.head_gemv(orch, &head, &xh, &mut logits)?;
+            self.apply_logit_scale(&mut logits);
+            Ok(Some(logits))
         }
-        self.apply_logit_scale(&mut logits);
-        Ok(Some(logits))
     }
 
     fn forward_inner(

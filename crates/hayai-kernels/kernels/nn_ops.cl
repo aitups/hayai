@@ -68,6 +68,7 @@ __kernel void hayai_rope_apply(
     const int n_rows,
     const int head_dim,
     const int rotary_dim,
+    const int pos,
     __global const float* restrict cosv,
     __global const float* restrict sinv)
 {
@@ -80,10 +81,11 @@ __kernel void hayai_rope_apply(
     int row = idx / hd2;
     int p = idx - row * hd2;
     int base = row * head_dim;
+    int ci = pos * hd2 + p;                    // precomputed table for every position
     float a = x[base + p];
     float b = x[base + hd2 + p];
-    float c = cosv[p];
-    float s = sinv[p];
+    float c = cosv[ci];
+    float s = sinv[ci];
     x[base + p] = a * c - b * s;
     x[base + hd2 + p] = a * s + b * c;
 }

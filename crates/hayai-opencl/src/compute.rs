@@ -129,7 +129,21 @@ impl OpenClEngine {
         Ok(())
     }
 
-    /// Read a device f32 buffer into host memory (blocking).
+    /// Upload a host f32 slice into a device buffer (**non-blocking**; the slice must
+    /// stay valid until the next synchronising operation).
+    pub fn upload_f32_nb(
+        &self,
+        buf: &mut Buffer<cl_float>,
+        data: &[f32],
+    ) -> Result<(), OpenClError> {
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(buf, CL_NON_BLOCKING, 0, data, &[])
+                .map_err(|e| OpenClError::ClError(format!("upload f32 nb: {e}")))?;
+        }
+        Ok(())
+    }
+
     pub fn read_f32(
         &self,
         buf: &Buffer<cl_float>,

@@ -584,6 +584,7 @@ impl OpenClEngine {
         n_rows: usize,
         head_dim: usize,
         rotary_dim: usize,
+        pos: usize,
         cos: &Buffer<cl_float>,
         sin: &Buffer<cl_float>,
     ) -> Result<(), OpenClError> {
@@ -593,7 +594,12 @@ impl OpenClEngine {
             return Ok(());
         }
         use opencl3::kernel::ExecuteKernel;
-        let (nr_i, hd_i, rd_i) = (n_rows as cl_int, head_dim as cl_int, rotary_dim as cl_int);
+        let (nr_i, hd_i, rd_i, pos_i) = (
+            n_rows as cl_int,
+            head_dim as cl_int,
+            rotary_dim as cl_int,
+            pos as cl_int,
+        );
         let local = 64usize.min(self.device_info.max_work_group_size.max(1));
         let global = ((total + local - 1) / local) * local;
         unsafe {
@@ -602,6 +608,7 @@ impl OpenClEngine {
                 .set_arg(&nr_i)
                 .set_arg(&hd_i)
                 .set_arg(&rd_i)
+                .set_arg(&pos_i)
                 .set_arg(cos)
                 .set_arg(sin)
                 .set_global_work_size(global)
