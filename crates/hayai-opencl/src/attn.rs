@@ -895,7 +895,7 @@ mod tests {
         let bxr = mk(&xr, CL_MEM_READ_WRITE);
         let bc = mk(&cos, CL_MEM_READ_ONLY);
         let bs = mk(&sin, CL_MEM_READ_ONLY);
-        eng.rope_apply_dev(&bxr, rows, hd, rd, &bc, &bs).unwrap();
+        eng.rope_apply_dev(&bxr, rows, hd, rd, 0, &bc, &bs).unwrap();
         let mut gr = vec![0.0f32; rows * hd];
         unsafe {
             eng.queue
