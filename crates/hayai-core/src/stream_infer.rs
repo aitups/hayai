@@ -2134,7 +2134,7 @@ impl StreamingGenerator {
         if let Some(sc) = scratch.as_deref_mut() {
             if sc.resident
                 && override_ffn.is_none()
-                && std::env::var("HAYAI_DENSE_DEV").ok().as_deref() == Some("1")
+                && crate::stream_infer::dense_dev_enabled()
             {
                 if let Some(logits) = self.forward_dense_device(orch, token, sc)? {
                     return Ok(logits);
@@ -3454,7 +3454,7 @@ impl StreamingGenerator {
                     // the device KV is primed for decode.
                     let use_dev = scratch.resident
                         && self.dense_dev_eligible()
-                        && std::env::var("HAYAI_DENSE_DEV").ok().as_deref() == Some("1");
+                        && crate::stream_infer::dense_dev_enabled();
                     if use_dev {
                         let mut last = Vec::new();
                         for &tok in prompt_ids {
@@ -4426,6 +4426,17 @@ fn dev_gemv(
     eng.ggml_gemv_dev_io(k, l, m.nrows, m.ncols, gb, o, inb, outb)
         .map_err(StreamInferError::from)?;
     Ok(())
+}
+
+/// Whether the device-resident Dense pipeline (#4) is enabled. On by default on the
+/// Linux product target (OpenCL launch overhead is low); opt-in on Windows via
+/// `HAYAI_DENSE_DEV=1` because WDDM per-launch cost (~0.9 ms) makes it slower there.
+pub(crate) fn dense_dev_enabled() -> bool {
+    match std::env::var("HAYAI_DENSE_DEV").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => cfg!(not(windows)),
+    }
 }
 
 fn gemv_kernel_for<'a>(
