@@ -3149,10 +3149,33 @@ impl StreamingGenerator {
             let p = sc.path;
             (p, sc)
         } else if resident {
+            let owned_layers: Option<Vec<Vec<bool>>> =
+                self.session_plan.as_ref().and_then(|s| {
+                    let ld = &s.placement.layer_device;
+                    if ld.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            (0..orch.pool.engines.len())
+                                .map(|ei| {
+                                    (0..self.config.num_layers)
+                                        .map(|l| {
+                                            matches!(
+                                                ld.get(l),
+                                                Some(crate::planner::ComputeTarget::Device(k)) if *k == ei
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .collect(),
+                        )
+                    }
+                });
             hayai_opencl::StreamingScratch::allocate_resident_for_pool(
                 &orch.pool,
                 layer_bytes,
                 self.config.num_layers,
+                owned_layers.as_deref(),
             )?
         } else {
             // Prefetch depth (slots). Default 2 (classic ping-pong); override with

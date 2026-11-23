@@ -23,6 +23,9 @@ use tracing::{info, warn};
 pub struct DgpuMirror {
     pub device_id: cl_device_id,
     pub slots: Vec<DeviceLayerBuffer>,
+    /// Resident layer-range partition: which layers this device mirrors. `None` = all
+    /// layers (unpartitioned). Non-owned slots are 1-byte placeholders.
+    pub owned: Option<Vec<bool>>,
 }
 
 enum HostBase {
@@ -195,6 +198,7 @@ impl StreamingScratch {
             dgpu_mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
                 slots,
+                owned: None,
             });
             info!(
                 "HeteroScratch dGPU mirror: {} ({} KiB × {}, FFN-slice DMA)",
@@ -215,6 +219,7 @@ impl StreamingScratch {
                         dgpu_mirrors.push(DgpuMirror {
                             device_id: prim.device_info.device_id,
                             slots,
+                            owned: None,
                         });
                     } else {
                         warn!(
@@ -252,6 +257,7 @@ impl StreamingScratch {
         pool: &OpenClDevicePool,
         layer_bytes: usize,
         n_layers: usize,
+        owned_per_device: Option<&[Vec<bool>]>
     ) -> Result<(TransferPath, Self), OpenClError> {
         let total = layer_bytes.saturating_mul(n_layers.max(1));
         if pool.is_empty() {
@@ -286,7 +292,7 @@ impl StreamingScratch {
                         n_layers,
                         layer_bytes / 1024
                     );
-                    let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers)?;
+                    let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers, owned_per_device)?;
                     return Ok((
                         TransferPath::SvmZeroCopy,
                         Self {
@@ -313,7 +319,7 @@ impl StreamingScratch {
         }
 
         let prim = pool.primary().ok_or(OpenClError::NoDeviceFound)?;
-        let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers)?;
+        let mirrors = Self::resident_mirrors(pool, layer_bytes, n_layers, owned_per_device)?;
         info!(
             "ResidentScratch: pinned host on {} ({} layers × {} KiB)",
             prim.device_info.device_name,
@@ -342,29 +348,31 @@ impl StreamingScratch {
         ))
     }
 
-    /// One big device mirror per discrete or integrated GPU for the resident base.
+    /// One device mirror per discrete GPU for the resident base. `owned_per_device`
+    /// (indexed by pool engine) selects the layer-range each device mirrors (audit I2);
+    /// non-owned slots are 1-byte placeholders, so a partitioned model only uses
+    /// `K*layer_bytes` of a device's VRAM.
     fn resident_mirrors(
         pool: &OpenClDevicePool,
         layer_bytes: usize,
         n_layers: usize,
+        owned_per_device: Option<&[Vec<bool>]>,
     ) -> Result<Vec<DgpuMirror>, OpenClError> {
         let mut mirrors = Vec::new();
         if n_layers == 0 || layer_bytes == 0 {
             return Ok(mirrors);
         }
-        for eng in pool.engines.iter().filter(|e| wants_device_mirror(e)) {
-            // Audit R3/N5: an Apu/IntegratedGpu device mirror is backed by the same
-            // system RAM as the resident host base, so mirroring the whole model there
-            // doubles RAM and can OOM. UMA owners use the host base (or host-upload);
-            // only discrete devices get a per-layer VRAM mirror.
+        for (idx, eng) in pool.engines.iter().enumerate() {
+            if !wants_device_mirror(eng) {
+                continue;
+            }
+            // Apu/IntegratedGpu mirrors are backed by system RAM (R3/N5): skip.
             if matches!(
                 eng.device_info.device_kind,
                 DeviceKind::Apu | DeviceKind::IntegratedGpu
             ) {
                 continue;
             }
-            // Audit P0.1a/R1: one buffer per layer, each under
-            // CL_DEVICE_MAX_MEM_ALLOC_SIZE, instead of one monolithic buffer.
             if !mirror_fits(eng, layer_bytes) {
                 warn!(
                     "Resident: skipping VRAM mirror on {} (layer {} MiB > max alloc {} MiB)",
@@ -374,13 +382,19 @@ impl StreamingScratch {
                 );
                 continue;
             }
+            let owned = owned_per_device.and_then(|o| o.get(idx)).cloned();
             let mut slots = Vec::with_capacity(n_layers);
-            for _ in 0..n_layers {
-                slots.push(DeviceLayerBuffer::new(eng, layer_bytes)?);
+            for l in 0..n_layers {
+                let own = owned
+                    .as_ref()
+                    .map(|o| o.get(l).copied().unwrap_or(false))
+                    .unwrap_or(true);
+                slots.push(DeviceLayerBuffer::new(eng, if own { layer_bytes } else { 1 })?);
             }
             mirrors.push(DgpuMirror {
                 device_id: eng.device_info.device_id,
                 slots,
+                owned,
             });
         }
         Ok(mirrors)
@@ -426,6 +440,7 @@ impl StreamingScratch {
                                 DeviceLayerBuffer::new(engine, layer_bytes)?,
                                 DeviceLayerBuffer::new(engine, layer_bytes)?,
                             ],
+                            owned: None,
                         });
                     }
                     return Ok((
@@ -461,6 +476,7 @@ impl StreamingScratch {
                     DeviceLayerBuffer::new(engine, layer_bytes)?,
                     DeviceLayerBuffer::new(engine, layer_bytes)?,
                 ],
+                owned: None,
             });
         }
         Ok((
@@ -936,8 +952,15 @@ impl StreamingScratch {
                 .iter()
                 .find(|m| m.device_id == eng.device_info.device_id)
             {
-                if let Some(buf) = m.slots.get(layer) {
-                    return Ok((WeightBind::Device { buf: &buf.cl_buffer }, tensor_off));
+                let owns = m
+                    .owned
+                    .as_ref()
+                    .map(|o| o.get(layer).copied().unwrap_or(false))
+                    .unwrap_or(true);
+                if owns {
+                    if let Some(buf) = m.slots.get(layer) {
+                        return Ok((WeightBind::Device { buf: &buf.cl_buffer }, tensor_off));
+                    }
                 }
             }
             return Err(OpenClError::ClError(format!(
@@ -1034,7 +1057,12 @@ impl StreamingScratch {
             // outlives this call; the base stays host-visible while mapped above.
             let src = unsafe { std::slice::from_raw_parts(host_ptr.add(base_off), total) };
             // Per-layer mirror (audit P0.1a): layer `L` lives in its own buffer at
-            // offset 0, so no single allocation exceeds CL_DEVICE_MAX_MEM_ALLOC_SIZE.
+            // offset 0. Skip layers this device does not own (layer-range partition).
+            if let Some(owned) = &mirror.owned {
+                if !owned.get(layer).copied().unwrap_or(false) {
+                    continue;
+                }
+            }
             if layer >= mirror.slots.len() {
                 continue;
             }
