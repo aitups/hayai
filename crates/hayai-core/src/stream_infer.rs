@@ -4661,8 +4661,9 @@ fn ffn_device_for(
     orch: &EngineOrchestrator,
     kind: LayerOpKind,
     role: usize,
+    layer: usize,
 ) -> Option<&hayai_opencl::OpenClEngine> {
-    match orch.placed_target(kind) {
+    match orch.placed_target_for_layer(kind, layer) {
         Some(crate::planner::ComputeTarget::Device(i)) => orch.pool.engines.get(i),
         Some(crate::planner::ComputeTarget::Cpu) => None,
         None => orch.pool.for_role(role),
@@ -4724,8 +4725,8 @@ pub(crate) fn ffn_begin_gate_up_scratch(
         }
     }
     let (gate_off, up_off) = layout.map(|l| (l.gate_off, l.up_off)).unwrap_or((0, 0));
-    let gate_eng = ffn_device_for(orch, LayerOpKind::FfnGate, 0);
-    let up_eng = ffn_device_for(orch, LayerOpKind::FfnUp, 1);
+    let gate_eng = ffn_device_for(orch, LayerOpKind::FfnGate, 0, layer);
+    let up_eng = ffn_device_for(orch, LayerOpKind::FfnUp, 1, layer);
 
     // Same device (the common case): use the persistent synchronous dispatch (no per-op
     // buffer churn, audit B.1.4) instead of two async dispatches on one in-order queue.
@@ -4851,7 +4852,7 @@ pub(crate) fn ffn_finish_scratch(
 
     if !orch.pool.is_empty() {
         let down_off = layout.map(|l| l.down_off).unwrap_or(0);
-        match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
+        match ffn_device_for(orch, LayerOpKind::FfnDown, 2, layer) {
             Some(eng) => {
                 *used_dgpu = true;
                 // Prefer the synchronous mirror dispatch: it reuses the persistent
@@ -4918,7 +4919,7 @@ pub(crate) fn ffn_finish_gelu_scratch(
 
     if !orch.pool.is_empty() {
         let down_off = layout.map(|l| l.down_off).unwrap_or(0);
-        match ffn_device_for(orch, LayerOpKind::FfnDown, 2) {
+        match ffn_device_for(orch, LayerOpKind::FfnDown, 2, layer) {
             Some(eng) => {
                 *used_dgpu = true;
                 // Prefer the synchronous mirror dispatch: it reuses the persistent

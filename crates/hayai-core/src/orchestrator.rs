@@ -60,6 +60,8 @@ pub struct EngineOrchestrator {
     /// Cost-driven op→device placement (from the planner). Empty ⇒ fall back to the
     /// static capability classes in `op_bindings`.
     placement: std::collections::BTreeMap<crate::exec_plan::LayerOpKind, crate::planner::ComputeTarget>,
+    /// Per-layer compute target (layer-range partition, audit I2); empty = per-kind.
+    layer_device: Vec<crate::planner::ComputeTarget>,
 }
 
 // SAFETY: OpenCL handles are raw pointers; the orchestrator is always accessed
@@ -172,16 +174,37 @@ impl EngineOrchestrator {
             pool,
             model_config,
             placement: Default::default(),
+            layer_device: Vec::new(),
         }
     }
 
     /// Install the cost-driven placement produced by the planner.
     pub fn set_placement(&mut self, placement: crate::planner::Placement) {
+        self.layer_device = placement.layer_device;
         self.placement = placement.assignments;
     }
 
     /// Where the planner wants `kind` to run, if anywhere.
     pub fn placed_target(&self, kind: crate::exec_plan::LayerOpKind) -> Option<crate::planner::ComputeTarget> {
+        self.placement.get(&kind).copied()
+    }
+
+    /// Where `kind` runs for a concrete layer (honours the layer-range partition).
+    pub fn placed_target_for_layer(
+        &self,
+        kind: crate::exec_plan::LayerOpKind,
+        layer: usize,
+    ) -> Option<crate::planner::ComputeTarget> {
+        if !self.layer_device.is_empty()
+            && matches!(
+                crate::exec_plan::op_binding(kind).device,
+                crate::exec_plan::OpDevice::GpuAsync
+            )
+        {
+            if let Some(t) = self.layer_device.get(layer) {
+                return Some(*t);
+            }
+        }
         self.placement.get(&kind).copied()
     }
 
@@ -339,7 +362,7 @@ impl EngineOrchestrator {
         tensor_off: usize,
     ) -> Result<(), OrchestratorError> {
         if let (Some(crate::planner::ComputeTarget::Device(i)), Some(sc)) =
-            (self.placement.get(&op).copied(), scratch)
+            (self.placed_target_for_layer(op, layer), scratch)
         {
             if let Some(eng) = self.pool.engines.get(i) {
                 let ran = crate::stream_infer::sync_gemv_from_scratch(
@@ -371,7 +394,7 @@ impl EngineOrchestrator {
         layer: usize,
         tensor_off: usize,
     ) -> Result<OpPending, OrchestratorError> {
-        if let Some(crate::planner::ComputeTarget::Device(i)) = self.placement.get(&op).copied() {
+        if let Some(crate::planner::ComputeTarget::Device(i)) = self.placed_target_for_layer(op, layer) {
             if let Some(sc) = scratch {
                 // Ping-pong only: macro-chunk's per-role DMA destinations are slot-based
                 // and do not match `weight_offset` (audit A.3.4 needs this DMA path fixed

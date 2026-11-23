@@ -107,10 +107,28 @@ pub struct Placement {
     pub target_load_s: BTreeMap<ComputeTarget, f64>,
     /// Estimated makespan (seconds) of one full layer's op graph.
     pub makespan_s: f64,
+    /// Per-layer compute target (layer-range partition, audit I2). Empty = use the
+    /// per-kind `assignments` for every layer. When non-empty, compute ops (GpuAsync)
+    /// of layer `l` run on `layer_device[l]`.
+    pub layer_device: Vec<ComputeTarget>,
 }
 
 impl Placement {
     pub fn target_of(&self, kind: LayerOpKind) -> Option<ComputeTarget> {
+        self.assignments.get(&kind).copied()
+    }
+
+    /// Target for a compute op of a concrete layer: the layer-range partition when set,
+    /// else the per-kind assignment. Non-compute ops (norms, host reads) keep their kind
+    /// assignment.
+    pub fn for_layer(&self, kind: LayerOpKind, layer: usize) -> Option<ComputeTarget> {
+        if !self.layer_device.is_empty()
+            && matches!(op_binding(kind).device, crate::exec_plan::OpDevice::GpuAsync)
+        {
+            if let Some(t) = self.layer_device.get(layer) {
+                return Some(*t);
+            }
+        }
         self.assignments.get(&kind).copied()
     }
 }
@@ -414,7 +432,27 @@ pub fn plan_session(
     // belongs to the per-layer split, not per-kind balancing.
     // Audit I2: schedule independent ops (Q/K/V, gate/up) concurrently across devices,
     // pricing cross-device hand-offs (see the `transfer` term in `plan_placement`).
-    let placement = plan_placement(tasks, caps, true);
+    let mut placement = plan_placement(tasks, caps, true);
+    // Audit I2: contiguous layer-range partition. When the winning target is a device
+    // whose residency cannot hold every layer (or when explicitly forced), the first K
+    // layers stay on that device and the remainder run on the CPU, so the model is not
+    // pinned to one device's VRAM. K = floor(resident_bytes / layer_bytes).
+    if layered && layer_bytes > 0 && placement.layer_device.is_empty() {
+        let force = std::env::var("HAYAI_PARTITION_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let k_cap = (resident_bytes / layer_bytes.max(1) as u64) as usize;
+        let k = force.unwrap_or(k_cap).min(n_layers);
+        if let ComputeTarget::Device(_) = compute {
+            if k >= 1 && k < n_layers {
+                let mut ld = vec![ComputeTarget::Cpu; n_layers];
+                for l in 0..k {
+                    ld[l] = compute;
+                }
+                placement.layer_device = ld;
+            }
+        }
+    }
 
     SessionPlan {
         compute,
