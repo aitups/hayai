@@ -596,6 +596,10 @@ pub struct StreamingGenerator {
     /// Qwen3.5 DeltaNet weights (None entries for full-attn layers).
     pub(crate) deltanet_weights: Option<Vec<Option<crate::deltanet::DeltaNetLayerWeights>>>,
     pub(crate) deltanet_states: Option<Vec<Option<crate::deltanet::DeltaNetState>>>,
+    /// DeltaNet-layer FFN matrices cached in RAM so hybrid decode does not re-read them
+    /// from disk every token (audit N4/hybrid). Bounded by HAYAI_HYBRID_FFN_CACHE_MB.
+    pub(crate) hybrid_ffn: Option<Vec<Option<crate::hybrid_infer::FfnMats>>>,
+    pub(crate) hybrid_ffn_bytes: usize,
     /// MoE expert LRU cache (colibri-style) — host RAM, sized at session start.
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
     /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
@@ -1417,6 +1421,8 @@ impl StreamingGenerator {
             io_worker: hayai_io::IoWorker::new("hayai-io-worker"),
             deltanet_weights: None,
             deltanet_states: None,
+            hybrid_ffn: None,
+            hybrid_ffn_bytes: 0,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
             device_kv: None,
@@ -3114,19 +3120,9 @@ impl StreamingGenerator {
                 };
             }
         }
-        // Hybrid (Qwen3.5 DeltaNet): the DeltaNet FFN weights are not part of the generic
-        // resident layer pack (they are read per token), so a resident window gives no
-        // speedup and doubles RAM. Under AutoFit, keep the fast streaming cadence.
-        if self.memory_strategy == MemoryStrategy::AutoFit
-            && self.model_kind() == ModelKind::Hybrid
-            && win.resident
-        {
-            win = WindowPlan {
-                k_chunk: 1,
-                resident: false,
-                window_bytes: 2 * full_bytes as u64,
-            };
-        }
+        // Hybrid (Qwen3.5 DeltaNet): DeltaNet-layer FFN matrices are cached in RAM on
+        // first use (see `hybrid_ffn`), so a resident window is now worthwhile instead
+        // of re-reading them from disk every token.
         self.window_plan = Some(win);
         let resident = win.resident && win.k_chunk >= self.config.num_layers;
         let layer_bytes = if resident { full_bytes } else { window_bytes };

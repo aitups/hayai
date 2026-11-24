@@ -18,7 +18,7 @@ use std::time::Instant;
 
 /// FFN matrices of one hybrid layer (dense or embedded sparse CSR), preloaded by
 /// the prefetch thread so a DeltaNet/FFN-only block does not stall on disk.
-type FfnMats = (
+pub(crate) type FfnMats = (
     QuantMatrix,
     QuantMatrix,
     QuantMatrix,
@@ -26,6 +26,34 @@ type FfnMats = (
     Option<hayai_model::CsrSparse>,
     Option<hayai_model::CsrSparse>,
 );
+
+/// Cache the DeltaNet-layer FFN matrices in RAM so hybrid decode does not re-read
+/// them from disk every token. Bounded by `HAYAI_HYBRID_FFN_CACHE_MB` (default 6000).
+fn take_cached_ffn(gen: &mut StreamingGenerator, layer: usize) -> Option<FfnMats> {
+    gen.hybrid_ffn
+        .as_mut()
+        .and_then(|v| v.get_mut(layer))
+        .and_then(|o| o.take())
+}
+
+fn store_cached_ffn(gen: &mut StreamingGenerator, layer: usize, mats: FfnMats) {
+    let bytes = mats.0.nbytes() + mats.1.nbytes() + mats.2.nbytes();
+    let cap_mb: usize = std::env::var("HAYAI_HYBRID_FFN_CACHE_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6000);
+    if gen.hybrid_ffn.is_none() {
+        gen.hybrid_ffn = Some((0..gen.config.num_layers).map(|_| None).collect());
+    }
+    if let Some(v) = gen.hybrid_ffn.as_mut() {
+        if layer < v.len() && gen.hybrid_ffn_bytes + bytes <= cap_mb * 1024 * 1024 {
+            if v[layer].is_none() {
+                gen.hybrid_ffn_bytes += bytes;
+            }
+            v[layer] = Some(mats);
+        }
+    }
+}
 
 pub(crate) fn prefill_hybrid(
     gen: &mut StreamingGenerator,
@@ -341,12 +369,16 @@ fn run_ffn_only_block(
     let h = x.len();
     // Use the prefetched FFN when available (overlapped with the previous layer);
     // otherwise read it now into a function-local that stays alive for the call.
-    let loaded: Option<FfnMats> = if preloaded.is_none() {
-        let t_io = Instant::now();
-        let m = gen.catalog.load_ffn_matrices(layer)?;
-        gen.io_secs += t_io.elapsed().as_secs_f64();
-        gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
-        Some(m)
+    let mut loaded: Option<FfnMats> = if preloaded.is_none() {
+        if let Some(m) = take_cached_ffn(gen, layer) {
+            Some(m)
+        } else {
+            let t_io = Instant::now();
+            let m = gen.catalog.load_ffn_matrices(layer)?;
+            gen.io_secs += t_io.elapsed().as_secs_f64();
+            gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
+            Some(m)
+        }
     } else {
         None
     };
@@ -406,6 +438,9 @@ fn run_ffn_only_block(
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
+    }
+    if let Some(mats) = loaded {
+        store_cached_ffn(gen, layer, mats);
     }
     let _ = scratch;
     Ok(())
@@ -495,12 +530,16 @@ fn run_deltanet_block(
     // Los bloques dispersos embebidos (D16) cargan con CSR.
     // Use the prefetched FFN when available (overlapped with the previous layer);
     // otherwise read it once into a function-local that outlives all uses.
-    let loaded: Option<FfnMats> = if preloaded.is_none() {
-        let t_io = Instant::now();
-        let m = gen.catalog.load_ffn_matrices(layer)?;
-        gen.io_secs += t_io.elapsed().as_secs_f64();
-        gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
-        Some(m)
+    let mut loaded: Option<FfnMats> = if preloaded.is_none() {
+        if let Some(m) = take_cached_ffn(gen, layer) {
+            Some(m)
+        } else {
+            let t_io = Instant::now();
+            let m = gen.catalog.load_ffn_matrices(layer)?;
+            gen.io_secs += t_io.elapsed().as_secs_f64();
+            gen.io_bytes += (m.0.nbytes() + m.1.nbytes() + m.2.nbytes()) as u64;
+            Some(m)
+        }
     } else {
         None
     };
@@ -569,6 +608,9 @@ fn run_deltanet_block(
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();
     for i in 0..h {
         x[i] += gen.ws_down[i];
+    }
+    if let Some(mats) = loaded {
+        store_cached_ffn(gen, layer, mats);
     }
     let _ = scratch;
     Ok(())
