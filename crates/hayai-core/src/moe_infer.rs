@@ -9,9 +9,11 @@
 //! 5. Per-expert gate/up/down via `execute_op` (GpuAsync binding → OpenCL pool),
 //!    SiLU gating, softmax routing weights, accumulated residual.
 
-use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, MoeMeta, TensorRef};
+use crate::exec_plan::{is_expert_op, op_binding, ExpertUnit, LayerOpKind, MoeMeta, StreamingUnit, TensorRef};
 use crate::orchestrator::EngineOrchestrator;
-use crate::stream_infer::{PrefetchJob, PrefetchWorker, StreamInferError, StreamingGenerator};
+use crate::stream_infer::{
+    gemv_kernel_for, PrefetchJob, PrefetchWorker, StreamInferError, StreamingGenerator,
+};
 use hayai_cpu::{apply_rope_partial_factors_scaled, attention_decode_step, rms_norm, softmax};
 use hayai_model::QuantMatrix;
 use hayai_opencl::StreamingScratch;
@@ -393,6 +395,19 @@ fn forward_moe_inner(
                 // Resident MoE: gate/up -> SiLU -> down from the per-layer mirror
                 // slice (compact expert layout). No per-expert clCreateBuffer / PCIe
                 // uploads (audit N3).
+                if try_moe_dev_ffn(
+                    &*orch,
+                    &*scratch,
+                    layer,
+                    &xn,
+                    &expert_meta,
+                    unit,
+                    &base,
+                    &weights,
+                    &mut acc,
+                )? {
+                    // Experts ran on-device (one readback per expert).
+                } else {
                 for &(i, eid, base_off, ff) in &expert_meta {
                     let expert = unit
                         .experts
@@ -447,6 +462,7 @@ fn forward_moe_inner(
                     for j in 0..h {
                         acc[j] += w * d[j];
                     }
+                }
                 }
             } else {
                 // GPU: async across experts — enqueue all gate∥up, wait, SiLU, down.
@@ -887,6 +903,105 @@ fn expert_view<'a>(
 /// Byte offset of one expert matrix inside the compact expert slot (`t.offset`).
 fn expert_op_offset(expert: &ExpertUnit, op: LayerOpKind) -> Option<usize> {
     expert.tensors.iter().find(|t| t.op == op).map(|t| t.offset)
+}
+
+/// Run a layer's selected experts entirely on one device (gate→silu_mul→down read
+/// straight from the per-layer VRAM mirror), reading back only the `down` output per
+/// expert instead of three blocking host round-trips. Returns `false` when placement,
+/// kernels or binds are not all available (caller falls back to the per-op path).
+#[allow(clippy::too_many_arguments)]
+fn try_moe_dev_ffn(
+    orch: &EngineOrchestrator,
+    scratch: &StreamingScratch,
+    layer: usize,
+    xn: &[f32],
+    expert_meta: &[(usize, usize, usize, usize)],
+    unit: &StreamingUnit,
+    base: &[u8],
+    weights: &[f32],
+    acc: &mut [f32],
+) -> Result<bool, StreamInferError> {
+    use crate::planner::ComputeTarget;
+    use hayai_opencl::{GgmlWeightBind, WeightBind};
+    let dev = match (
+        orch.placed_target_for_layer(LayerOpKind::ExpertGate, layer),
+        orch.placed_target_for_layer(LayerOpKind::ExpertUp, layer),
+        orch.placed_target_for_layer(LayerOpKind::ExpertDown, layer),
+    ) {
+        (
+            Some(ComputeTarget::Device(a)),
+            Some(ComputeTarget::Device(b)),
+            Some(ComputeTarget::Device(c)),
+        ) if a == b && b == c => a,
+        _ => return Ok(false),
+    };
+    let Some(eng) = orch.pool.engines.get(dev) else {
+        return Ok(false);
+    };
+    let h = acc.len();
+    eng.ffn_dev_upload_x(xn)
+        .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+    for &(i, eid, base_off, _ff) in expert_meta {
+        let expert = unit
+            .experts
+            .iter()
+            .find(|e| e.expert_id == eid)
+            .ok_or_else(|| StreamInferError::Msg(format!("top-k expert {eid} not in plan")))?;
+        let gate = expert_view(base, expert, base_off, LayerOpKind::ExpertGate)?;
+        let up = expert_view(base, expert, base_off, LayerOpKind::ExpertUp)?;
+        let down = expert_view(base, expert, base_off, LayerOpKind::ExpertDown)?;
+        let (Some((gk, gl)), Some((uk, ul)), Some((dk, dl))) = (
+            gemv_kernel_for(eng, gate.ggml_type),
+            gemv_kernel_for(eng, up.ggml_type),
+            gemv_kernel_for(eng, down.ggml_type),
+        ) else {
+            return Ok(false);
+        };
+        if gate.ncols != xn.len() || up.ncols != xn.len() || down.nrows != h {
+            return Ok(false);
+        }
+        let goff = expert_op_offset(expert, LayerOpKind::ExpertGate).unwrap_or(0);
+        let uoff = expert_op_offset(expert, LayerOpKind::ExpertUp).unwrap_or(0);
+        let doff = expert_op_offset(expert, LayerOpKind::ExpertDown).unwrap_or(0);
+        let (gb, gw) = match scratch.weight_bind_and_offset(eng, layer, base_off + goff) {
+            Ok((WeightBind::Device { buf }, o)) => (GgmlWeightBind::Device(buf), o),
+            Ok((WeightBind::Svm { ptr }, o)) => (GgmlWeightBind::Svm(ptr), o),
+            Err(_) => return Ok(false),
+        };
+        let (ub, uw) = match scratch.weight_bind_and_offset(eng, layer, base_off + uoff) {
+            Ok((WeightBind::Device { buf }, o)) => (GgmlWeightBind::Device(buf), o),
+            Ok((WeightBind::Svm { ptr }, o)) => (GgmlWeightBind::Svm(ptr), o),
+            Err(_) => return Ok(false),
+        };
+        let (db, dw) = match scratch.weight_bind_and_offset(eng, layer, base_off + doff) {
+            Ok((WeightBind::Device { buf }, o)) => (GgmlWeightBind::Device(buf), o),
+            Ok((WeightBind::Svm { ptr }, o)) => (GgmlWeightBind::Svm(ptr), o),
+            Err(_) => return Ok(false),
+        };
+        eng.ffn_dev_gate_up(
+            gk,
+            gl,
+            gate.nrows,
+            gate.ncols,
+            gb,
+            gw,
+            uk,
+            ul,
+            up.nrows,
+            up.ncols,
+            ub,
+            uw,
+        )
+        .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+        let mut d = vec![0.0f32; h];
+        eng.ffn_dev_down(dk, dl, down.nrows, down.ncols, db, dw, &mut d)
+            .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+        let w = weights[i];
+        for j in 0..h {
+            acc[j] += w * d[j];
+        }
+    }
+    Ok(true)
 }
 
 /// View over a shared-expert matrix (`ffn_shexp.*` / `shared_expert.*`).
