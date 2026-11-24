@@ -471,8 +471,10 @@ fn run_deltanet_block(
         let _ = weights;
     }
     let t0 = Instant::now();
-    // Opt-in device DeltaNet: create the per-layer recurrent state on the device.
-    let use_dn_gpu = std::env::var_os("HAYAI_DN_GPU").is_some() && orch.opencl_engine().is_some();
+    // Device DeltaNet: default-on when a device is present (the host scan is the
+    // dominant hybrid decode cost). `HAYAI_DN_GPU=0` forces the bit-identical host path.
+    let use_dn_gpu = orch.opencl_engine().is_some()
+        && std::env::var("HAYAI_DN_GPU").ok().as_deref() != Some("0");
     if use_dn_gpu {
         let (nk, nv, hk, hv) = {
             let w = gen
