@@ -282,13 +282,13 @@ pub(crate) fn forward_hybrid(
 
     let logits = output_logits(gen, orch, &mut x, eps)?;
     gen.position += 1;
-    if pos <= 2 {
+    if pos <= 12 {
         tracing::info!(
-            "hybrid pos={} scratch.resident={} block_k={} io_bytes={} ffn_cache={} MiB",
+            "hybrid pos={} scratch.resident={} block_k={} io_bytes={} MiB ffn_cache={} MiB",
             pos,
             scratch.resident,
             scratch.block_k,
-            gen.io_bytes,
+            gen.io_bytes / (1024 * 1024),
             gen.hybrid_ffn_bytes / (1024 * 1024),
         );
     }
