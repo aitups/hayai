@@ -600,6 +600,7 @@ pub struct StreamingGenerator {
     /// from disk every token (audit N4/hybrid). Bounded by HAYAI_HYBRID_FFN_CACHE_MB.
     pub(crate) hybrid_ffn: Option<Vec<Option<crate::hybrid_infer::FfnMats>>>,
     pub(crate) hybrid_ffn_bytes: usize,
+    pub(crate) hybrid_ffn_counted: Option<Vec<bool>>,
     /// MoE expert LRU cache (colibri-style) — host RAM, sized at session start.
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
     /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
@@ -1423,6 +1424,7 @@ impl StreamingGenerator {
             deltanet_states: None,
             hybrid_ffn: None,
             hybrid_ffn_bytes: 0,
+            hybrid_ffn_counted: None,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
             device_kv: None,

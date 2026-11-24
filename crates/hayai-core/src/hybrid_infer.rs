@@ -42,14 +42,34 @@ fn store_cached_ffn(gen: &mut StreamingGenerator, layer: usize, mats: FfnMats) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(6000);
+    let n = gen.config.num_layers;
     if gen.hybrid_ffn.is_none() {
-        gen.hybrid_ffn = Some((0..gen.config.num_layers).map(|_| None).collect());
+        gen.hybrid_ffn = Some((0..n).map(|_| None).collect());
+    }
+    if gen.hybrid_ffn_counted.is_none() {
+        gen.hybrid_ffn_counted = Some(vec![false; n]);
+    }
+    // Count a layer's bytes only the first time it is cached. Decode takes the mats
+    // out and stores them back each token, so counting on every store would inflate
+    // the total and trip the cap (evicting a cache that is in fact fine).
+    let already = gen
+        .hybrid_ffn_counted
+        .as_ref()
+        .and_then(|c| c.get(layer).copied())
+        .unwrap_or(true);
+    if !already {
+        if gen.hybrid_ffn_bytes + bytes > cap_mb * 1024 * 1024 {
+            return;
+        }
+        gen.hybrid_ffn_bytes += bytes;
+        if let Some(c) = gen.hybrid_ffn_counted.as_mut() {
+            if layer < c.len() {
+                c[layer] = true;
+            }
+        }
     }
     if let Some(v) = gen.hybrid_ffn.as_mut() {
-        if layer < v.len() && gen.hybrid_ffn_bytes + bytes <= cap_mb * 1024 * 1024 {
-            if v[layer].is_none() {
-                gen.hybrid_ffn_bytes += bytes;
-            }
+        if layer < v.len() {
             v[layer] = Some(mats);
         }
     }
@@ -160,6 +180,9 @@ pub(crate) fn prefill_hybrid_all(
                 for x in xs.iter_mut() {
                     run_deltanet_block(gen, orch, scratch, layer, eps, x, None, Some(&ffn))?;
                 }
+                // Populate the RAM cache during prefill so the first decode token does
+                // not re-read this layer's FFN from disk.
+                store_cached_ffn(gen, layer, ffn);
             }
             _ => {
                 // FFN-only (ablation: attention skipped on this layer kind).
