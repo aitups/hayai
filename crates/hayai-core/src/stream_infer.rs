@@ -408,6 +408,7 @@ impl ModelKind {
 /// Device-resident Dense decode state (audit #4): the residual stream and all
 /// intermediates live in VRAM; the per-token loop runs norm/RoPE/KV/attention/FFN on
 /// the device with a single logits readback.
+#[allow(dead_code)]
 pub(crate) struct DenseDevState {
     pub(crate) h: usize,
     pub(crate) q_dim: usize,
@@ -2036,7 +2037,7 @@ impl StreamingGenerator {
         token: u32,
         scratch: &mut hayai_opencl::StreamingScratch,
     ) -> Result<Option<Vec<f32>>, StreamInferError> {
-        if !self.dense_dev_eligible() {
+        if !self.dense_dev_eligible() || orch.pool.engines.is_empty() {
             return Ok(None);
         }
         self.ensure_dense_dev(orch, scratch)?;
@@ -2163,6 +2164,7 @@ impl StreamingGenerator {
         // Device-resident Dense pipeline (audit #4): all layers on the GPU, one readback.
         if let Some(sc) = scratch.as_deref_mut() {
             if sc.resident
+                && !orch.pool.is_empty()
                 && override_ffn.is_none()
                 && crate::stream_infer::dense_dev_enabled()
             {
@@ -3506,6 +3508,7 @@ impl StreamingGenerator {
                     // Device-resident pipeline: prefill must also run on the device so
                     // the device KV is primed for decode.
                     let use_dev = scratch.resident
+                        && !orch.pool.is_empty()
                         && self.dense_dev_eligible()
                         && crate::stream_infer::dense_dev_enabled();
                     if use_dev {
