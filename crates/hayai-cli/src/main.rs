@@ -1143,6 +1143,12 @@ fn cmd_generate(
         };
         let mut orch = EngineOrchestrator::new(mode, weights.config.clone());
         println!("  FFN device: {}", orch.ffn_device_name());
+        if orch.pool.is_empty() {
+            eprintln!(
+                "  !! NO OpenCL DEVICE — these numbers are CPU-ONLY and NOT GPU results. \
+                 Install a vendor OpenCL ICD and check `clinfo` !!"
+            );
+        }
         let mut gen = Generator::new(weights, tokenizer, sinks, window, sampler, seed);
         let t1 = Instant::now();
         let stats = gen.generate(&mut orch, &prompt_text, max_tokens)?;
@@ -1358,6 +1364,12 @@ fn cmd_bench_generate(
         format_bytes(win.window_bytes)
     );
     println!("  FFN device:    {}", orch.ffn_device_name());
+    if orch.pool.is_empty() {
+        eprintln!(
+            "  !! NO OpenCL DEVICE — these numbers are CPU-ONLY and NOT GPU results. \
+             Install a vendor OpenCL ICD (e.g. /etc/OpenCL/vendors/nvidia.icd) and check `clinfo` !!"
+        );
+    }
     if let Some(cl) = orch.opencl_engine() {
         println!(
             "  Transfer path: {:?}",
