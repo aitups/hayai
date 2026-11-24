@@ -198,12 +198,6 @@ pub(crate) fn prefill_hybrid_all(
     }
 
     gen.position = base_pos + t_count;
-    tracing::info!(
-        "hybrid prefill: scratch.resident={} block_k={} io_bytes={} MiB",
-        scratch.resident,
-        scratch.block_k,
-        gen.io_bytes / (1024 * 1024),
-    );
     let mut all_logits = Vec::with_capacity(t_count);
     let mut all_hidden = Vec::with_capacity(t_count);
     for (i, x) in xs.iter_mut().enumerate() {
@@ -305,16 +299,6 @@ pub(crate) fn forward_hybrid(
 
     let logits = output_logits(gen, orch, &mut x, eps)?;
     gen.position += 1;
-    if pos <= 12 {
-        tracing::info!(
-            "hybrid pos={} scratch.resident={} block_k={} io_bytes={} MiB ffn_cache={} MiB",
-            pos,
-            scratch.resident,
-            scratch.block_k,
-            gen.io_bytes / (1024 * 1024),
-            gen.hybrid_ffn_bytes / (1024 * 1024),
-        );
-    }
     if std::env::var("HAYAI_DUMP_TOP").ok().as_deref() == Some("1") {
         let at = std::env::var("HAYAI_DUMP_AT_POS")
             .ok()
