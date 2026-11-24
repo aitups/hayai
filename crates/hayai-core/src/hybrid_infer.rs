@@ -8,7 +8,8 @@ use crate::infer::FfnOverride;
 use crate::layer_cfg::{hybrid_layer_kind, resolve_full_attn_cfg, HybridLayerKind};
 use crate::orchestrator::EngineOrchestrator;
 use crate::stream_infer::{
-    ffn_begin_gate_up_scratch, ffn_finish_scratch, StreamInferError, StreamingGenerator,
+    ffn_begin_gate_up_scratch, ffn_finish_scratch, gemv_kernel_for, StreamInferError,
+    StreamingGenerator,
 };
 use hayai_cpu::{attention_decode_step, rms_norm, LayerKvCache};
 use hayai_model::{GgmlType, QuantMatrix};
@@ -34,6 +35,120 @@ fn take_cached_ffn(gen: &mut StreamingGenerator, layer: usize) -> Option<FfnMats
         .as_mut()
         .and_then(|v| v.get_mut(layer))
         .and_then(|o| o.take())
+}
+
+/// One DeltaNet layer's FFN weights resident in device VRAM (gate/up/down buffers),
+/// built once so hybrid decode edits them in place instead of re-uploading every token.
+pub(crate) struct DnFfnDev {
+    device_id: usize,
+    gate: hayai_opencl::Buffer<u8>,
+    up: hayai_opencl::Buffer<u8>,
+    down: hayai_opencl::Buffer<u8>,
+}
+
+/// Run a DeltaNet layer's FFN (gate→silu_mul→down) entirely from its resident device
+/// buffers. Returns `false` (caller uses the host path) when the plan does not place all
+/// three ops on one usable device, or the shapes/kernels are unavailable.
+fn dn_ffn_dev_run(
+    orch: &EngineOrchestrator,
+    cache: &mut Option<Vec<Option<DnFfnDev>>>,
+    layer: usize,
+    gate: &QuantMatrix,
+    up: &QuantMatrix,
+    down: &QuantMatrix,
+    xn: &[f32],
+    out: &mut [f32],
+) -> Result<bool, StreamInferError> {
+    use crate::exec_plan::LayerOpKind;
+    use crate::planner::ComputeTarget;
+    use hayai_opencl::GgmlWeightBind;
+    let dev = match (
+        orch.placed_target_for_layer(LayerOpKind::FfnGate, layer),
+        orch.placed_target_for_layer(LayerOpKind::FfnUp, layer),
+        orch.placed_target_for_layer(LayerOpKind::FfnDown, layer),
+    ) {
+        (
+            Some(ComputeTarget::Device(a)),
+            Some(ComputeTarget::Device(b)),
+            Some(ComputeTarget::Device(c)),
+        ) if a == b && b == c => a,
+        _ => return Ok(false),
+    };
+    let Some(eng) = orch.pool.engines.get(dev) else {
+        return Ok(false);
+    };
+    let (Some((gk, gl)), Some((uk, ul)), Some((dk, dl))) = (
+        gemv_kernel_for(eng, gate.ggml_type),
+        gemv_kernel_for(eng, up.ggml_type),
+        gemv_kernel_for(eng, down.ggml_type),
+    ) else {
+        return Ok(false);
+    };
+    if gate.ncols != xn.len()
+        || up.ncols != xn.len()
+        || up.nrows != gate.nrows
+        || down.ncols != gate.nrows
+        || down.nrows != out.len()
+    {
+        return Ok(false);
+    }
+    if cache.as_ref().map_or(true, |v| v.len() <= layer) {
+        let mut v = cache.take().unwrap_or_default();
+        while v.len() <= layer {
+            v.push(None);
+        }
+        *cache = Some(v);
+    }
+    let slots = cache.as_mut().unwrap();
+    if slots[layer].is_none() {
+        let g = eng
+            .create_weight_buffer(gate.data())
+            .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+        let u = eng
+            .create_weight_buffer(up.data())
+            .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+        let d = eng
+            .create_weight_buffer(down.data())
+            .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+        slots[layer] = Some(DnFfnDev {
+            device_id: dev,
+            gate: g,
+            up: u,
+            down: d,
+        });
+    }
+    let d = slots[layer].as_ref().unwrap();
+    if d.device_id != dev {
+        return Ok(false);
+    }
+    eng.ffn_dev_upload_x(xn)
+        .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+    eng.ffn_dev_gate_up(
+        gk,
+        gl,
+        gate.nrows,
+        gate.ncols,
+        GgmlWeightBind::Device(&d.gate),
+        0,
+        uk,
+        ul,
+        up.nrows,
+        up.ncols,
+        GgmlWeightBind::Device(&d.up),
+        0,
+    )
+    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+    eng.ffn_dev_down(
+        dk,
+        dl,
+        down.nrows,
+        down.ncols,
+        GgmlWeightBind::Device(&d.down),
+        0,
+        out,
+    )
+    .map_err(|e| StreamInferError::Msg(e.to_string()))?;
+    Ok(true)
 }
 
 fn store_cached_ffn(gen: &mut StreamingGenerator, layer: usize, mats: FfnMats) {
@@ -599,35 +714,50 @@ fn run_deltanet_block(
         };
         gen.run_ffn_block(orch, &pack, &xn, ov, Some(&*scratch), layer)?;
     } else {
-        let inflight = ffn_begin_gate_up_scratch(
-            orch,
-            &m.0,
-            &m.1,
-            &xn,
-            &mut gen.ws_gate,
-            &mut gen.ws_up,
-            &mut gen.used_dgpu,
-            &mut gen.used_apu,
-            None,
-            0,
-            None,
-            false,
-        )?;
-        ffn_finish_scratch(
-            orch,
-            inflight,
-            &m.2,
-            &mut gen.ws_gate,
-            &mut gen.ws_up,
-            &mut gen.ws_down,
-            &mut gen.used_dgpu,
-            None,
-            0,
-            None,
-        )?;
-        if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
-            eprintln!("PROD_GATE_ACT L0: {:?}", &gen.ws_gate[0..8]);
-            eprintln!("PROD_DOWN L0: {:?}", &gen.ws_down[0..8]);
+        let used_dev = std::env::var("HAYAI_DN_FFN_DEV").ok().as_deref() != Some("0")
+            && dn_ffn_dev_run(
+                &*orch,
+                &mut gen.dn_ffn_dev,
+                layer,
+                &m.0,
+                &m.1,
+                &m.2,
+                &xn,
+                &mut gen.ws_down,
+            )?;
+        if used_dev {
+            gen.used_dgpu = true;
+        } else {
+            let inflight = ffn_begin_gate_up_scratch(
+                orch,
+                &m.0,
+                &m.1,
+                &xn,
+                &mut gen.ws_gate,
+                &mut gen.ws_up,
+                &mut gen.used_dgpu,
+                &mut gen.used_apu,
+                None,
+                0,
+                None,
+                false,
+            )?;
+            ffn_finish_scratch(
+                orch,
+                inflight,
+                &m.2,
+                &mut gen.ws_gate,
+                &mut gen.ws_up,
+                &mut gen.ws_down,
+                &mut gen.used_dgpu,
+                None,
+                0,
+                None,
+            )?;
+            if std::env::var("HAYAI_DUMP_GATE").ok().as_deref() == Some("1") && layer == 0 {
+                eprintln!("PROD_GATE_ACT L0: {:?}", &gen.ws_gate[0..8]);
+                eprintln!("PROD_DOWN L0: {:?}", &gen.ws_down[0..8]);
+            }
         }
     }
     gen.ffn_secs += t_ffn.elapsed().as_secs_f64();

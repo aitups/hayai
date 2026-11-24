@@ -601,6 +601,9 @@ pub struct StreamingGenerator {
     pub(crate) hybrid_ffn: Option<Vec<Option<crate::hybrid_infer::FfnMats>>>,
     pub(crate) hybrid_ffn_bytes: usize,
     pub(crate) hybrid_ffn_counted: Option<Vec<bool>>,
+    /// Per-DeltaNet-layer FFN weights uploaded once to device VRAM (mirror) so hybrid
+    /// decode does not re-upload them over PCIe every token.
+    pub(crate) dn_ffn_dev: Option<Vec<Option<crate::hybrid_infer::DnFfnDev>>>,
     /// MoE expert LRU cache (colibri-style) — host RAM, sized at session start.
     pub(crate) moe_cache: crate::moe_infer::ExpertCache,
     /// MoE router selection bias (`blk.N.ffn_gate_inp.bias`, DeepSeek V3), per layer.
@@ -1425,6 +1428,7 @@ impl StreamingGenerator {
             hybrid_ffn: None,
             hybrid_ffn_bytes: 0,
             hybrid_ffn_counted: None,
+            dn_ffn_dev: None,
             moe_cache: crate::moe_infer::ExpertCache::new(0),
             moe_router_bias,
             device_kv: None,
@@ -4493,7 +4497,7 @@ pub(crate) fn dense_dev_enabled() -> bool {
     }
 }
 
-fn gemv_kernel_for<'a>(
+pub(crate) fn gemv_kernel_for<'a>(
     eng: &'a hayai_opencl::OpenClEngine,
     t: GgmlType,
 ) -> Option<(&'a hayai_opencl::Kernel, &'static str)> {
