@@ -216,23 +216,47 @@ fn forward_moe_inner(
             let wv = view_of(&base, &loaded, LayerOpKind::AttnV)?;
             let wo = view_of(&base, &loaded, LayerOpKind::AttnO)?;
             let mut q = vec![0.0f32; q_dim];
-            wq.gemv(&xn, &mut q)?;
+            orch.execute_op(
+                LayerOpKind::AttnQ,
+                op_binding(LayerOpKind::AttnQ),
+                &wq,
+                &xn,
+                &mut q,
+            )?;
             // Q/K RMSNorm: per-head (`weight.len()==head_dim`, Gemma) or over the whole
             // projection (`weight.len()==q_dim`, OLMoE).
             if let Some(qn) = &gen.layer_norms[layer].attn_q_norm {
                 apply_qk_norm(&mut q, qn, cfg.num_heads, cfg.head_dim, eps);
             }
             let mut k = vec![0.0f32; kv_dim];
-            wk.gemv(&xn, &mut k)?;
+            orch.execute_op(
+                LayerOpKind::AttnK,
+                op_binding(LayerOpKind::AttnK),
+                &wk,
+                &xn,
+                &mut k,
+            )?;
             if let Some(kn) = &gen.layer_norms[layer].attn_k_norm {
                 apply_qk_norm(&mut k, kn, cfg.num_kv_heads, cfg.head_dim, eps);
             }
             let mut v = vec![0.0f32; kv_dim];
-            wv.gemv(&xn, &mut v)?;
+            orch.execute_op(
+                LayerOpKind::AttnV,
+                op_binding(LayerOpKind::AttnV),
+                &wv,
+                &xn,
+                &mut v,
+            )?;
             let mut attn_out = vec![0.0f32; q_dim];
             attention_decode_step(cfg, &mut gen.kv[layer], &mut q, &mut k, &v, pos, &mut attn_out);
             let mut attn_proj = vec![0.0f32; h];
-            wo.gemv(&attn_out, &mut attn_proj)?;
+            orch.execute_op(
+                LayerOpKind::AttnO,
+                op_binding(LayerOpKind::AttnO),
+                &wo,
+                &attn_out,
+                &mut attn_proj,
+            )?;
             for i in 0..h {
                 x[i] += attn_proj[i];
             }
