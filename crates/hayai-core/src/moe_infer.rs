@@ -64,16 +64,6 @@ fn forward_moe_inner(
 
     let mut x = vec![0.0f32; h];
     gen.embed_row("token_embd.weight", token, h, &mut x)?;
-    if pos <= 8 {
-        tracing::info!(
-            "moe pos={} resident={} block_k={} io={:.2}s io_bytes={} MiB",
-            pos,
-            scratch.resident,
-            scratch.block_k,
-            gen.io_secs,
-            gen.io_bytes / (1024 * 1024),
-        );
-    }
 
     // Colibri-style pipeline: the next layer's non-expert tensors are prefetched
     // into the OTHER ping-pong slot while this layer's attention+FFN compute runs
